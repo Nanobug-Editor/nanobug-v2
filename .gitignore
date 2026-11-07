@@ -1,0 +1,19 @@
+# Build and test outputs
+/target/
+/dist/
+/test-output/
+*.log
+
+# Local editor and OS files
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Local session notes
+/docs/会话交接.md
