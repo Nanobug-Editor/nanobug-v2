@@ -1,7 +1,7 @@
 //! Deterministic visual-motion checks; timestamps describe real target/frame event order.
-use nanobug::{
-    cursor_motion::{CursorMotion, Effect, Geometry},
-    scroll_motion::{GridScroll, ScrollInput},
+use nanobug::animation::{
+    cursor::{CursorMotion, Effect, Geometry},
+    scroll::{GridScroll, ScrollInput},
 };
 
 /// Inputs arriving immediately before frames must not discard the preceding elapsed time.
@@ -406,7 +406,7 @@ fn viewport_rebase_preserves_cursor_progress_relative_to_text() {
     let mut motion = sample(120., 0.06);
     let before = motion.corners();
     let head = motion.head();
-    motion.translate(nanobug::cursor_motion::Vec2::new(0., -37.5));
+    motion.translate(nanobug::animation::cursor::Vec2::new(0., -37.5));
     for (old, new) in before.into_iter().zip(motion.corners()) {
         assert_eq!(new.x, old.x);
         assert!((new.y - old.y + 37.5).abs() < 0.0001);

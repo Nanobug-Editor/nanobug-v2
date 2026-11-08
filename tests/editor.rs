@@ -1,10 +1,6 @@
 //! Behavior checks for real text mutations, UTF-8 boundaries, undo units and file safety.
 use gpui::{Keystroke, Modifiers};
-use nanobug::{
-    document::Document,
-    keys::normal_character,
-    vim::{Action, Mode, Register, Vim},
-};
+use nanobug::editor::{Action, Document, Mode, Register, Vim, normal_character};
 use std::{
     fs,
     path::PathBuf,

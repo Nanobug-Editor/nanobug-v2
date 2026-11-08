@@ -1,8 +1,7 @@
 //! Replays the project configuration through the production phase and effect model.
-use nanobug::{
-    cursor_lifecycle::{CursorConfig, Stage, Target},
-    cursor_motion::{CursorMotion, Effect, Geometry, Vec2},
-    scroll_motion::GridScroll,
+use nanobug::animation::{
+    cursor::{CursorConfig, CursorMotion, Effect, Geometry, Stage, Target, Vec2},
+    scroll::GridScroll,
 };
 
 /// Idle layers share a stage, wake after a delay, and reset together on input.

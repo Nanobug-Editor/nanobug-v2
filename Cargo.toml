@@ -10,9 +10,11 @@ anyhow = "1"
 gpui = { package = "gpui-pre", version = "=0.3.10", default-features = false }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", default-features = false }
 image = { version = "0.25.10", default-features = false }
+unicode-script = "0.5"
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10.9"
 tempfile = "3.27.0"
 toml = "0.8.23"

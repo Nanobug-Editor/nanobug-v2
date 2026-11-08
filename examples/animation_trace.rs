@@ -1,5 +1,5 @@
 //! Export the actual cursor model for a deterministic comparison animation, without a native window.
-use nanobug::cursor_motion::{CursorMotion, Effect, Geometry, Vec2};
+use nanobug::animation::cursor::{CursorMotion, Effect, Geometry, Vec2};
 use std::{
     fs::File,
     io::{BufWriter, Write},

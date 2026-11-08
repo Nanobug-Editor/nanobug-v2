@@ -1,0 +1,3 @@
+# Offsets in theme.json refer to the original byte sequence.
+icons.pack binary
+Material-Icon-Theme-MIT.txt -text

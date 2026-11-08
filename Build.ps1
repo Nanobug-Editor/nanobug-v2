@@ -8,7 +8,9 @@ try {
     New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
     # Ship the licenses for assets embedded in the executable.
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'assets\fonts\MapleMono-OFL.txt') -Destination $outputPath
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'assets\icons\Lucide-ISC.txt') -Destination $outputPath
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'assets\fonts\Recursive-OFL.txt') -Destination $outputPath
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'assets\fonts\AlibabaPuHuiTi-3-Notice.txt') -Destination $outputPath
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'assets\icons\material\Material-Icon-Theme-MIT.txt') -Destination $outputPath
     # Stage the complete executable, preserving an in-use previous build and its live buffers.
     $targetPath = Join-Path $outputPath 'Nanobug.exe'
     $versionId = [Guid]::NewGuid().ToString('N')
