@@ -26,7 +26,7 @@ pub const SELECTION: u32 = 0x65baa558;
 /// Subtle current-line/status tint above the panel's material.
 pub const CURRENT: u32 = 0x85bcd522;
 /// Low-contrast RGBA ink for Explorer hierarchy guides.
-pub(super) const TREE_GUIDE: u32 = 0x4f627aff;
+pub(crate) const TREE_GUIDE: u32 = 0x4f627aff;
 /// Bundled Rec Mono Casual, with code ligatures disabled to preserve separate cells.
 pub static GRID_TEXT_FONT: LazyLock<Font> = LazyLock::new(|| Font {
     features: FontFeatures::disable_ligatures(),

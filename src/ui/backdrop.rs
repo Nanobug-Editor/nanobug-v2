@@ -1,5 +1,5 @@
 //! Rasterize the workspace layers once for the shortcut popup's frosted backdrop.
-use crate::{explorer::EntryIcon, ui::theme::BACKGROUND};
+use crate::{ui::icons::Icon, ui::theme::BACKGROUND};
 use gpui::{
     Bounds, DevicePixels, ObjectFit, Pixels, PlatformTextSystem, Point, RenderGlyphParams,
     RenderImage, Size, SvgRenderer, point, size,
@@ -35,7 +35,7 @@ pub(crate) struct BackdropRaster<'a> {
     /// SVG renderer for the built-in file icons.
     svg: SvgRenderer,
     /// BGRA file icons at the snapshot's scale and shared grid font size.
-    icons: HashMap<EntryIcon, Option<Arc<RenderImage>>>,
+    icons: HashMap<Icon, Option<Arc<RenderImage>>>,
 }
 
 impl<'a> BackdropRaster<'a> {
@@ -124,7 +124,7 @@ impl<'a> BackdropRaster<'a> {
     }
 
     /// Blend the original colors of `icon` into its logical `bounds`, clipped to its pane.
-    pub(crate) fn icon(&mut self, icon: EntryIcon, bounds: Bounds<Pixels>, clip: Bounds<Pixels>) {
+    pub(crate) fn icon(&mut self, icon: Icon, bounds: Bounds<Pixels>, clip: Bounds<Pixels>) {
         let visible = self.pixel_clip(clip);
         let edge = (f32::from(bounds.size.width) * self.scale).round().max(1.) as i32;
         let image = self

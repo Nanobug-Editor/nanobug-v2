@@ -2690,6 +2690,7 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-platform",
  "image",
+ "raw-window-handle",
  "rustix",
  "serde",
  "serde_json",

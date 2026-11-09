@@ -1,6 +1,6 @@
 //! Horizontal positions for workspace text, shared by drawing and input.
 use gpui::{FontId, PlatformTextSystem};
-use nanobug::editor::display_width;
+use nanobug::document::display_width;
 use std::{borrow::Cow, cell::RefCell, collections::HashMap, iter::from_fn, sync::Arc};
 use unicode_script::{Script, UnicodeScript};
 use unicode_segmentation::UnicodeSegmentation;

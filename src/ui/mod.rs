@@ -1,10 +1,9 @@
-//! Native drawing, text measurement and the independently animated cursor view.
-//! These views render derived state and do not own editable document copies.
+//! Shared native UI support: text measurement, SVG raster caching, themes and input normalization.
+//! Concrete grid windows and their retained renderer live in `grid`.
 
 pub(crate) mod backdrop;
-mod cursor;
-pub(crate) mod grid;
+pub(crate) mod icons;
+pub(crate) mod ime;
+pub(crate) mod keys;
 pub(crate) mod text;
 pub(crate) mod theme;
-
-pub(crate) use cursor::Cursor;

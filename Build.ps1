@@ -11,6 +11,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'assets\fonts\Recursive-OFL.txt') -Destination $outputPath
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'assets\fonts\AlibabaPuHuiTi-3-Notice.txt') -Destination $outputPath
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'assets\icons\material\Material-Icon-Theme-MIT.txt') -Destination $outputPath
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'assets\icons\Leader-Icons-Licenses.txt') -Destination $outputPath
     # Stage the complete executable, preserving an in-use previous build and its live buffers.
     $targetPath = Join-Path $outputPath 'Nanobug.exe'
     $versionId = [Guid]::NewGuid().ToString('N')

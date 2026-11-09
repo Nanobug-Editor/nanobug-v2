@@ -1,32 +1,21 @@
 //! Process startup: resolve the initial project, register assets and open the native workspace.
 
-mod workspace;
-
-use crate::explorer::ExplorerIconCache;
+use crate::{grid::Workspace, ui::icons::IconCache};
 use gpui::{
     App, AppContext, Bounds, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
     WindowOptions, px, size,
 };
 
-/// Open the supplied directory/file, or the current working directory when no argument is given.
+/// Open the supplied directories or files, defaulting to the current working directory.
 pub(crate) fn run() {
-    let path = std::env::args_os()
-        .nth(1)
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::current_dir().unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").into())
-        });
-    let path = if path.is_relative() {
-        std::env::current_dir().unwrap_or_default().join(path)
-    } else {
-        path
-    };
-    let initial = path.is_file().then(|| path.clone());
-    let project = if initial.is_some() {
-        path.parent().unwrap().to_path_buf()
-    } else {
-        path
-    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").into());
+    let mut paths: Vec<_> = std::env::args_os()
+        .skip(1)
+        .map(|path| cwd.join(path))
+        .collect();
+    if paths.is_empty() {
+        paths.push(cwd);
+    }
     let platform = gpui_platform::current_platform(false);
     let glyphs = platform.text_system();
     // Register the bundled text and box-drawing faces before GPUI measures the grid.
@@ -47,7 +36,7 @@ pub(crate) fn run() {
         ])
         .expect("register bundled grid fonts");
     gpui::Application::with_platform(platform).run(move |cx: &mut App| {
-        cx.set_global(ExplorerIconCache::default());
+        cx.set_global(IconCache::default());
         let bounds = Bounds::centered(None, size(px(1320.), px(840.)), cx);
         cx.open_window(
             WindowOptions {
@@ -56,13 +45,12 @@ pub(crate) fn run() {
                 window_background: WindowBackgroundAppearance::Blurred,
                 titlebar: Some(TitlebarOptions {
                     title: Some("Nanobug V2".into()),
+                    appears_transparent: cfg!(windows),
                     ..Default::default()
                 }),
                 ..Default::default()
             },
-            move |window, cx| {
-                cx.new(|cx| workspace::Editor::new(project, initial, glyphs, window, cx))
-            },
+            move |window, cx| cx.new(|cx| Workspace::new(paths, glyphs, window, cx)),
         )
         .expect("create Nanobug native window");
         cx.on_window_closed(|cx, _| cx.quit()).detach();

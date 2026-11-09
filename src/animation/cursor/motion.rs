@@ -3,6 +3,7 @@ use super::{
     lifecycle::{CursorConfig, Kind, Stage, Target, Timeline, Wave},
     shape::{CubicSegment, FLUID_SEGMENTS, fluid_outline},
 };
+use crate::i18n;
 use std::collections::VecDeque;
 
 /// A logical-pixel point independent of GPUI.
@@ -121,14 +122,14 @@ pub enum Effect {
     Ripple,
 }
 impl Effect {
-    /// Human-readable label used in the editor's status line.
+    /// Localized label used in the editor's status line.
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Fluid => "流体",
-            Self::Elastic => "弹性",
-            Self::Afterglow => "余晖",
-            Self::Ripple => "涟漪",
-        }
+        i18n::text(match self {
+            Self::Fluid => "cursor.fluid",
+            Self::Elastic => "cursor.elastic",
+            Self::Afterglow => "cursor.afterglow",
+            Self::Ripple => "cursor.ripple",
+        })
     }
     /// Select the adjacent effect, going backwards when `reverse` is true.
     pub fn next(self, reverse: bool) -> Self {

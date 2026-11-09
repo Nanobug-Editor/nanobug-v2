@@ -1,5 +1,6 @@
 //! Stage bindings and timed effects shared by the motion model and the native painter.
 use super::motion::{Effect, Vec2};
+use crate::i18n;
 use serde::Deserialize;
 use std::{collections::BTreeMap, path::Path};
 
@@ -200,7 +201,10 @@ impl CursorConfig {
                     && settings
                         .response_ms
                         .is_none_or(|n| (12..=2000).contains(&n)),
-                "stage {stage:?} timing must be at most 2000 ms"
+                i18n::format(
+                    "cursor.invalid_stage_timing",
+                    &[("stage", &format_args!("{stage:?}"))]
+                )
             );
             for binding in settings.effects.iter().flatten() {
                 anyhow::ensure!(
@@ -213,17 +217,26 @@ impl CursorConfig {
                         && (1. ..=512.).contains(&binding.radius_px)
                         && (0. ..=12.).contains(&binding.text_offset_px)
                         && (0. ..=1000.).contains(&binding.min_cells),
-                    "invalid effect parameters for {stage:?}"
+                    i18n::format(
+                        "cursor.invalid_effect_parameters",
+                        &[("stage", &format_args!("{stage:?}"))],
+                    )
                 );
                 anyhow::ensure!(
                     binding.repeat_ms == 0
                         || (binding.duration(stage) > 0
                             && binding.duration(stage) <= binding.repeat_ms),
-                    "repeat_ms must be at least duration_ms for {stage:?}"
+                    i18n::format(
+                        "cursor.invalid_repeat_interval",
+                        &[("stage", &format_args!("{stage:?}"))],
+                    )
                 );
                 anyhow::ensure!(
                     !stage.transient() || binding.repeat_ms == 0 || binding.count > 0,
-                    "{stage:?} repeats require a finite count"
+                    i18n::format(
+                        "cursor.missing_repeat_count",
+                        &[("stage", &format_args!("{stage:?}"))],
+                    )
                 );
             }
             anyhow::ensure!(
@@ -231,7 +244,7 @@ impl CursorConfig {
                     .effects
                     .as_ref()
                     .is_none_or(|items| items.len() <= 16),
-                "at most 16 effects per stage"
+                i18n::text("cursor.too_many_effects")
             );
         }
         Ok(config)

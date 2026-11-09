@@ -1,6 +1,8 @@
 //! Behavior checks for real text mutations, UTF-8 boundaries, undo units and file safety.
-use gpui::{Keystroke, Modifiers};
-use nanobug::editor::{Action, Document, Mode, Register, Vim, normal_character};
+use nanobug::{
+    document::Document,
+    vim::{Action, Mode, Register, Vim},
+};
 use std::{
     fs,
     path::PathBuf,
@@ -193,34 +195,4 @@ fn invalid_utf8_and_binary_files_are_rejected_without_changing_a_buffer() {
     fs::write(&path, "a\0b").unwrap();
     assert!(Document::open(&path).is_err());
     fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn normal_keys_work_without_ime_commits_and_preserve_shifted_commands() {
-    for (raw, shift, expected) in [
-        ("i", false, "i"),
-        ("g", true, "G"),
-        (";", true, ":"),
-        ("4", true, "$"),
-        ("6", true, "^"),
-    ] {
-        let key = Keystroke {
-            key: raw.into(),
-            key_char: None,
-            modifiers: Modifiers {
-                shift,
-                ..Default::default()
-            },
-        };
-        assert_eq!(normal_character(&key).as_deref(), Some(expected));
-    }
-    let control = Keystroke {
-        key: "r".into(),
-        modifiers: Modifiers {
-            control: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    assert_eq!(normal_character(&control), None);
 }

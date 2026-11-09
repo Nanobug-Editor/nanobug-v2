@@ -1,4 +1,6 @@
-//! Editor state and deterministic animation models, independent of the native application shell.
+//! Document and editing models plus deterministic animation, without native window ownership.
 
 pub mod animation;
-pub mod editor;
+pub mod document;
+pub mod i18n;
+pub mod vim;
