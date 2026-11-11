@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 16">
+  <defs>
+    <g id="wordmark" fill-rule="evenodd">
+      <path transform="translate(1 2)" d="M0 0h2v1h1v2h1v2h1V0h2v10H5V9H4V7H3V5H2v5H0Z"/>
+      <path transform="translate(10 2)" d="M1 0h5v1h1v9H5V6H2v4H0V1h1ZM2 2v2h3V2Z"/>
+      <path transform="translate(19 2)" d="M0 0h2v1h1v2h1v2h1V0h2v10H5V9H4V7H3V5H2v5H0Z"/>
+      <path transform="translate(28 2)" d="M1 0h5v1h1v8H6v1H1V9H0V1h1ZM2 2v6h3V2Z"/>
+      <path transform="translate(37 2)" d="M0 0h6v1h1v3H6v1h1v4H6v1H0Zm2 2v2h3V2Zm0 4v2h3V6Z"/>
+      <path transform="translate(46 2)" d="M0 0h2v8h3V0h2v9H6v1H1V9H0Z"/>
+      <path transform="translate(55 2)" d="M1 0h5v1h1v2H5V2H2v6h3V6H4V4h3v5H6v1H1V9H0V1h1Z"/>
+    </g>
+  </defs>
+  <use href="#wordmark" transform="translate(.7 1)" fill="#4f627a"/>
+  <use href="#wordmark" fill="#c8d3f5"/>
+  <g transform="translate(65 0)" fill="#9df0d4">
+    <path d="M3 1h1v2h1v1H4V3H3Zm7 0h1v2h-1v1H9V3h1ZM0 5h2v1H0Zm12 0h2v1h-2ZM0 8h2v1H0Zm12 0h2v1h-2ZM0 11h2v1H0Zm12 0h2v1h-2Z"/>
+    <path fill-rule="evenodd" d="M5 3h4v1h2v2h1v5h-1v2H9v1H5v-1H3v-2H2V6h1V4h2ZM4 6v1h6V6Zm2 2v4h2V8Z"/>
+  </g>
+</svg>

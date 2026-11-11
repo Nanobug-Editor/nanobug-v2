@@ -1,100 +1,65 @@
-//! Confirm closing the editor, one modified buffer at a time.
+//! Resolve modified buffers before closing an editor pane, project or window.
 
-use super::{
-    Workspace,
-    layout::{Focus, ShellWindow},
-    projects::Projects,
-};
+use super::{Workspace, projects::WorkspaceTabs};
 use crate::{
     grid::{
-        render::{Frame, LabelStyle, Rect},
-        windows::editor::EditorWindow,
+        mnemonic::Mnemonic,
+        render::{Frame, Rect},
     },
     ui::{
         text::TextSpacing,
-        theme::{ACCENT, GOLD, TEXT},
+        theme::{ACCENT, GOLD, MUTED, TEXT},
     },
 };
-use gpui::{Context, KeyDownEvent, Modifiers, Pixels, Point, Window};
-use nanobug::i18n;
+use gpui::{Context, KeyDownEvent, Modifiers, MouseDownEvent, Window};
+use nanobug::{document::Document, i18n};
 use std::{collections::VecDeque, ops::Range, path::PathBuf};
 
-/// Width of the confirmation and its three buttons in grid columns.
-const COLUMNS: usize = 54;
+/// Width of the confirmation in grid columns, including the longest button row.
+const COLUMNS: usize = 64;
 /// Height through the border, filename and button row, before any error.
 const ROWS: usize = 6;
 /// Button order and translation keys used for drawing and keyboard matching.
-const BUTTONS: [(Choice, &str); 3] = [
+const BUTTONS: [(Choice, &str); 5] = [
     (Choice::Save, "editor_close.yes"),
     (Choice::Discard, "editor_close.no"),
+    (Choice::SaveAll, "editor_close.save_all"),
+    (Choice::DiscardAll, "editor_close.discard_all"),
     (Choice::Cancel, "editor_close.cancel"),
 ];
 
-/// The user's response for the file currently shown.
+/// The user's response for the current file or the remaining close request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Choice {
     /// Save this file before continuing.
     Save,
-    /// Discard this file's edits once the pane is ready to close.
+    /// Discard this file's edits once the request is ready to close.
     Discard,
+    /// Save every remaining file, pausing for Save As or a write error.
+    SaveAll,
+    /// Discard the remaining files' edits and close.
+    DiscardAll,
     /// Keep the editor open and drop any queued discards.
     Cancel,
 }
 
-/// A localized caption split around its marked access key.
-#[derive(Clone, Copy)]
-struct Mnemonic {
-    /// Ordinary text before the marked letter.
-    prefix: &'static str,
-    /// One ASCII letter for both keyboard input and underlining, or empty for a plain caption.
-    letter: &'static str,
-    /// Ordinary text after the letter.
-    suffix: &'static str,
+/// Resolve captions for the active language, with bulk choices for `multiple` files.
+fn buttons(multiple: bool) -> impl Iterator<Item = (Choice, Mnemonic)> {
+    BUTTONS
+        .into_iter()
+        .filter(move |(choice, _)| {
+            multiple || !matches!(choice, Choice::SaveAll | Choice::DiscardAll)
+        })
+        .map(|(choice, label)| (choice, Mnemonic::parse(i18n::text(label))))
 }
 
-impl Mnemonic {
-    /// Split a button `label` at its single `&` marker before an ASCII letter.
-    fn parse(label: &'static str) -> Self {
-        if let Some((prefix, tail)) = label.split_once('&')
-            && let Some(letter) = tail
-                .get(..1)
-                .filter(|s| s.as_bytes()[0].is_ascii_alphabetic())
-        {
-            Self {
-                prefix,
-                letter,
-                suffix: &tail[1..],
-            }
-        } else {
-            Self {
-                prefix: label,
-                letter: "",
-                suffix: "",
-            }
-        }
-    }
-
-    /// Return the bracketed button in the same spans used for sizing and drawing.
-    fn spans(self) -> [(&'static str, LabelStyle); 5] {
-        [
-            ("[", LabelStyle::Text),
-            (self.prefix, LabelStyle::Text),
-            (self.letter, LabelStyle::Key),
-            (self.suffix, LabelStyle::Text),
-            ("]", LabelStyle::Text),
-        ]
-    }
-}
-
-/// Resolve captions for the active language.
-fn buttons() -> [(Choice, Mnemonic); BUTTONS.len()] {
-    BUTTONS.map(|(choice, label)| (choice, Mnemonic::parse(i18n::text(label))))
-}
-
-/// Measure the button hit regions with the same `spacing` as the painted spans.
-fn button_slots(spacing: &TextSpacing) -> [(Choice, Mnemonic, Range<usize>); BUTTONS.len()] {
+/// Measure visible button slots with the same `spacing` as drawing, including bulk choices if `multiple`.
+fn button_slots(
+    spacing: &TextSpacing,
+    multiple: bool,
+) -> impl Iterator<Item = (Choice, Mnemonic, Range<usize>)> + '_ {
     let mut start = 2;
-    buttons().map(|(choice, label)| {
+    buttons(multiple).map(move |(choice, label)| {
         let width: usize = label
             .spans()
             .map(|(text, _)| spacing.columns(text))
@@ -106,11 +71,8 @@ fn button_slots(spacing: &TextSpacing) -> [(Choice, Mnemonic, Range<usize>); BUT
     })
 }
 
-/// Match a fresh `event` against the localized `buttons` or the standard Escape action.
-fn key_choice(
-    event: &KeyDownEvent,
-    buttons: [(Choice, Mnemonic); BUTTONS.len()],
-) -> Option<Choice> {
+/// Match a fresh `event` against visible captions, including bulk choices if `multiple`, or Escape.
+fn key_choice(event: &KeyDownEvent, multiple: bool) -> Option<Choice> {
     let key = &event.keystroke;
     let mods = key.modifiers;
     if event.is_held || mods.control || mods.platform || mods.function {
@@ -119,18 +81,64 @@ fn key_choice(
     if key.key == "escape" && mods == Modifiers::default() {
         return Some(Choice::Cancel);
     }
-    buttons
-        .into_iter()
-        .find(|(_, label)| !label.letter.is_empty() && label.letter.eq_ignore_ascii_case(&key.key))
+    buttons(multiple)
+        .find(|(_, label)| label.matches(&key.key))
         .map(|(choice, _)| choice)
 }
 
-/// Pending decisions while the popup owns input and the buffer order is fixed.
+/// Find the button at grid `(x, y)` in `area`, using the drawn `spacing` and `multiple` choices.
+/// Ignore `click_count` above one so a double click cannot answer two files.
+fn click_choice(
+    area: Rect,
+    (x, y): (usize, usize),
+    click_count: usize,
+    spacing: &TextSpacing,
+    multiple: bool,
+) -> Option<Choice> {
+    if click_count > 1 || !area.contains(x, y) || y != area.y + area.h - 2 {
+        return None;
+    }
+    button_slots(spacing, multiple)
+        .find_map(|(choice, _, slot)| slot.contains(&(x - area.x)).then_some(choice))
+}
+
+/// The scope of the user's close request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CloseTarget {
+    /// The editor pane in the selected project.
+    Editor,
+    /// The selected project tab.
+    Project,
+    /// The native window and all its projects.
+    Quit,
+}
+
+/// Identifies a modified buffer while the dialog holds tab and buffer order fixed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingBuffer {
+    /// Project tab that owns the buffer.
+    tab: usize,
+    /// Buffer index within that project.
+    index: usize,
+}
+
+impl PendingBuffer {
+    /// Read the document for this queued buffer in `projects`.
+    fn document(self, projects: &WorkspaceTabs) -> &Document {
+        &projects.project(self.tab).editor.buffers[self.index]
+            .vim
+            .doc
+    }
+}
+
+/// Pending close decisions while the popup owns input.
 pub(super) struct EditorClose {
-    /// Dirty buffer indices to ask about, starting with the displayed file.
-    pending: VecDeque<usize>,
-    /// Buffer indices to reset only after every file is resolved.
-    discarded: Vec<usize>,
+    /// Operation to complete when every file is resolved.
+    target: CloseTarget,
+    /// Modified buffers, with the active project and its displayed file first.
+    pending: VecDeque<PendingBuffer>,
+    /// Buffers to reset only once every remaining decision is resolved.
+    discarded: Vec<PendingBuffer>,
     /// Last write or file-picker error for the current buffer.
     error: Option<String>,
     /// A native Save As picker owns input while choosing a filename.
@@ -138,13 +146,29 @@ pub(super) struct EditorClose {
 }
 
 impl EditorClose {
-    /// Collect the dirty buffers in `editor`, or return None if it can close immediately.
-    fn new(editor: &EditorWindow) -> Option<Self> {
-        let pending: VecDeque<_> = std::iter::once(editor.active)
-            .chain((0..editor.buffers.len()).filter(|&index| index != editor.active))
-            .filter(|&index| editor.buffers[index].vim.doc.modified())
-            .collect();
+    /// Collect the dirty buffers in `projects` covered by `target`, or let a clean request proceed.
+    fn new(projects: &WorkspaceTabs, target: CloseTarget) -> Option<Self> {
+        let active = projects
+            .active_project()
+            .map(|project| (projects.selected, project));
+        let others = projects
+            .indexed()
+            .filter(|(tab, _)| target == CloseTarget::Quit && *tab != projects.selected);
+        let mut pending = VecDeque::new();
+        for (tab, project) in active.into_iter().chain(others) {
+            let editor = &project.editor;
+            let order = std::iter::once(editor.active)
+                .chain((0..editor.buffers.len()).filter(|&index| index != editor.active));
+            pending.extend(order.filter_map(|index| {
+                editor.buffers[index]
+                    .vim
+                    .doc
+                    .modified()
+                    .then_some(PendingBuffer { tab, index })
+            }));
+        }
         (!pending.is_empty()).then(|| Self {
+            target,
             pending,
             discarded: Vec::new(),
             error: None,
@@ -152,34 +176,72 @@ impl EditorClose {
         })
     }
 
-    /// Apply `choice` in `projects`, saving to `path` only for Save As.
-    /// Return whether the dialog can end. Save errors leave the current buffer pending.
-    fn resolve(&mut self, choice: Choice, path: Option<PathBuf>, projects: &mut Projects) -> bool {
-        let index = self.pending[0];
+    /// Apply `choice` in `projects`, using `path` for the first buffer when resuming Save As.
+    /// Return whether the dialog can end. A picker or write error leaves that buffer pending.
+    fn resolve(
+        &mut self,
+        choice: Choice,
+        path: Option<PathBuf>,
+        projects: &mut WorkspaceTabs,
+    ) -> bool {
+        self.error = None;
         match choice {
             Choice::Cancel => return true,
-            Choice::Discard => self.discarded.push(index),
-            Choice::Save => {
-                if let Err(error) = save_buffer(projects, index, path) {
-                    self.error = Some(error.root_cause().to_string());
-                    return false;
+            Choice::Discard => self.discarded.extend(self.pending.drain(..1)),
+            Choice::DiscardAll => self.discarded.extend(self.pending.drain(..)),
+            Choice::Save | Choice::SaveAll => {
+                let mut path = path;
+                let count = if choice == Choice::SaveAll {
+                    self.pending.len()
+                } else {
+                    1
+                };
+                for _ in 0..count {
+                    let buffer = self.pending[0];
+                    let filename = buffer.document(projects).path.as_ref();
+                    if filename.is_none() && path.is_none() {
+                        self.picking_path = true;
+                        return false;
+                    }
+                    // Overlapping project roots can retain different drafts for one path.
+                    if choice == Choice::SaveAll
+                        && let Some(filename) = filename
+                        && self
+                            .pending
+                            .iter()
+                            .skip(1)
+                            .any(|other| other.document(projects).path.as_ref() == Some(filename))
+                    {
+                        self.error = Some(i18n::text("editor_close.duplicate_draft").into());
+                        return false;
+                    }
+                    if let Err(error) = save_buffer(projects, buffer, path.take()) {
+                        self.error = Some(error.root_cause().to_string());
+                        return false;
+                    }
+                    self.pending.pop_front();
                 }
             }
         }
-        self.error = None;
-        self.pending.pop_front();
         if !self.pending.is_empty() {
             return false;
         }
-        for index in self.discarded.drain(..) {
-            projects.active.editor.discard(index);
+        for buffer in self.discarded.drain(..) {
+            projects
+                .project_mut(buffer.tab)
+                .editor
+                .discard(buffer.index);
         }
         true
     }
 }
 
-/// Save buffer `index` in `projects`, preventing Save As to another open buffer's `path`.
-fn save_buffer(projects: &mut Projects, index: usize, path: Option<PathBuf>) -> anyhow::Result<()> {
+/// Save `buffer` in `projects`, preventing Save As to another open buffer's `path`.
+fn save_buffer(
+    projects: &mut WorkspaceTabs,
+    buffer: PendingBuffer,
+    path: Option<PathBuf>,
+) -> anyhow::Result<()> {
     if let Some(path) = &path {
         let path = path.canonicalize().unwrap_or_else(|_| path.clone());
         if projects.ordered().any(|project| {
@@ -193,28 +255,43 @@ fn save_buffer(projects: &mut Projects, index: usize, path: Option<PathBuf>) -> 
         }
     }
     let save_as = path.is_some();
-    projects.save_buffer(index, path)?;
-    if save_as {
-        let _ = projects.active.manager.tree.refresh();
+    projects.save_buffer(buffer.tab, buffer.index, path)?;
+    if save_as && let Some(manager) = &mut projects.project_mut(buffer.tab).manager {
+        let _ = manager.tree.refresh();
     }
     Ok(())
 }
 
 impl Workspace {
-    /// Start confirmation for the active editor, returning whether it must stay visible for now.
-    pub(super) fn begin_editor_close(&mut self) -> bool {
-        let Some(close) = EditorClose::new(&self.projects.active.editor) else {
+    /// Resolve dirty buffers before closing `target` in `window` through `cx`.
+    pub(super) fn request_close(
+        &mut self,
+        target: CloseTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.begin_close(target) {
+            self.finish_close(target, window, cx);
+        }
+    }
+
+    /// Start confirmation for `target`, returning whether closure must wait.
+    pub(super) fn begin_close(&mut self, target: CloseTarget) -> bool {
+        let Some(close) = EditorClose::new(&self.projects, target) else {
             return false;
         };
-        if self.projects.active.hidden_pane.is_some()
-            && let Some(message) = self.projects.inactive_exit_message()
-        {
-            self.projects.active.status = message;
-        } else {
-            self.editor_close = Some(close);
-            self.resizing = false;
-            self.projects.active.editor.dragging = None;
-            self.projects.active.editor.composition.clear();
+        self.editor_close = Some(close);
+        self.help.close();
+        self.language_selection = None;
+        self.prefix = None;
+        self.resizing = false;
+        self.hovered_controls = None;
+        if let Some(project) = self.projects.active_project_mut() {
+            if let Some(manager) = &mut project.manager {
+                manager.paste_timer = None;
+            }
+            project.editor.dragging = None;
+            project.editor.composition.clear();
         }
         true
     }
@@ -231,8 +308,9 @@ impl Workspace {
         let (Some(close), Some(area)) = (&self.editor_close, self.editor_close_area()) else {
             return;
         };
-        let project = &self.projects.active;
-        let doc = &project.editor.buffers[close.pending[0]].vim.doc;
+        let buffer = close.pending[0];
+        let project = self.projects.project(buffer.tab);
+        let doc = buffer.document(&self.projects);
         let filename = doc.path.as_deref().map_or_else(
             || i18n::text("editor.untitled").into(),
             |path| {
@@ -245,6 +323,15 @@ impl Workspace {
         let slot = 2..area.w - 2;
         let mut frame = Frame::new(area.w, area.h);
         frame.border(i18n::text("editor_close.title"), true, false, spacing);
+        if close.target != CloseTarget::Editor {
+            frame.label(
+                1,
+                slot.clone(),
+                &spacing.ellipsize(&project.name(), slot.len()),
+                MUTED,
+                spacing,
+            );
+        }
         frame.label(
             2,
             slot.clone(),
@@ -261,7 +348,7 @@ impl Workspace {
                 spacing,
             );
         }
-        for (_, label, slot) in button_slots(spacing) {
+        for (_, label, slot) in button_slots(spacing, close.pending.len() > 1) {
             let mut start = slot.start;
             for (text, style) in label.spans() {
                 start =
@@ -279,60 +366,56 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(choice) = key_choice(event, buttons()) {
+        if let Some(close) = &self.editor_close
+            && let Some(choice) = key_choice(event, close.pending.len() > 1)
+        {
             self.held_close_key = Some(event.keystroke.key.clone());
             self.choose_editor_close(choice, window, cx);
         }
     }
 
-    /// Handle a press at `position` in `window` through `cx`, consuming clicks behind the dialog.
+    /// Handle `event` in `window` through `cx`, consuming clicks behind the dialog.
     pub(super) fn press_editor_close(
         &mut self,
-        position: Point<Pixels>,
+        event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(area) = self.editor_close_area() else {
+        let (Some(close), Some(area)) = (&self.editor_close, self.editor_close_area()) else {
             return false;
         };
-        let (x, y) = self.metrics.cell(position);
-        if area.contains(x, y)
-            && y == area.y + area.h - 2
-            && let Some((choice, _, _)) = button_slots(&self.spacing)
-                .into_iter()
-                .find(|(_, _, slot)| slot.contains(&(x - area.x)))
-        {
+        let cell = self.metrics.cell(event.position);
+        if let Some(choice) = click_choice(
+            area,
+            cell,
+            event.click_count,
+            &self.spacing,
+            close.pending.len() > 1,
+        ) {
             self.choose_editor_close(choice, window, cx);
         }
         true
     }
 
-    /// Dispatch `choice` in `window` through `cx`, asking for a path for unnamed buffers.
+    /// Dispatch a fresh `choice` in `window` through `cx` while no native picker owns input.
     fn choose_editor_close(&mut self, choice: Choice, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(close) = self
+        if self
             .editor_close
-            .as_mut()
-            .filter(|close| !close.picking_path)
-        else {
-            return;
-        };
-        if choice == Choice::Save
-            && self.projects.active.editor.buffers[close.pending[0]]
-                .vim
-                .doc
-                .path
-                .is_none()
+            .as_ref()
+            .is_some_and(|close| !close.picking_path)
         {
-            close.picking_path = true;
-            self.pick_editor_save_path(window, cx);
-        } else {
             self.resolve_editor_close(choice, None, window, cx);
         }
     }
 
-    /// Select a Save As path from the active project directory in `window` through `cx`.
-    fn pick_editor_save_path(&self, window: &Window, cx: &mut Context<Self>) {
-        let picker = cx.prompt_for_new_path(&self.projects.active.root, None);
+    /// Select a path in `window` through `cx` and resume `choice` only if a path is supplied.
+    fn pick_editor_save_path(&self, choice: Choice, window: &Window, cx: &mut Context<Self>) {
+        let buffer = self
+            .editor_close
+            .as_ref()
+            .expect("save picker needs a close request")
+            .pending[0];
+        let picker = cx.prompt_for_new_path(&self.projects.project(buffer.tab).root, None);
         cx.spawn_in(window, async move |view, cx| {
             let result = match picker.await {
                 Ok(result) => result,
@@ -350,7 +433,7 @@ impl Workspace {
                     close.picking_path = false;
                     match result {
                         Ok(Some(path)) => {
-                            workspace.resolve_editor_close(Choice::Save, Some(path), window, cx)
+                            workspace.resolve_editor_close(choice, Some(path), window, cx)
                         }
                         Ok(None) => {}
                         Err(error) => {
@@ -364,7 +447,7 @@ impl Workspace {
         .detach();
     }
 
-    /// Apply `choice` with an optional Save As `path`, then update `window` through `cx`.
+    /// Apply `choice` with an optional Save As `path`, advancing the close flow through `window` and `cx`.
     fn resolve_editor_close(
         &mut self,
         choice: Choice,
@@ -372,13 +455,17 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(close) = &mut self.editor_close
-            && close.resolve(choice, path, &mut self.projects)
-        {
+        let Some(close) = &mut self.editor_close else {
+            return;
+        };
+        if close.resolve(choice, path, &mut self.projects) {
+            let target = close.target;
             self.editor_close = None;
             if choice != Choice::Cancel {
-                self.finish_grid_close(ShellWindow::Pane(Focus::Editor), window);
+                self.finish_close(target, window, cx);
             }
+        } else if close.picking_path {
+            self.pick_editor_save_path(choice, window, cx);
         }
         self.sync(window, cx);
     }

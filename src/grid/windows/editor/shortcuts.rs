@@ -42,5 +42,5 @@ pub(in crate::grid) const SHORTCUTS: &[Shortcut] = &[
     (Localized("keys.editor_search"), "editor_shortcuts.search"),
     (Fixed(":w / Ctrl+s"), "editor_shortcuts.save"),
     (Localized("keys.editor_open"), "editor_shortcuts.open"),
-    (Fixed(":q  :q!  :wq  :x"), "editor_shortcuts.quit"),
+    (Fixed(":q  :qa  :q!  :wq  :x"), "editor_shortcuts.quit"),
 ];

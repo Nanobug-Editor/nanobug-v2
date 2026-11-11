@@ -189,13 +189,14 @@ fn shell_labels_use_measured_widths_with_fixed_anchors() {
             .all(|cell| cell.text == " ")
     );
     assert_eq!(frame.rows[0].cells[11].text, "─");
-    assert_eq!(
-        frame.rows[0].cells[16..23]
+    assert_eq!(frame.rows[0].cells[16].text, "─");
+    assert_eq!(frame.rows[0].cells[18].text, "?");
+    assert!(
+        frame.rows[0].cells[20..23]
             .iter()
-            .map(|cell| cell.text.as_str())
-            .collect::<String>(),
-        " [Esc] "
+            .all(|cell| cell.text == " ")
     );
+    assert_eq!(frame.rows[0].cells[23].text, "─");
     assert_eq!(frame.label(1, 1..4, "中文X", TEXT, &spacing), 4);
     assert_eq!(frame.right_label(1, 24, "余 UTF-8", GOLD, &spacing), 16);
     assert_eq!(

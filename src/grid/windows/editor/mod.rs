@@ -13,7 +13,6 @@ pub(in crate::grid) use input::EditResult;
 use crate::ui::ime::Composition;
 use gpui::{Pixels, Point};
 use nanobug::{
-    animation::scroll::GridScroll,
     document::Document,
     vim::{Register, Vim},
 };
@@ -37,12 +36,13 @@ pub(in crate::grid) struct EditorWindow {
 impl EditorWindow {
     /// Create a window around `doc`, initially showing one buffer in Normal mode.
     pub(in crate::grid) fn new(doc: Document) -> Self {
+        Self::with_buffer(Buffer::new(doc))
+    }
+
+    /// Display a retained buffer, including its edits, undo state and viewport.
+    pub(in crate::grid) fn with_buffer(buffer: Buffer) -> Self {
         Self {
-            buffers: vec![Buffer {
-                vim: Vim::new(doc),
-                scroll: GridScroll::default(),
-                columns: GridScroll::default(),
-            }],
+            buffers: vec![buffer],
             active: 0,
             register: Register::default(),
             composition: Composition::default(),

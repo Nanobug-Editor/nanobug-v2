@@ -6,6 +6,7 @@ mod alt_escape;
 mod commands;
 mod editor_close;
 mod explorer;
+mod file_picker;
 mod frames;
 mod ime;
 mod keyboard;
@@ -14,20 +15,25 @@ mod layout;
 mod leader_hint;
 mod pointer;
 mod projects;
+mod recent_projects;
+mod start_page;
 mod tabs;
 mod view;
 mod viewport;
 
 use crate::grid::{
     render::{Cursor, Metrics, Panel, Rect},
-    windows::help::HelpWindow,
+    windows::{help::HelpWindow, start::StartPage},
 };
 
 use self::{
-    editor_close::EditorClose,
+    editor_close::{CloseTarget, EditorClose},
+    file_picker::PickerSession,
     keyboard::PendingPrefix,
-    layout::{Layout, ShellWindow},
-    projects::Projects,
+    layout::{Layout, OUTER_INSET_Y, ShellWindow, TAB_GAP_Y},
+    projects::WorkspaceTabs,
+    recent_projects::RecentProjects,
+    start_page::StartPreview,
     tabs::TabBar,
     viewport::CursorSpace,
 };
@@ -43,13 +49,23 @@ use std::{path::PathBuf, sync::Arc, time::Instant};
 pub(crate) struct Workspace {
     /// Native keyboard/IME focus for the whole character work surface.
     focus_handle: FocusHandle,
-    /// Open projects, including the panes that currently receive input.
-    projects: Projects,
-    /// Project strip layout and its independent animated selection.
+    /// Tab order, with each start page or project retaining its own state.
+    projects: WorkspaceTabs,
+    /// Tab strip layout and its independent animated selection.
     tabs: TabBar,
+    /// Project history shared by all start pages.
+    recent_projects: RecentProjects,
+    /// Retained frame for the selected start page.
+    start_panel: Entity<Panel>,
+    /// Directory scan shown by the active project picker.
+    start_preview: Option<StartPreview>,
+    /// Active picker session, including its render panels and pending operations.
+    file_picker: Option<PickerSession>,
+    /// Last successfully browsed directory for openings from the start page.
+    file_picker_directory: Option<PathBuf>,
     /// Shortcut-help window owns popup visibility and cached content.
     help: HelpWindow,
-    /// Pending decisions for closing the active editor.
+    /// Pending decisions for closing a pane, project or the native window.
     editor_close: Option<EditorClose>,
     /// Highlighted language while the picker is open.
     language_selection: Option<Locale>,
@@ -57,8 +73,8 @@ pub(crate) struct Workspace {
     language_list: Entity<Panel>,
     /// Cached cells for the leader hint, language picker chrome or editor close dialog.
     popup_panel: Entity<Panel>,
-    /// Window whose border currently shows the close button.
-    hovered_close: Option<ShellWindow>,
+    /// Window whose border currently shows its corner controls.
+    hovered_controls: Option<ShellWindow>,
     /// Ignore repeats of a key that just dismissed a popup, pane or project.
     held_close_key: Option<String>,
     /// Windows interception of Alt+Esc while this native window is active.
@@ -88,8 +104,6 @@ pub(crate) struct Workspace {
     scroll_scheduled: bool,
     /// Last logical cursor space, distinguishing viewport motion from focus jumps.
     last_cursor_space: Option<CursorSpace>,
-    /// User-selected visual behavior, independent of the document mode.
-    cursor_effect: Effect,
     /// Independent full-window cursor layer.
     cursor: Entity<Cursor>,
     /// Whether pointer dragging is resizing the sidebar.
@@ -106,7 +120,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let projects = Projects::new(paths);
+        let projects = WorkspaceTabs::new(paths);
+        let recent_projects =
+            RecentProjects::new(projects.ordered().map(|project| project.root.clone()));
         let system = window.text_system();
         let font_id = system.resolve_font(&GRID_TEXT_FONT);
         let rule_font_id = system.resolve_font(&font(GRID_RULE_FONT_FAMILY));
@@ -125,7 +141,7 @@ impl Workspace {
             cw: (advance * scale).round().max(1.) / scale,
             lh: (height * scale).ceil() / scale,
             font_size,
-            origin: point(px(14.), px(5.)),
+            origin: point(px(14.), px(OUTER_INSET_Y + TAB_GAP_Y)),
         };
         let chinese_face = system.resolve_font(&GRID_CHINESE_FONT);
         let spacing = TextSpacing::new(glyphs.clone(), chinese_face, font_size, metrics.cw);
@@ -134,13 +150,14 @@ impl Workspace {
         let weak = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             weak.update(cx, |workspace, cx| {
-                if workspace.editor_close.is_some() {
+                if workspace.editor_close.is_some() || workspace.picker_operation_pending() {
                     return false;
                 }
-                if let Some(message) = workspace.projects.exit_message() {
-                    workspace.projects.active.status = message;
+                if workspace.file_picker.take().is_some() {
+                    workspace.help.close();
+                }
+                if workspace.begin_close(CloseTarget::Quit) {
                     workspace.sync(window, cx);
-                    cx.notify();
                     false
                 } else {
                     true
@@ -154,29 +171,39 @@ impl Workspace {
             }
             #[cfg(windows)]
             {
+                if window.is_window_active() {
+                    workspace.sync_native_ime(window, cx);
+                }
                 workspace.alt_escape = alt_escape::AltEscape::install(
                     window,
                     cx,
-                    workspace.projects.active.focus == layout::Focus::Editor
-                        && !workspace.modal_open(),
+                    workspace.editor_accepts_alt_escape(),
                 );
             }
         })
         .detach();
         #[cfg(windows)]
-        let alt_escape = alt_escape::AltEscape::install(window, cx, true);
-        let config = projects.active.cursor_config.clone();
-        let cursor_effect = Effect::Afterglow;
+        let alt_escape =
+            alt_escape::AltEscape::install(window, cx, projects.active_project().is_some());
+        let config = projects
+            .active_project()
+            .map(|project| project.cursor_config.clone())
+            .unwrap_or_default();
         Self {
             focus_handle,
             projects,
             tabs: TabBar::new(metrics, cx),
+            recent_projects,
+            start_panel: cx.new(|_| Panel::new(StartPage::content_metrics(metrics))),
+            start_preview: None,
+            file_picker: None,
+            file_picker_directory: None,
             help: HelpWindow::new(metrics, cx),
             editor_close: None,
             language_selection: None,
             language_list: cx.new(|_| Panel::new(metrics)),
             popup_panel: cx.new(|_| Panel::new(metrics)),
-            hovered_close: None,
+            hovered_controls: None,
             held_close_key: None,
             #[cfg(windows)]
             alt_escape,
@@ -200,8 +227,7 @@ impl Workspace {
             scroll_epoch: Instant::now(),
             scroll_scheduled: false,
             last_cursor_space: None,
-            cursor_effect,
-            cursor: cx.new(|_| Cursor::new(cursor_effect, config)),
+            cursor: cx.new(|_| Cursor::new(Effect::Afterglow, config)),
             resizing: false,
             wheel: 0.,
         }
@@ -209,11 +235,20 @@ impl Workspace {
 
     /// Whether a popup currently owns pane input.
     fn modal_open(&self) -> bool {
-        self.help.is_open() || self.small_modal_open()
+        self.file_picker.is_some() || self.help.is_open() || self.small_modal_open()
     }
 
     /// Whether the language picker or editor close dialog currently owns pane input.
     fn small_modal_open(&self) -> bool {
         self.language_selection.is_some() || self.editor_close.is_some()
+    }
+
+    /// Keep Alt+Escape interception limited to the selected editor pane.
+    #[cfg(windows)]
+    fn editor_accepts_alt_escape(&self) -> bool {
+        self.projects
+            .active_project()
+            .is_some_and(|project| project.focus == layout::Focus::Editor)
+            && !self.modal_open()
     }
 }

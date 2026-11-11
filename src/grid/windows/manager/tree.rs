@@ -48,22 +48,45 @@ pub struct Explorer {
 impl Explorer {
     /// Scan the first level of `root`, without recursively indexing the project.
     pub fn new(root: PathBuf) -> Self {
-        let mut tree = Self {
+        let mut tree = Self::empty(root);
+        let _ = tree.refresh();
+        tree
+    }
+
+    /// Read the immediate children of `root` in the same order as a new Explorer.
+    pub(in crate::grid) fn preview(root: PathBuf) -> Result<Vec<Entry>> {
+        Self::directory_preview(root, false)
+    }
+
+    /// Read one directory for the picker, treating links to directories as navigable rows.
+    pub(in crate::grid) fn preview_with_directory_links(root: PathBuf) -> Result<Vec<Entry>> {
+        Self::directory_preview(root, true)
+    }
+
+    /// Read immediate children of `root`, with optional directory-link classification.
+    fn directory_preview(root: PathBuf, follow_directory_links: bool) -> Result<Vec<Entry>> {
+        let tree = Self::empty(root);
+        let mut entries = Vec::new();
+        tree.walk(&tree.root, 0, &mut entries, follow_directory_links)?;
+        Ok(entries)
+    }
+
+    /// Prepare a tree at `root` before reading its directory.
+    fn empty(root: PathBuf) -> Self {
+        Self {
             root,
             entries: Vec::new(),
             selected: 0,
             marked: HashSet::new(),
             expanded: HashSet::new(),
-        };
-        let _ = tree.refresh();
-        tree
+        }
     }
 
     /// Refresh visible entries and retain the selected path when it still exists.
     pub fn refresh(&mut self) -> Result<()> {
         let selected = self.entries.get(self.selected).map(|e| e.path.clone());
         let mut entries = Vec::new();
-        self.walk(&self.root, 0, &mut entries)?;
+        self.walk(&self.root, 0, &mut entries, false)?;
         self.entries = entries;
         self.selected = selected
             .and_then(|p| self.entries.iter().position(|e| e.path == p))
@@ -91,8 +114,14 @@ impl Explorer {
         }
     }
 
-    /// Append children of `directory` at `depth`, descending only into explicitly expanded nodes.
-    fn walk(&self, directory: &Path, depth: usize, output: &mut Vec<Entry>) -> Result<()> {
+    /// Append children of `directory` at `depth` to `output`, optionally classifying directory links.
+    fn walk(
+        &self,
+        directory: &Path,
+        depth: usize,
+        output: &mut Vec<Entry>,
+        follow_directory_links: bool,
+    ) -> Result<()> {
         if depth > 32 || output.len() >= 10_000 {
             return Ok(());
         }
@@ -107,7 +136,10 @@ impl Explorer {
             })
             .filter_map(|e| {
                 let kind = e.file_type().ok()?;
-                Some((e.path(), kind.is_dir()))
+                let path = e.path();
+                let directory =
+                    kind.is_dir() || follow_directory_links && kind.is_symlink() && path.is_dir();
+                Some((path, directory))
             })
             .collect();
         children.sort_by_key(|(p, dir)| {
@@ -137,7 +169,7 @@ impl Explorer {
                 continuing_branches: 0,
             });
             if open {
-                let _ = self.walk(&path, depth + 1, output);
+                let _ = self.walk(&path, depth + 1, output, follow_directory_links);
             }
         }
         Ok(())

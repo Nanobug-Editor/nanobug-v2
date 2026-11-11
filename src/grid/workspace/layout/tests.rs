@@ -1,10 +1,28 @@
-//! Pane selection and close button hit testing regressions.
+//! Pane selection, corner hit testing and footer clearance regressions.
 
 use super::*;
 
-/// The label fits on a narrow pane and activates only inside its small top-right hover region.
+/// Whole pane rows leave clearance above the footer while it stays aligned to the outer inset.
 #[test]
-fn close_button_uses_the_border_cells_and_pixel_tolerance() {
+fn footer_keeps_clearance_across_window_heights() {
+    for line_height in [20., 21., 22.] {
+        for height in 480..=840 {
+            let height = height as f32;
+            let (rows, offset) = footer_geometry(px(height), line_height);
+            let origin = OUTER_INSET_Y + TAB_GAP_Y;
+            let footer = origin + (rows - FOOTER_ROWS) as f32 * line_height + f32::from(offset);
+            let border = origin + ((rows - FOOTER_ROWS) as f32 - 0.5) * line_height;
+            assert!(footer + FOOTER_BADGE_INSET_Y - border >= FOOTER_GAP_Y);
+            let badge_bottom = footer + line_height - FOOTER_BADGE_INSET_Y;
+            assert_eq!(height - badge_bottom, OUTER_INSET_Y);
+        }
+    }
+    assert_eq!(footer_geometry(px(840.), 22.).0, 38);
+}
+
+/// Pane controls include a separate help target, while a popup has only its close target.
+#[test]
+fn corner_controls_use_adjacent_border_slots() {
     let metrics = Metrics {
         cw: 10.,
         lh: 20.,
@@ -17,21 +35,33 @@ fn close_button_uses_the_border_cells_and_pixel_tolerance() {
         w: 12,
         h: 8,
     };
-    let button = area.close_button().unwrap().pixels(metrics);
-    assert_eq!(button.origin, metrics.at(7., 2.));
-    assert_eq!(button.center().x, metrics.at(10.5, 2.5).x);
-    assert!(button.contains(&metrics.at(8.5, 2.5)));
+    let controls = area.corner_controls(true).unwrap();
+    let help = controls.help.unwrap().pixels(metrics);
+    let button = controls.close.pixels(metrics);
+    assert_eq!(help.right(), button.left());
+    assert_eq!(help.center(), metrics.at(9.5, 2.5));
+    assert!(near_corner_controls(area, true, metrics, help.center()));
+    assert!(area.corner_controls(false).unwrap().help.is_none());
+    assert!(!near_corner_controls(area, false, metrics, help.center()));
+    assert_eq!(button.origin, metrics.at(11., 2.));
+    assert_eq!(button.center().x, metrics.at(12.5, 2.5).x);
+    assert!(!button.contains(&metrics.at(10.8, 2.5)));
     assert!(button.contains(&metrics.at(12.5, 2.5)));
     assert!(!button.contains(&metrics.at(14.5, 2.5)));
-    for (x, y) in [(12.5, 2.5), (9., 3.1), (6.8, 2.5), (14.2, 2.5)] {
-        assert!(near_close_button(area, metrics, metrics.at(x, y)));
+    for (x, y) in [(12.5, 2.5), (12.5, 3.1), (10.8, 2.5), (14.2, 2.5)] {
+        assert!(near_corner_controls(area, true, metrics, metrics.at(x, y)));
     }
-    for (x, y) in [(5., 2.5), (15.5, 2.5), (16.2, 6.), (10., 9.5), (10., 5.)] {
-        assert!(!near_close_button(area, metrics, metrics.at(x, y)));
+    for (x, y) in [(7., 2.5), (15.5, 2.5), (16.2, 6.), (10., 9.5), (10., 5.)] {
+        assert!(!near_corner_controls(area, true, metrics, metrics.at(x, y)));
     }
     let hidden = Rect { w: 0, ..area };
-    assert!(hidden.close_button().is_none());
-    assert!(!near_close_button(hidden, metrics, metrics.at(4., 2.)));
+    assert!(hidden.corner_controls(true).is_none());
+    assert!(!near_corner_controls(
+        hidden,
+        true,
+        metrics,
+        metrics.at(4., 2.)
+    ));
 }
 
 /// A shortcut popup owns the selection while open and returns it to its originating pane.

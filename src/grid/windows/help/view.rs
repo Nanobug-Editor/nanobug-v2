@@ -235,7 +235,8 @@ impl HelpWindow {
         let global = list.scope() == Scope::Global;
         chrome.border_with_title(
             context.selected,
-            context.close_hovered,
+            context.controls_hovered,
+            false,
             |frame, slot, color| {
                 let mut start = slot.start;
                 for (text, selected) in [

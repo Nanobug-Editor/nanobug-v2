@@ -48,10 +48,14 @@ impl Workspace {
     /// Open the picker in `window` with the active language highlighted, then repaint through `cx`.
     pub(super) fn open_language_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.language_selection = Some(i18n::locale());
-        self.hovered_close = None;
+        self.hovered_controls = None;
         self.resizing = false;
-        self.projects.active.editor.dragging = None;
-        self.projects.active.manager.click = None;
+        if let Some(project) = self.projects.active_project_mut() {
+            project.editor.dragging = None;
+            if let Some(manager) = &mut project.manager {
+                manager.click = None;
+            }
+        }
         self.repaint([ScrollInput::Advance; 3], window, cx);
     }
 
@@ -199,6 +203,9 @@ impl Workspace {
             && i18n::set_locale(locale)
         {
             // Status feedback is already formatted in the previous language.
+            if let Some(page) = self.projects.start_mut() {
+                page.status.clear();
+            }
             for project in self.projects.iter_mut() {
                 project.status.clear();
                 for buffer in &mut project.editor.buffers {

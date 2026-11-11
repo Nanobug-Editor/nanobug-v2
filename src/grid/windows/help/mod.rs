@@ -50,8 +50,17 @@ impl HelpWindow {
     }
 
     /// Start a fresh session for the editor or, when `manager` is true, Explorer.
-    pub(in crate::grid) fn open(&mut self, manager: bool) {
-        self.list = Some(HelpList::new(manager));
+    pub(in crate::grid) fn open(&mut self, manager: bool, manager_available: bool) {
+        self.list = Some(HelpList::new(manager, manager_available));
+    }
+
+    /// Start help over the file picker's shortcut catalog.
+    pub(in crate::grid) fn open_file_picker(&mut self, manager_available: bool) {
+        self.list = Some(HelpList::for_window(
+            super::file_picker::SHORTCUTS,
+            "picker.help_title",
+            manager_available,
+        ));
     }
 
     /// Discard the browsing session and its transient text.

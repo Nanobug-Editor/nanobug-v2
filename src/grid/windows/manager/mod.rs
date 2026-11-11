@@ -9,17 +9,16 @@ mod transfer;
 mod tree;
 mod view;
 
-use icons::EntryIcon;
+pub(in crate::grid) use icons::EntryIcon;
 pub(in crate::grid) use input::ManagerCommand;
-use transfer::TransferKind;
+pub(in crate::grid) use transfer::{FileTransfers, TransferKind, move_exclusive};
 
 use super::PathChange;
 
 use gpui::Task;
 use nanobug::animation::scroll::GridScroll;
 use std::path::PathBuf;
-use transfer::FileTransfers;
-use tree::Explorer;
+pub(in crate::grid) use tree::{Entry, Explorer};
 
 /// The manager window owns filesystem selection, transfer history and scrolling.
 pub(in crate::grid) struct ManagerWindow {

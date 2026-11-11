@@ -17,16 +17,16 @@ pub(in crate::grid) struct WindowFrame<'a> {
     pub selected: bool,
     /// Whether a modal popup currently owns input.
     pub modal_open: bool,
-    /// Whether the close button must be reserved in the border.
-    pub close_hovered: bool,
+    /// Whether the corner controls are visible in the border.
+    pub controls_hovered: bool,
     /// Shared font measurements used for labels and document cells.
     pub spacing: &'a TextSpacing,
 }
 
 impl WindowFrame<'_> {
-    /// Draw `title` around `frame`, retaining the shared border and close-button rules.
+    /// Draw `title` around `frame` using the shared border and corner controls.
     pub fn border(self, frame: &mut Frame, title: &str) {
-        frame.border(title, self.selected, self.close_hovered, self.spacing);
+        frame.border(title, self.selected, self.controls_hovered, self.spacing);
     }
 
     /// Dim retained pane selections while a modal popup owns input.

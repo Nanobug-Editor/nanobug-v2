@@ -3,6 +3,7 @@
 use crate::ui::text::{TextSpacing, UNITS_PER_COLUMN};
 use nanobug::{
     animation::scroll::GridScroll,
+    document::Document,
     vim::{Mode, Vim},
 };
 use std::{borrow::Cow, ops::Range};
@@ -21,6 +22,15 @@ pub(in crate::grid) struct Buffer {
 }
 
 impl Buffer {
+    /// Start editing `doc` with a fresh Vim state and viewport.
+    pub(super) fn new(doc: Document) -> Self {
+        Self {
+            vim: Vim::new(doc),
+            scroll: GridScroll::default(),
+            columns: GridScroll::default(),
+        }
+    }
+
     /// Return the active byte cursor's document row without scanning graphemes.
     pub(in crate::grid) fn cursor_row(&self) -> usize {
         self.vim

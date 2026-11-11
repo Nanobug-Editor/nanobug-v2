@@ -1,4 +1,8 @@
 //! Native input for the document and popup filter, with preedit local to the owning surface.
+
+#[cfg(windows)]
+mod windows;
+
 use super::{Workspace, layout::Focus};
 use crate::ui::ime::Composition;
 use gpui::{
@@ -10,20 +14,36 @@ use std::ops::Range;
 
 impl Workspace {
     /// Read preedit from the surface that currently owns native input.
-    fn composition(&self) -> &Composition {
+    fn composition(&self) -> Option<&Composition> {
         if self.help.is_open() {
-            &self.help.composition
+            Some(&self.help.composition)
+        } else if let Some(session) = &self.file_picker {
+            session
+                .state
+                .prompt
+                .as_ref()
+                .map(|_| &session.state.composition)
         } else {
-            &self.projects.active.editor.composition
+            self.projects
+                .active_project()
+                .map(|project| &project.editor.composition)
         }
     }
 
     /// Update preedit on the surface that currently owns native input.
-    fn composition_mut(&mut self) -> &mut Composition {
+    fn composition_mut(&mut self) -> Option<&mut Composition> {
         if self.help.is_open() {
-            &mut self.help.composition
+            Some(&mut self.help.composition)
+        } else if let Some(session) = &mut self.file_picker {
+            session
+                .state
+                .prompt
+                .as_ref()
+                .map(|_| &mut session.state.composition)
         } else {
-            &mut self.projects.active.editor.composition
+            self.projects
+                .active_project_mut()
+                .map(|project| &mut project.editor.composition)
         }
     }
 
@@ -33,12 +53,16 @@ impl Workspace {
             false
         } else if self.help.is_open() {
             self.help.is_filtering()
+        } else if let Some(session) = &self.file_picker {
+            session.state.prompt.is_some()
         } else {
-            self.projects.active.focus == Focus::Editor
-                && matches!(
-                    self.projects.active.editor.vim().mode,
-                    Mode::Insert | Mode::Command | Mode::Search
-                )
+            self.projects.active_project().is_some_and(|project| {
+                project.focus == Focus::Editor
+                    && matches!(
+                        project.editor.vim().mode,
+                        Mode::Insert | Mode::Command | Mode::Search
+                    )
+            })
         }
     }
 
@@ -61,7 +85,7 @@ impl EntityInputHandler for Workspace {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        self.composition().text_for_range(range, adjusted)
+        self.composition()?.text_for_range(range, adjusted)
     }
 
     /// Expose the native composition selection, or an empty local text-input interval.
@@ -72,20 +96,23 @@ impl EntityInputHandler for Workspace {
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
-            range: self.composition().selection.clone(),
+            range: self.composition()?.selection.clone(),
             reversed: false,
         })
     }
 
     /// Report the current native preedit interval in UTF-16 units.
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        let composition = self.composition();
+        let composition = self.composition()?;
         (!composition.is_empty()).then(|| 0..composition.text.encode_utf16().count())
     }
 
     /// Finalize any outstanding native composition when the OS unmarks it.
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.composition_mut().take();
+        let Some(composition) = self.composition_mut() else {
+            return;
+        };
+        let text = composition.take();
         if !text.is_empty() {
             self.commit_text(&text, window, cx);
         } else {
@@ -101,8 +128,10 @@ impl EntityInputHandler for Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.composition_mut().clear();
-        self.commit_text(text, window, cx);
+        if let Some(composition) = self.composition_mut() {
+            composition.clear();
+            self.commit_text(text, window, cx);
+        }
     }
 
     /// Update transient `text` and its UTF-16 `selection`; no document/undo mutation occurs yet.
@@ -114,11 +143,12 @@ impl EntityInputHandler for Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.accepts_native_text() {
-            return;
+        if self.accepts_native_text()
+            && let Some(composition) = self.composition_mut()
+        {
+            composition.mark(range, text, selection);
+            self.repaint_preedit(window, cx);
         }
-        self.composition_mut().mark(range, text, selection);
-        self.repaint_preedit(window, cx);
     }
 
     /// Anchor OS candidate UI to the logical input point, independently of visual interpolation.
@@ -143,12 +173,12 @@ impl EntityInputHandler for Workspace {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(self.composition().selection.end)
+        Some(self.composition()?.selection.end)
     }
 
     /// Size of the local native composition surface, measured in UTF-16 units.
     fn text_length_utf16(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
-        Some(self.composition().text.encode_utf16().count())
+        Some(self.composition()?.text.encode_utf16().count())
     }
 
     /// IME is enabled for the filter prompt and the editor's text-entry modes.
@@ -160,8 +190,9 @@ impl EntityInputHandler for Workspace {
     fn paste(&mut self, item: ClipboardItem, window: &mut Window, cx: &mut Context<Self>) {
         if self.accepts_native_text()
             && let Some(text) = item.text()
+            && let Some(composition) = self.composition_mut()
         {
-            self.composition_mut().clear();
+            composition.clear();
             self.commit_text(&text, window, cx);
         }
     }

@@ -112,7 +112,7 @@ impl Document {
         self.text != self.saved
     }
 
-    /// Open a fresh buffer from the last loaded or saved text, retaining its path and encoding.
+    /// Build a fresh document from the last loaded or saved text, retaining its path and encoding.
     pub fn saved_version(&self) -> Self {
         let mut doc = Self::new(&self.saved);
         doc.path.clone_from(&self.path);

@@ -1,8 +1,10 @@
 //! Built-in grid windows. Each feature owns its data and derives its own display frames.
 
 pub(crate) mod editor;
+pub(in crate::grid) mod file_picker;
 pub(crate) mod help;
 pub(crate) mod manager;
+pub(in crate::grid) mod start;
 
 mod frame;
 pub(in crate::grid) use frame::WindowFrame;

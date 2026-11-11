@@ -36,8 +36,8 @@ const HINT_CONTROLS: [(HintControl, KeyIcon, &str); 2] = [
 ];
 
 /// Height of the `prefix` group, including both borders, the gap and the footer.
-fn hint_rows(prefix: LeaderPrefix) -> usize {
-    prefix.bindings().count() + 4
+fn hint_rows(prefix: LeaderPrefix, project_active: bool, manager_available: bool) -> usize {
+    prefix.bindings(project_active, manager_available).count() + 4
 }
 
 /// Build the hint title by appending each group key in `suffix`.
@@ -66,16 +66,21 @@ impl Workspace {
 
     /// Set the pending `prefix` and its retained hint together before scheduling a render through `cx`.
     pub(super) fn show_leader_hint(&mut self, prefix: LeaderPrefix, cx: &mut Context<Self>) {
-        let height = hint_rows(prefix);
+        let project_active = self.projects.active_project().is_some();
+        let manager_available = self.projects.manager_available();
+        let height = hint_rows(prefix, project_active, manager_available);
         let mut frame = Frame::new(HINT_COLUMNS, height);
         let title = hint_title(prefix.suffix());
         frame.border(&title, true, false, &self.spacing);
         let arrow_column = 3 + prefix
-            .bindings()
+            .bindings(project_active, manager_available)
             .map(|(label, _)| self.spacing.columns(label))
             .max()
             .unwrap_or(1);
-        for (index, (label, binding)) in prefix.bindings().enumerate() {
+        for (index, (label, binding)) in prefix
+            .bindings(project_active, manager_available)
+            .enumerate()
+        {
             let row = index + 1;
             frame.label(row, 2..arrow_column, label, ACCENT, &self.spacing);
             frame.label(
@@ -113,7 +118,11 @@ impl Workspace {
         let Some(PendingPrefix::Leader(prefix)) = self.prefix else {
             return None;
         };
-        Some(self.small_popup_area(HINT_COLUMNS, hint_rows(prefix)))
+        let project_active = self.projects.active_project().is_some();
+        Some(self.small_popup_area(
+            HINT_COLUMNS,
+            hint_rows(prefix, project_active, self.projects.manager_available()),
+        ))
     }
 
     /// Paint the hint in `area`, attaching footer hit targets through `cx`.

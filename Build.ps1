@@ -1,4 +1,4 @@
-# Build a standalone native executable and a launcher that opens this project.
+# Build a standalone native executable and a launcher for its start page.
 $ErrorActionPreference = 'Stop'
 Push-Location -LiteralPath $PSScriptRoot
 try {
@@ -26,7 +26,7 @@ try {
         }
         throw
     }
-    $launcher = "@echo off`r`nstart `"`" `"%~dp0Nanobug.exe`" `"%~dp0..`"`r`n"
+    $launcher = "@echo off`r`nstart `"`" `"%~dp0Nanobug.exe`"`r`n"
     Set-Content -LiteralPath (Join-Path $outputPath '启动 Nanobug.cmd') -Value $launcher -Encoding ascii
     Write-Output (Join-Path $outputPath 'Nanobug.exe')
 } finally { Pop-Location }

@@ -23,8 +23,6 @@ use unicode_width::UnicodeWidthStr;
 
 /// Corner and horizontal rule cells between each side and its padded label.
 const BORDER_LABEL_INSET: usize = 2;
-/// ASCII close button with one cell of padding on each side.
-const CLOSE_BUTTON_TEXT: &str = " [Esc] ";
 /// Logical pixels between a key's visible path and its footer caption.
 const KEY_HINT_GAP: f32 = 4.;
 
@@ -255,7 +253,20 @@ impl GuideSegment {
     }
 }
 
-/// One panel's derived character cells, icons and guides.
+/// One column of tapered background joining a status badge to its neighbor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RowChevron {
+    /// Grid position of the column occupied by the tip.
+    column: usize,
+    /// Grid row containing the badge.
+    row: usize,
+    /// Whether the tip faces left and joins the tint on its right.
+    points_left: bool,
+    /// RGBA fill shared with the adjoining badge.
+    color: u32,
+}
+
+/// One panel's derived character cells and decorations.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Frame {
     /// Visible rows and any viewport-relative positions for their cells.
@@ -268,6 +279,10 @@ pub struct Frame {
     icons: Vec<RowIcon>,
     /// Explorer guides painted over the row tints, before the icons.
     guides: Vec<GuideSegment>,
+    /// Tapered badge edges painted over row tints.
+    chevrons: Vec<RowChevron>,
+    /// Vertical inset of row tint fills, in logical pixels.
+    tint_inset: Pixels,
 }
 
 impl Frame {
@@ -290,6 +305,8 @@ impl Frame {
             first_row,
             icons: Vec::new(),
             guides: Vec::new(),
+            chevrons: Vec::new(),
+            tint_inset: px(0.),
         }
     }
     /// Write fixed-grid `text` at cell `(x, y)` in `fg`, clipped to `limit` cells.
@@ -417,6 +434,54 @@ impl Frame {
         }
     }
 
+    /// Inset the frame's row tints by `padding` on both vertical edges without moving its text.
+    pub(in crate::grid) fn inset_row_tints(&mut self, padding: Pixels) {
+        self.tint_inset = padding;
+    }
+
+    /// Add an RGBA `color` tip at `column` on `row`, extending left when `points_left` is set.
+    pub(in crate::grid) fn chevron(
+        &mut self,
+        row: usize,
+        column: usize,
+        points_left: bool,
+        color: u32,
+    ) {
+        self.chevrons.push(RowChevron {
+            column,
+            row,
+            points_left,
+            color,
+        });
+    }
+
+    /// Position a tint of `width` within the row at `origin`, using its logical `height`.
+    fn tint_bounds(&self, origin: Point<Pixels>, width: Pixels, height: f32) -> Bounds<Pixels> {
+        let inset = self.tint_inset;
+        Bounds::new(
+            origin + point(px(0.), inset),
+            size(width, (px(height) - inset * 2.).max(px(0.))),
+        )
+    }
+
+    /// Place a `chevron` in the frame at `origin`, sharing the tints' vertical inset and `metrics`.
+    fn chevron_bounds(
+        &self,
+        chevron: RowChevron,
+        origin: Point<Pixels>,
+        metrics: Metrics,
+    ) -> Bounds<Pixels> {
+        self.tint_bounds(
+            origin
+                + point(
+                    px(chevron.column as f32 * metrics.cw),
+                    px(chevron.row as f32 * metrics.lh),
+                ),
+            px(metrics.cw),
+            metrics.lh,
+        )
+    }
+
     /// Place `icon` at `column`, vertically centered within `row`.
     pub fn icon(&mut self, column: usize, row: usize, icon: Icon) {
         self.icons.push(RowIcon {
@@ -435,11 +500,22 @@ impl Frame {
         key: KeyIcon,
         offset: f32,
     ) {
+        self.image(column, row, key.image, key.canvas(offset));
+    }
+
+    /// Paint `icon` in a custom `canvas` relative to the left edge of `column` and midpoint of `row`.
+    pub(in crate::grid) fn image(
+        &mut self,
+        column: usize,
+        row: usize,
+        icon: Icon,
+        canvas: Bounds<Pixels>,
+    ) {
         self.icons.push(RowIcon {
             column,
             row,
-            icon: key.image,
-            canvas: Some(key.canvas(offset)),
+            icon,
+            canvas: Some(canvas),
         });
     }
 
@@ -484,19 +560,27 @@ impl Frame {
     }
 
     /// Draw a character border with measured `title` using `spacing` and the focus accent when `active`.
-    /// Draw the close label in the right-hand border when `show_close` is true.
-    pub fn border(&mut self, title: &str, active: bool, show_close: bool, spacing: &TextSpacing) {
-        self.border_with_title(active, show_close, |frame, slot, color| {
+    /// Add the pane's corner controls when `show_controls` is true.
+    pub fn border(
+        &mut self,
+        title: &str,
+        active: bool,
+        show_controls: bool,
+        spacing: &TextSpacing,
+    ) {
+        self.border_with_title(active, show_controls, true, |frame, slot, color| {
             frame.label(0, slot, title, color, spacing)
         });
     }
 
-    /// Draw the border with focus color from `active` and an optional `show_close` label.
+    /// Draw the border with focus color from `active` and render corner controls when `show_controls`.
+    /// `include_help` enables the pane's question mark beside the close icon's reserved gap.
     /// `draw_title` receives the available columns and ink color, and returns the end of its title.
     pub(in crate::grid) fn border_with_title(
         &mut self,
         active: bool,
-        show_close: bool,
+        show_controls: bool,
+        include_help: bool,
         draw_title: impl FnOnce(&mut Self, Range<usize>, u32) -> usize,
     ) {
         let height = self.rows.len();
@@ -517,26 +601,32 @@ impl Frame {
             self.text(0, row, "│", color, 1);
             self.text(width - 1, row, "│", color, 1);
         }
-        let close = if show_close {
+        let controls = if show_controls {
             Rect {
                 w: width,
                 h: height,
                 ..Rect::default()
             }
-            .close_button()
+            .corner_controls(include_help)
         } else {
             None
         };
         let title_start = BORDER_LABEL_INSET + 1;
-        // Leave room for the title's trailing space and one horizontal rule before the button.
-        let title_end = close.map_or(width.saturating_sub(3), |button| button.x - 2);
+        // Leave room for the title's trailing space and a rule before the controls.
+        let title_end = controls
+            .as_ref()
+            .map_or(width.saturating_sub(3), |controls| controls.area().x - 2);
         if title_end > title_start {
             let end = draw_title(self, title_start..title_end, color);
             let gap = end + 1 - BORDER_LABEL_INSET;
             self.text(BORDER_LABEL_INSET, 0, &" ".repeat(gap), color, gap);
         }
-        if let Some(button) = close {
-            self.text(button.x, 0, CLOSE_BUTTON_TEXT, GOLD, button.w);
+        if let Some(controls) = controls {
+            let area = controls.area();
+            self.text(area.x, 0, &" ".repeat(area.w), color, area.w);
+            if let Some(help) = controls.help {
+                self.text(help.x + help.w / 2, 0, "?", GOLD, 1);
+            }
         }
     }
 }

@@ -28,11 +28,7 @@ impl EditorWindow {
             self.active = index;
         } else {
             let doc = Document::open(&path)?;
-            self.buffers.push(Buffer {
-                vim: Vim::new(doc),
-                scroll: GridScroll::default(),
-                columns: GridScroll::default(),
-            });
+            self.buffers.push(Buffer::new(doc));
             self.active = self.buffers.len() - 1;
         }
         let buffer = &mut self.buffers[self.active];
@@ -40,6 +36,21 @@ impl EditorWindow {
         buffer.columns.snap(buffer.columns.first_cell(), now);
         self.composition.clear();
         Ok(())
+    }
+
+    /// Move buffer `index` to another tab, retaining a valid editor in this tab.
+    pub(in crate::grid) fn take_buffer(&mut self, index: usize) -> Buffer {
+        let mut buffer = self.buffers.remove(index);
+        if index == self.active {
+            self.composition.clear();
+            self.dragging = None;
+        }
+        buffer.vim.cancel_pending();
+        if self.buffers.is_empty() {
+            self.buffers.push(Buffer::new(Document::new("")));
+        }
+        self.active = (self.active - usize::from(index < self.active)).min(self.buffers.len() - 1);
+        buffer
     }
 
     /// Save buffer `index` to `path` or its filename, returning the path whose transfer history is stale.
@@ -119,11 +130,7 @@ impl EditorWindow {
             false
         });
         if self.buffers.is_empty() {
-            self.buffers.push(Buffer {
-                vim: Vim::new(Document::new("")),
-                scroll: GridScroll::default(),
-                columns: GridScroll::default(),
-            });
+            self.buffers.push(Buffer::new(Document::new("")));
         }
         self.active = active.min(self.buffers.len() - 1);
         true

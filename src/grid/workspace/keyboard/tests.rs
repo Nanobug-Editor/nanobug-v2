@@ -12,9 +12,10 @@ fn shell_shortcut(
 ) -> Option<ShellShortcut> {
     let key = Keystroke::parse(key).unwrap();
     ShellShortcut::resolve(
-        focus,
+        Some(focus),
         mode,
         hidden_pane,
+        true,
         prefix,
         &key,
         normal_character(&key).as_deref(),
@@ -123,9 +124,10 @@ fn leader_letter_case_requires_shift() {
         key.key_char = Some(text.into());
         key.modifiers.shift = shift;
         ShellShortcut::resolve(
-            Focus::Editor,
+            Some(Focus::Editor),
             Mode::Normal,
             None,
+            true,
             leader,
             &key,
             normal_character(&key).as_deref(),
@@ -159,8 +161,14 @@ fn leader_quit_resolves_only_the_project_close_sequences() {
             command(leader, "q"),
             Some(ShellShortcut::AwaitLeader(LeaderPrefix("q")))
         );
-        assert_eq!(command(quit, "q"), Some(ShellShortcut::CloseProject));
-        assert_eq!(command(quit, "a"), Some(ShellShortcut::Quit));
+        assert_eq!(
+            command(quit, "q"),
+            Some(ShellShortcut::Close(CloseTarget::Project))
+        );
+        assert_eq!(
+            command(quit, "a"),
+            Some(ShellShortcut::Close(CloseTarget::Quit))
+        );
         for key in ["ctrl-q", "shift-a", "e"] {
             assert_eq!(command(quit, key), None);
         }
@@ -174,6 +182,76 @@ fn leader_quit_resolves_only_the_project_close_sequences() {
             assert_eq!(shell_shortcut(Focus::Editor, mode, None, prefix, key), None);
         }
     }
+}
+
+/// The project group can add a start page and the quit group works on every command surface.
+#[test]
+fn project_and_quit_groups_resolve_in_panes_and_on_the_start_page() {
+    let root = Some(PendingPrefix::Leader(LeaderPrefix::ROOT));
+    let project = Some(PendingPrefix::Leader(LeaderPrefix("p")));
+    let quit = Some(PendingPrefix::Leader(LeaderPrefix("q")));
+    for focus in [Some(Focus::Editor), Some(Focus::Manager), None] {
+        let command = |prefix, key| {
+            let key = Keystroke::parse(key).unwrap();
+            ShellShortcut::resolve(
+                focus,
+                Mode::Normal,
+                None,
+                focus.is_some(),
+                prefix,
+                &key,
+                normal_character(&key).as_deref(),
+            )
+        };
+        assert_eq!(
+            command(root, "p"),
+            Some(ShellShortcut::AwaitLeader(LeaderPrefix("p")))
+        );
+        assert_eq!(command(project, "a"), Some(ShellShortcut::OpenStart));
+        assert_eq!(command(project, "q"), None);
+        assert_eq!(
+            command(root, "q"),
+            Some(ShellShortcut::AwaitLeader(LeaderPrefix("q")))
+        );
+        assert_eq!(
+            command(quit, "a"),
+            Some(ShellShortcut::Close(CloseTarget::Quit))
+        );
+        assert_eq!(
+            command(quit, "q"),
+            focus.map(|_| ShellShortcut::Close(CloseTarget::Project))
+        );
+    }
+}
+
+/// An editor-only tab shares file and close shortcuts without offering Explorer.
+#[test]
+fn standalone_editor_omits_explorer_bindings() {
+    let command = |prefix, key| {
+        let key = Keystroke::parse(key).unwrap();
+        ShellShortcut::resolve(
+            Some(Focus::Editor),
+            Mode::Normal,
+            None,
+            false,
+            prefix,
+            &key,
+            normal_character(&key).as_deref(),
+        )
+    };
+    let leader = Some(PendingPrefix::Leader(LeaderPrefix::ROOT));
+    assert_eq!(command(leader, "e"), None);
+    assert_eq!(command(None, "ctrl-h"), Some(ShellShortcut::Stay));
+    assert_eq!(command(leader, "f"), Some(ShellShortcut::OpenFilePicker));
+    assert_eq!(
+        command(Some(PendingPrefix::Leader(LeaderPrefix("q"))), "q"),
+        Some(ShellShortcut::Close(CloseTarget::Project)),
+    );
+    assert!(
+        !LeaderPrefix::ROOT
+            .bindings(true, false)
+            .any(|(key, _)| key == "e")
+    );
 }
 
 /// Backspace goes up one group, or dismisses the root, while a leader hint is open.

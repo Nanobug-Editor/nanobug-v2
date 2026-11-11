@@ -15,7 +15,7 @@ pub enum Action {
     Open(String),
     /// Close the app, optionally discarding unsaved buffers.
     Close(bool),
-    /// Save the active file, then close if every buffer is clean.
+    /// Save the active file, then request closing the app.
     SaveClose,
 }
 
@@ -46,7 +46,7 @@ impl Vim {
                 let args = args.trim();
                 return match name {
                     "w" | "write" => Action::Save((!args.is_empty()).then(|| args.into())),
-                    "q" | "quit" => Action::Close(false),
+                    "q" | "quit" | "qa" | "qall" => Action::Close(false),
                     "q!" | "quit!" => Action::Close(true),
                     "wq" | "x" => Action::SaveClose,
                     "e" | "edit" if !args.is_empty() => Action::Open(args.into()),

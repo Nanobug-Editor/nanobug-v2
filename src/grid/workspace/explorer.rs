@@ -16,15 +16,16 @@ impl Workspace {
             .ordered()
             .flat_map(|project| project.editor.dirty_paths())
             .collect::<Vec<_>>();
-        let active = &mut self.projects.active;
-        let (changes, message) = active.manager.transfer(key, &active.root, &dirty_paths);
+        let active = self.projects.active_mut();
+        let Some(manager) = &mut active.manager else {
+            return;
+        };
+        let (changes, message) = manager.transfer(key, &active.root, &dirty_paths);
         if !changes.is_empty() {
-            for project in self.projects.iter_mut() {
-                project.editor.apply_path_changes(&changes);
-            }
+            self.projects.apply_path_changes(&changes);
             self.last_cursor_space = None;
         }
-        self.projects.active.status = message;
+        self.projects.active_mut().status = message;
     }
 
     /// Interpret a manager `key` after a possible `prefix`, returning its viewport intent.
@@ -33,7 +34,7 @@ impl Workspace {
         &mut self,
         key: &str,
         prefix: Option<char>,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<ScrollInput> {
         let height = ManagerWindow::body(self.layout.tree).h;
@@ -47,8 +48,9 @@ impl Workspace {
             if let Some(inset) = inset {
                 return Some(ScrollInput::Position(
                     self.projects
-                        .active
+                        .active()
                         .manager
+                        .as_ref()?
                         .tree
                         .selected
                         .saturating_sub(inset),
@@ -58,17 +60,22 @@ impl Workspace {
                 self.transfer("z");
             }
         }
-        let (scroll, command) = self.projects.active.manager.key(key, prefix)?;
+        let (scroll, command) = self
+            .projects
+            .active_mut()
+            .manager
+            .as_mut()?
+            .key(key, prefix)?;
         match command {
             ManagerCommand::None => {}
-            ManagerCommand::Open(path) => self.open(path),
-            ManagerCommand::Status(message) => self.projects.active.status = message,
+            ManagerCommand::Open(path) => self.open(path, window, cx),
+            ManagerCommand::Status(message) => self.set_status(message),
             ManagerCommand::Transfer(key) => self.transfer(key),
             ManagerCommand::Prefix(prefix) => {
                 self.prefix = Some(PendingPrefix::Manager(prefix));
                 if prefix == 'z' {
                     let delay = cx.background_executor().timer(Duration::from_millis(350));
-                    self.projects.active.manager.paste_timer =
+                    self.projects.active_mut().manager.as_mut()?.paste_timer =
                         Some(cx.spawn_in(window, async move |weak, cx| {
                             delay.await;
                             let _ = cx.update(|window, cx| {

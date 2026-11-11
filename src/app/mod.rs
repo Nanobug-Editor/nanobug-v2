@@ -6,16 +6,13 @@ use gpui::{
     WindowOptions, px, size,
 };
 
-/// Open the supplied directories or files, defaulting to the current working directory.
+/// Open the supplied directories or files, or show the start page without arguments.
 pub(crate) fn run() {
     let cwd = std::env::current_dir().unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").into());
-    let mut paths: Vec<_> = std::env::args_os()
+    let paths: Vec<_> = std::env::args_os()
         .skip(1)
         .map(|path| cwd.join(path))
         .collect();
-    if paths.is_empty() {
-        paths.push(cwd);
-    }
     let platform = gpui_platform::current_platform(false);
     let glyphs = platform.text_system();
     // Register the bundled text and box-drawing faces before GPUI measures the grid.

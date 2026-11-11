@@ -89,6 +89,36 @@ impl<'a> BackdropRaster<'a> {
         }
     }
 
+    /// Blend a triangular badge tip of RGBA `color` in `bounds`, pointing left when `points_left` is set.
+    /// Only samples inside `clip` are written.
+    pub(crate) fn chevron(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        clip: Bounds<Pixels>,
+        points_left: bool,
+        color: u32,
+    ) {
+        let area = self.pixel_clip(bounds.intersect(&clip));
+        let source = Rgba(color.to_be_bytes());
+        let base = if points_left {
+            bounds.right()
+        } else {
+            bounds.left()
+        };
+        let base = f32::from(base) * self.scale;
+        let center = f32::from(bounds.center().y) * self.scale;
+        let half_height = f32::from(bounds.size.height) * self.scale * 0.5;
+        let width = f32::from(bounds.size.width) * self.scale;
+        for y in area.top().0..area.bottom().0 {
+            let reach = width * (1. - (y as f32 + 0.5 - center).abs() / half_height);
+            for x in area.left().0..area.right().0 {
+                if (x as f32 + 0.5 - base).abs() <= reach {
+                    self.pixels.get_pixel_mut(x as u32, y as u32).blend(&source);
+                }
+            }
+        }
+    }
+
     /// Stamp a glyph at its baseline `at` in RGB `color`, constrained by the pane's `clip`.
     pub(crate) fn glyph(
         &mut self,

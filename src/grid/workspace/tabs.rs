@@ -1,6 +1,6 @@
-//! Character layout, shortcuts and animated selection for the project tab strip.
+//! Character layout, shortcuts and animated selection for the workspace tab strip.
 
-use super::{Workspace, projects::Projects, view::positioned};
+use super::{Workspace, projects::WorkspaceTabs, view::positioned};
 use crate::{
     grid::render::{Frame, Metrics, Panel, Rect},
     ui::{
@@ -12,7 +12,10 @@ use gpui::{
     App, AppContext, Bounds, Context, Entity, Keystroke, ParentElement, Pixels, Styled, Window,
     div, px, rgb,
 };
-use nanobug::animation::cursor::Spring;
+use nanobug::{
+    animation::cursor::Spring,
+    i18n::{self, Locale},
+};
 use std::{ops::Range, time::Instant};
 
 /// Space on each side of a tab name, in narrow grid columns.
@@ -22,7 +25,7 @@ const TAB_SEPARATOR: usize = 1;
 /// Time for the selection's edges to settle, in seconds.
 const TAB_SETTLE: f64 = 0.24;
 
-/// Keyboard actions that operate on the project order without focusing the strip.
+/// Keyboard actions that operate on tab order without focusing the strip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ProjectShortcut {
     /// Select the tab at a relative offset.
@@ -58,7 +61,7 @@ impl ProjectShortcut {
 }
 
 impl Workspace {
-    /// Apply `shortcut` to the project order in `window` through `cx`.
+    /// Apply `shortcut` to the tab order in `window` through `cx`.
     pub(super) fn project_shortcut(
         &mut self,
         shortcut: ProjectShortcut,
@@ -69,8 +72,7 @@ impl Workspace {
         let last = self.projects.len() - 1;
         let target = match shortcut {
             ProjectShortcut::Select(offset) => {
-                if self.select_project(current.saturating_add_signed(offset).min(last), window, cx)
-                {
+                if self.select_tab(current.saturating_add_signed(offset).min(last), window, cx) {
                     self.sync(window, cx);
                 }
                 return;
@@ -86,7 +88,7 @@ impl Workspace {
         }
     }
 
-    /// Refresh the strip using the current grid and open projects in `cx`.
+    /// Refresh the strip from the current grid and open tabs in `cx`.
     pub(super) fn refresh_tab_bar(&mut self, cx: &mut Context<Self>) {
         self.tabs
             .update(self.layout.cols, &self.projects, &self.spacing, cx);
@@ -95,9 +97,9 @@ impl Workspace {
 
 /// Two retained text layers and a moving block that masks their contrasting inks.
 pub(super) struct TabBar {
-    /// The column count, selected index and tab count at the last layout.
-    layout: Option<(usize, usize, usize)>,
-    /// Index of the first visible project, retained until the selected tab needs room.
+    /// The column count, tab revision and locale at the last layout.
+    layout: Option<(usize, u64, Locale)>,
+    /// Index of the first visible tab, retained until the selected tab needs room.
     first: usize,
     /// Normal text layer for the full strip.
     labels: Entity<Panel>,
@@ -126,12 +128,18 @@ impl TabBar {
     }
 
     /// Fit `projects` into `cols`, using `spacing` for actual glyph positions and `cx` for panels.
-    fn update(&mut self, cols: usize, projects: &Projects, spacing: &TextSpacing, cx: &mut App) {
-        let key = (cols, projects.selected, projects.len());
+    fn update(
+        &mut self,
+        cols: usize,
+        projects: &WorkspaceTabs,
+        spacing: &TextSpacing,
+        cx: &mut App,
+    ) {
+        let key = (cols, projects.revision, i18n::locale());
         if self.layout == Some(key) {
             return;
         }
-        let names: Vec<_> = projects.ordered().map(|project| project.name()).collect();
+        let names: Vec<_> = projects.names().collect();
         let widths: Vec<_> = names.iter().map(|name| spacing.columns(name)).collect();
         let visible = visible_tabs(&widths, cols, self.first, projects.selected);
         self.first = visible.start;

@@ -44,7 +44,7 @@ fn press(list: &mut HelpList, key: &'static str, height: usize, now: f64) -> Hel
 /// The window and global lists stay separate, and only descriptions match a query.
 #[test]
 fn switch_scopes_and_filter_descriptions_from_the_keyboard() {
-    let mut list = HelpList::new(true);
+    let mut list = HelpList::new(true, true);
     let title = match i18n::locale() {
         Locale::English => "Explorer shortcuts",
         Locale::SimplifiedChinese => "文件管理器快捷键",
@@ -93,7 +93,7 @@ fn switch_scopes_and_filter_descriptions_from_the_keyboard() {
 /// Help closes on a single q or Escape while browsing; the filter handles those keys locally.
 #[test]
 fn help_close_keys_respect_filter_input() {
-    let mut list = HelpList::new(true);
+    let mut list = HelpList::new(true, true);
     assert!(matches!(
         press(&mut list, "shift-x", 10, 0.),
         HelpCommand::Ignore
@@ -125,7 +125,7 @@ fn help_close_keys_respect_filter_input() {
 /// Opening search over the selected bottom row preserves the rows above it.
 #[test]
 fn search_covers_the_last_visible_row_without_scrolling() {
-    let mut list = HelpList::new(false);
+    let mut list = HelpList::new(false, true);
     let height = list.len();
     press(&mut list, "shift-g", height, 0.);
     assert_eq!(list.selected, height - 1);
@@ -141,7 +141,7 @@ fn search_covers_the_last_visible_row_without_scrolling() {
 /// Page keys move the selection by the visible row count, then reveal it smoothly.
 #[test]
 fn page_keys_use_the_editors_row_distance() {
-    let mut list = HelpList::new(false);
+    let mut list = HelpList::new(false, true);
     let height = 8;
     list.track(ScrollInput::Advance, height, 0.);
     press(&mut list, "pagedown", height, 0.);
@@ -158,7 +158,7 @@ fn page_keys_use_the_editors_row_distance() {
 /// Read-only Normal jumps work, while editing commands and retired chords stay local and inert.
 #[test]
 fn normal_jumps_are_available_without_editor_modes() {
-    let mut list = HelpList::new(false);
+    let mut list = HelpList::new(false, true);
     let last = list.len() - 1;
     press(&mut list, "shift-g", 10, 0.);
     assert_eq!(list.selected, last);
@@ -197,7 +197,7 @@ fn normal_jumps_are_available_without_editor_modes() {
 /// Numeric row commands move the caret by the whole count, revealing the fourth row at either edge.
 #[test]
 fn counted_motion_reveals_the_selection_with_editor_margins() {
-    let mut list = HelpList::new(false);
+    let mut list = HelpList::new(false, true);
     let height = 10;
     list.track(ScrollInput::Advance, height, 0.);
     for key in ["1", "2", "j"] {

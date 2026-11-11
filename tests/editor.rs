@@ -156,6 +156,10 @@ fn commands_produce_explicit_file_actions_with_space_containing_paths() {
     );
     vim.text(":q!", &mut register);
     assert_eq!(vim.key("Enter", &mut register), Action::Close(true));
+    for command in [":qa", ":qall"] {
+        vim.text(command, &mut register);
+        assert_eq!(vim.key("Enter", &mut register), Action::Close(false));
+    }
 }
 
 #[test]

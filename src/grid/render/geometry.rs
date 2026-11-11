@@ -1,8 +1,11 @@
 //! Grid-to-pixel geometry shared by painting and pointer input.
 
-use super::{BORDER_LABEL_INSET, CLOSE_BUTTON_TEXT};
+use super::BORDER_LABEL_INSET;
 use crate::ui::text::UNITS_PER_COLUMN;
 use gpui::{Bounds, Pixels, Point, point, px, size};
+
+/// Grid columns occupied by each corner button, including its clickable padding.
+const CORNER_BUTTON_COLUMNS: usize = 3;
 
 /// Common font geometry, shared by grid drawing, pointer hit testing and the cursor.
 #[derive(Clone, Copy)]
@@ -69,17 +72,40 @@ impl Rect {
         )
     }
 
-    /// Return the padded close label's rectangle, mirrored from the title's left inset.
-    pub fn close_button(self) -> Option<Self> {
-        let width = CLOSE_BUTTON_TEXT.len();
+    /// Place corner buttons at the right inset, with help to the left when `include_help` fits.
+    pub(in crate::grid) fn corner_controls(self, include_help: bool) -> Option<CornerControls> {
+        let width = CORNER_BUTTON_COLUMNS;
         if self.w < 2 * BORDER_LABEL_INSET + width || self.h < 2 {
             return None;
         }
-        Some(Self {
+        let close = Self {
             x: self.x + self.w - BORDER_LABEL_INSET - width,
             y: self.y,
             w: width,
             h: 1,
+        };
+        let help = (include_help && self.w >= 2 * BORDER_LABEL_INSET + 2 * width).then(|| Self {
+            x: close.x - width,
+            ..close
+        });
+        Some(CornerControls { help, close })
+    }
+}
+
+/// Adjacent hit targets for the actions shown on a window's top-right border.
+pub(in crate::grid) struct CornerControls {
+    /// Help button for panes that have a shortcut catalog.
+    pub help: Option<Rect>,
+    /// Close button at the right inset.
+    pub close: Rect,
+}
+
+impl CornerControls {
+    /// Combined span used for border layout and hover detection.
+    pub fn area(&self) -> Rect {
+        self.help.map_or(self.close, |help| Rect {
+            w: help.w + self.close.w,
+            ..help
         })
     }
 }

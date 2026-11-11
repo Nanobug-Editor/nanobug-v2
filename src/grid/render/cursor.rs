@@ -28,7 +28,7 @@ pub struct Cursor {
     clip: Option<Bounds<Pixels>>,
     /// Inner bounds for the primary cursor during wheel-following motion.
     head_clip: Option<Bounds<Pixels>>,
-    /// Document character to recolor inside the animated block head.
+    /// Character to recolor inside the animated block head.
     text_cell: Option<CursorCell>,
 }
 impl Cursor {
@@ -90,7 +90,7 @@ impl Cursor {
     }
 
     /// Associate effects with `body` and its `clip`, and constrain the head to `head_clip` while wheeling.
-    /// `text_cell` identifies a document glyph that takes the theme's cursor text color.
+    /// `text_cell` identifies the glyph that takes the theme's cursor text color.
     /// `changed` clears stale viewport effects through `cx` when the owning region changes.
     pub fn set_viewport(
         &mut self,

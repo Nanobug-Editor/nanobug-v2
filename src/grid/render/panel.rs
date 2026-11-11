@@ -13,10 +13,10 @@ use crate::{
     },
 };
 use gpui::{
-    App, Bounds, ContentMask, Context, Font, FontId, GlyphId, IntoElement, Pixels,
+    App, Bounds, ContentMask, Context, Font, FontId, GlyphId, IntoElement, PathBuilder, Pixels,
     PlatformTextSystem, Point, Render, RenderGlyphParams, ShapedGlyph, ShapedLine, Styled,
     TextAlign, TextRun, UnderlineStyle, Window, WindowTextSystem, canvas, fill, font, point, px,
-    rgb, rgba, size,
+    rgb, rgba,
 };
 use nanobug::animation::cursor::{Vec2, Wave};
 use std::{cell::RefCell, rc::Rc};
@@ -130,7 +130,7 @@ impl PreparedRow {
     }
 }
 
-/// The document cell to recolor when the animated cursor head covers it.
+/// The grid cell to recolor when the animated cursor head covers it.
 #[derive(Clone, Copy, PartialEq)]
 pub struct CursorCell {
     /// Row relative to the first retained row in the text panel.
@@ -221,7 +221,9 @@ impl Panel {
             let Some(prepared) = prepared else { continue };
             let y = bounds.origin.y + px(row as f32 * metrics.lh);
             for &(x, width, color) in &prepared.backgrounds {
-                let area = Bounds::new(point(bounds.origin.x + x, y), size(width, px(metrics.lh)));
+                let area = data
+                    .frame
+                    .tint_bounds(point(bounds.origin.x + x, y), width, metrics.lh);
                 raster.fill(area.intersect(&clip), color);
             }
             for run in prepared.runs.iter().chain(&prepared.label_runs) {
@@ -246,6 +248,10 @@ impl Panel {
                     }
                 }
             }
+        }
+        for &chevron in &data.frame.chevrons {
+            let area = data.frame.chevron_bounds(chevron, bounds.origin, metrics);
+            raster.chevron(area, clip, chevron.points_left, chevron.color);
         }
         let scale = window.scale_factor();
         for guide in &data.frame.guides {
@@ -531,9 +537,10 @@ impl PanelData {
                 let y = bounds.origin.y + px(i as f32 * self.metrics.lh);
                 for &(x, width, color) in &row.backgrounds {
                     window.paint_quad(fill(
-                        Bounds::new(
+                        self.frame.tint_bounds(
                             point(bounds.origin.x + x, y),
-                            size(width, px(self.metrics.lh)),
+                            width,
+                            self.metrics.lh,
                         ),
                         rgba(color),
                     ));
@@ -569,6 +576,24 @@ impl PanelData {
                         window,
                         cx,
                     );
+                }
+            }
+            for &chevron in &self.frame.chevrons {
+                let area = self
+                    .frame
+                    .chevron_bounds(chevron, bounds.origin, self.metrics);
+                let (base, tip) = if chevron.points_left {
+                    (area.right(), area.left())
+                } else {
+                    (area.left(), area.right())
+                };
+                let mut path = PathBuilder::fill();
+                path.move_to(point(base, area.top()));
+                path.line_to(point(tip, area.center().y));
+                path.line_to(point(base, area.bottom()));
+                path.close();
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, rgba(chevron.color));
                 }
             }
             let scale = window.scale_factor();

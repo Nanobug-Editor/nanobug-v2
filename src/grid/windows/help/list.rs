@@ -21,8 +21,12 @@ pub(super) enum Scope {
 
 /// A browsing session over the opening pane's shortcuts and the global shortcuts.
 pub(in crate::grid) struct HelpList {
-    /// Whether the opening pane was Explorer.
-    manager: bool,
+    /// Shortcut rows for the window that opened help.
+    bindings: &'static [Shortcut],
+    /// Translation key of that window's help title.
+    title: &'static str,
+    /// Whether the selected tab offers Explorer actions in the global catalog.
+    manager_available: bool,
     /// Current source of shortcut rows.
     scope: Scope,
     /// Localized key labels and descriptions in filtered catalog order.
@@ -43,9 +47,32 @@ pub(in crate::grid) struct HelpList {
 
 impl HelpList {
     /// Build the unfiltered window catalog for the editor or, with `manager`, Explorer.
-    pub(super) fn new(manager: bool) -> Self {
+    pub(super) fn new(manager: bool, manager_available: bool) -> Self {
+        if manager {
+            Self::for_window(
+                manager::shortcuts::SHORTCUTS,
+                "help.explorer_title",
+                manager_available,
+            )
+        } else {
+            Self::for_window(
+                editor::shortcuts::SHORTCUTS,
+                "help.editor_title",
+                manager_available,
+            )
+        }
+    }
+
+    /// Build an unfiltered session from `bindings` and the window's `title` key.
+    pub(super) fn for_window(
+        bindings: &'static [Shortcut],
+        title: &'static str,
+        manager_available: bool,
+    ) -> Self {
         let mut list = Self {
-            manager,
+            bindings,
+            title,
+            manager_available,
             scope: Scope::Window,
             rows: Vec::new(),
             selected: 0,
@@ -61,11 +88,7 @@ impl HelpList {
 
     /// Original window bindings, independent of the active scope and query.
     fn window_rows(&self) -> &'static [Shortcut] {
-        if self.manager {
-            manager::shortcuts::SHORTCUTS
-        } else {
-            editor::shortcuts::SHORTCUTS
-        }
+        self.bindings
     }
 
     /// Largest catalog size, so filtering or switching scopes keeps the popup in place.
@@ -75,11 +98,7 @@ impl HelpList {
 
     /// Border title for the pane that opened help.
     pub(super) fn window_title(&self) -> &'static str {
-        i18n::text(if self.manager {
-            "help.explorer_title"
-        } else {
-            "help.editor_title"
-        })
+        i18n::text(self.title)
     }
 
     /// Catalog currently selected in the title and displayed in the list.
@@ -197,6 +216,17 @@ impl HelpList {
         self.rows.clear();
         self.rows
             .extend(source.iter().filter_map(|(keys, description)| {
+                if self.scope == Scope::Global
+                    && !self.manager_available
+                    && matches!(
+                        *description,
+                        "global_shortcuts.open_manager"
+                            | "global_shortcuts.focus_horizontal"
+                            | "global_shortcuts.refresh"
+                    )
+                {
+                    return None;
+                }
                 let description = i18n::text(description);
                 (query.is_empty() || description.to_lowercase().contains(&query))
                     .then(|| (keys.text(), description))

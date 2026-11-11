@@ -11,7 +11,7 @@ use std::{
 };
 use tempfile::{Builder, TempDir};
 
-/// Prefix reserved for paste history directories under a project root.
+/// Prefix reserved for the private staging and history directories of a transfer.
 pub const STASH_PREFIX: &str = ".nanobug-paste-";
 /// Total number of paste actions retained across undo and redo.
 const HISTORY_LIMIT: usize = 10;
@@ -54,6 +54,8 @@ struct Paste {
     items: Vec<PasteItem>,
     /// Owns the private storage for a copy. Cut transactions need no staged data.
     stage: Option<TempDir>,
+    /// Allow browser transfers to cross filesystem boundaries.
+    cross_volume: bool,
 }
 
 impl Paste {
@@ -75,7 +77,7 @@ impl Paste {
         let result = (|| -> Result<()> {
             for item in &self.items {
                 let (from, to) = item.paths(forward);
-                move_exclusive(from, to).with_context(|| {
+                move_entry(from, to, self.cross_volume).with_context(|| {
                     i18n::format(
                         "manager.move_failed",
                         &[("source", &from.display()), ("destination", &to.display())],
@@ -84,7 +86,7 @@ impl Paste {
                 moved += 1;
                 if verify {
                     ensure!(
-                        fingerprint(to)? == item.stamp,
+                        fingerprint(to, !self.cross_volume)? == item.stamp,
                         i18n::format(
                             "manager.changed_during_replay",
                             &[("path", &from.display())]
@@ -98,7 +100,7 @@ impl Paste {
             let mut rollback_errors = Vec::new();
             for item in self.items[..moved].iter().rev() {
                 let (old, new) = item.paths(forward);
-                if let Err(error) = move_exclusive(new, old) {
+                if let Err(error) = move_entry(new, old, self.cross_volume) {
                     rollback_errors.push(format!(
                         "{} → {} ({error})",
                         new.display(),
@@ -189,12 +191,39 @@ impl FileTransfers {
         directory: &Path,
         dirty: &[PathBuf],
     ) -> Result<Vec<PathChange>> {
+        self.paste_into(Some(root), directory, dirty)
+    }
+
+    /// Paste into a canonical browser `directory`, guarding all `dirty` open paths.
+    pub fn paste_browser(
+        &mut self,
+        directory: &Path,
+        dirty: &[PathBuf],
+    ) -> Result<Vec<PathChange>> {
+        self.paste_into(None, directory, dirty)
+    }
+
+    /// Paths a pending cut would move. Copy leaves this list empty.
+    pub fn cut_paths(&self) -> &[PathBuf] {
+        match &self.clipboard {
+            Some((TransferKind::Cut, paths)) => paths,
+            _ => &[],
+        }
+    }
+
+    /// Paste into `directory` with dirty-buffer checks and the optional project boundary `root`.
+    fn paste_into(
+        &mut self,
+        root: Option<&Path>,
+        directory: &Path,
+        dirty: &[PathBuf],
+    ) -> Result<Vec<PathChange>> {
         let (kind, sources) = self
             .clipboard
             .as_ref()
             .context(i18n::text("manager.copy_first"))?;
         ensure!(
-            directory.starts_with(root)
+            root.is_none_or(|root| directory.starts_with(root))
                 && entry_metadata(directory)?.is_dir()
                 && fs::canonicalize(directory)? == directory,
             i18n::text("manager.destination_outside_project")
@@ -204,7 +233,9 @@ impl FileTransfers {
         for source in sources {
             entry_metadata(source)?;
             ensure!(
-                source != root && source.starts_with(root) && fs::canonicalize(source)? == *source,
+                source.parent().is_some()
+                    && root.is_none_or(|root| source != root && source.starts_with(root))
+                    && fs::canonicalize(source)? == *source,
                 i18n::text("manager.source_outside_project")
             );
             ensure!(
@@ -233,8 +264,13 @@ impl FileTransfers {
         }
 
         let stage = (*kind == TransferKind::Copy)
-            .then(|| Builder::new().prefix(STASH_PREFIX).tempdir_in(root))
+            .then(|| {
+                Builder::new()
+                    .prefix(STASH_PREFIX)
+                    .tempdir_in(root.unwrap_or(directory))
+            })
             .transpose()?;
+        let cross_volume = root.is_none();
         let mut items = Vec::new();
         for (index, (source, after)) in pairs.into_iter().enumerate() {
             let before = if let Some(stage) = &stage {
@@ -247,13 +283,17 @@ impl FileTransfers {
                 source.clone()
             };
             items.push(PasteItem {
-                stamp: fingerprint(&before)?,
+                stamp: fingerprint(&before, !cross_volume)?,
                 source,
                 before,
                 after,
             });
         }
-        let mut paste = Paste { items, stage };
+        let mut paste = Paste {
+            items,
+            stage,
+            cross_volume,
+        };
         let changes = paste.apply(true, false)?;
         if *kind == TransferKind::Cut {
             self.clipboard = None;
@@ -284,7 +324,7 @@ impl FileTransfers {
         );
         let intact = paste.items.iter().all(|item| {
             let path = if redo { &item.before } else { &item.after };
-            fingerprint(path).is_ok_and(|stamp| stamp == item.stamp)
+            fingerprint(path, !paste.cross_volume).is_ok_and(|stamp| stamp == item.stamp)
         });
         if !intact {
             if redo && let Some(stage) = &mut paste.stage {
@@ -344,15 +384,15 @@ fn copy_entry(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Digest contents, descendant names and file timestamps of the item at `path`.
-fn fingerprint(path: &Path) -> Result<[u8; 32]> {
+/// Digest contents and descendant names at `path`, optionally including file timestamps.
+fn fingerprint(path: &Path, timestamps: bool) -> Result<[u8; 32]> {
     let mut digest = Sha256::new();
-    hash_entry(path, &mut digest, &mut [0; 64 * 1024])?;
+    hash_entry(path, &mut digest, &mut [0; 64 * 1024], timestamps)?;
     Ok(digest.finalize().into())
 }
 
-/// Add `path` and its children to `digest`, reusing `buffer` to stream file contents.
-fn hash_entry(path: &Path, digest: &mut Sha256, buffer: &mut [u8]) -> Result<()> {
+/// Add `path` and its children to `digest`, streaming through `buffer` and including requested `timestamps`.
+fn hash_entry(path: &Path, digest: &mut Sha256, buffer: &mut [u8], timestamps: bool) -> Result<()> {
     let metadata = entry_metadata(path)?;
     if metadata.is_dir() {
         let mut children = fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
@@ -364,12 +404,14 @@ fn hash_entry(path: &Path, digest: &mut Sha256, buffer: &mut [u8]) -> Result<()>
             let name = name.as_encoded_bytes();
             digest.update(name.len().to_le_bytes());
             digest.update(name);
-            hash_entry(&child.path(), digest, buffer)?;
+            hash_entry(&child.path(), digest, buffer, timestamps)?;
         }
     } else {
         digest.update(b"F");
         digest.update(metadata.len().to_le_bytes());
-        digest.update(format!("{:?}", metadata.modified()?));
+        if timestamps {
+            digest.update(format!("{:?}", metadata.modified()?));
+        }
         let mut file = File::open(path)?;
         loop {
             let n = file.read(buffer)?;
@@ -378,6 +420,50 @@ fn hash_entry(path: &Path, digest: &mut Sha256, buffer: &mut [u8]) -> Result<()>
             }
             digest.update(&buffer[..n]);
         }
+    }
+    Ok(())
+}
+
+/// Move `source` into `target`, using staging only when a browser crosses volumes.
+fn move_entry(source: &Path, target: &Path, cross_volume: bool) -> Result<()> {
+    match move_exclusive(source, target) {
+        Ok(()) => Ok(()),
+        Err(error) if cross_volume && error.kind() == io::ErrorKind::CrossesDevices => {
+            move_across_volumes(source, target)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Commit a cross-volume move from `source` to vacant `target`, restoring the source on failure.
+fn move_across_volumes(source: &Path, target: &Path) -> Result<()> {
+    let stash = |path: &Path| {
+        Builder::new()
+            .prefix(STASH_PREFIX)
+            .tempdir_in(path.parent().unwrap_or(path))
+    };
+    let mut original = stash(source)?;
+    let destination = stash(target)?;
+    let staged_source = original.path().join("item");
+    let staged_target = destination.path().join("item");
+    move_exclusive(source, &staged_source)?;
+    let result = copy_entry(&staged_source, &staged_target)
+        .and_then(|()| move_exclusive(&staged_target, target).map_err(Into::into));
+    if let Err(error) = result {
+        if let Err(rollback) = move_exclusive(&staged_source, source) {
+            original.disable_cleanup(true);
+            bail!(i18n::format(
+                "manager.rollback_failed",
+                &[
+                    (
+                        "items",
+                        &format_args!("{} ({rollback})", staged_source.display())
+                    ),
+                    ("error", &format_args!("{error:#}")),
+                ],
+            ));
+        }
+        return Err(error);
     }
     Ok(())
 }
@@ -397,7 +483,7 @@ fn require_vacant(path: &Path) -> Result<()> {
 
 /// Rename `source` to `target` atomically with overwrite disabled.
 #[cfg(windows)]
-fn move_exclusive(source: &Path, target: &Path) -> io::Result<()> {
+pub(in crate::grid) fn move_exclusive(source: &Path, target: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     let source: Vec<_> = source.as_os_str().encode_wide().chain(Some(0)).collect();
     let target: Vec<_> = target.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -413,7 +499,7 @@ fn move_exclusive(source: &Path, target: &Path) -> io::Result<()> {
 
 /// Rename `source` to `target` atomically with overwrite disabled.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn move_exclusive(source: &Path, target: &Path) -> io::Result<()> {
+pub(in crate::grid) fn move_exclusive(source: &Path, target: &Path) -> io::Result<()> {
     use rustix::fs::{CWD, RenameFlags, renameat_with};
     Ok(renameat_with(
         CWD,
@@ -594,5 +680,42 @@ mod tests {
         assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
         drop(locked);
         assert_eq!(transfers.paste(&root, &target, &[]).unwrap().len(), 2);
+    }
+    /// Picker paste accepts a sibling directory while the project-bound entry point refuses it.
+    #[test]
+    fn browser_paste_can_cross_project_roots() {
+        let (_temp, root, destination) = project();
+        let source_dir = root.join("source");
+        fs::create_dir(&source_dir).unwrap();
+        let source = source_dir.join("notes.txt");
+        fs::write(&source, "content").unwrap();
+        let mut transfers = FileTransfers::default();
+        transfers
+            .capture(&[source.clone()].into_iter().collect(), TransferKind::Copy)
+            .unwrap();
+        assert!(transfers.paste(&source_dir, &destination, &[]).is_err());
+        transfers.paste_browser(&destination, &[]).unwrap();
+        assert_eq!(
+            fs::read_to_string(destination.join("notes.txt")).unwrap(),
+            "content"
+        );
+        assert!(source.exists());
+    }
+
+    /// Exercise cross-volume staging even on machines with one mounted volume.
+    #[test]
+    fn cross_volume_fallback_restores_the_source_on_collision() {
+        let (_temp, root, destination) = project();
+        let source = root.join("source.txt");
+        let target = destination.join("target.txt");
+        fs::write(&source, "source").unwrap();
+        fs::write(&target, "target").unwrap();
+        assert!(move_across_volumes(&source, &target).is_err());
+        assert_eq!(fs::read_to_string(&source).unwrap(), "source");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "target");
+        let vacant = destination.join("vacant.txt");
+        move_across_volumes(&source, &vacant).unwrap();
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(vacant).unwrap(), "source");
     }
 }
