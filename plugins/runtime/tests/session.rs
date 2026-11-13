@@ -494,17 +494,30 @@ wasm = 'main.wasm'
             .plugin(&namespace)
             .is_some()
     };
-    let guest = |key| {
-        let (reply, answer) = async_channel::bounded(1);
-        session
-            .send(Action::Invoke {
-                key,
-                event: PluginEvent::Diagnose,
-                reply: Some(reply),
-                timeout: Duration::from_secs(3),
-            })
-            .unwrap();
-        answer.recv_blocking().unwrap().unwrap().output.message
+    let guest = |key: Key| {
+        // Apply publishes the saved configuration before the guest finishes adopting it.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let (reply, answer) = async_channel::bounded(1);
+            session
+                .send(Action::Invoke {
+                    key: key.clone(),
+                    event: PluginEvent::Diagnose,
+                    reply: Some(reply),
+                    timeout: Duration::from_secs(3),
+                })
+                .unwrap();
+            match answer.recv_blocking().unwrap() {
+                Ok(result) => break result.output.message,
+                Err(error)
+                    if error == "Module is adopting updated settings"
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
     };
     let first_scope = ConfigScope::Project(1);
     let second_scope = ConfigScope::Project(2);
