@@ -5,35 +5,93 @@ edition = "2024"
 publish = false
 description = "Native character-grid editor with an embedded Neovim core"
 
+[features]
+plugin-probe = ["dep:nanobug-probe-wire"]
+
 [dependencies]
 anyhow = "1"
+async-channel = "2.5"
+nanobug-probe-wire = { path = "experiments/plugin-probe/wire", optional = true }
 dirs = "5.0.1"
 gpui = { package = "gpui-pre", version = "=0.3.10", default-features = false }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", default-features = false }
-image = { version = "0.25.10", default-features = false }
+image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+keyring = "=4.2.0"
+lyon_path = "=1.0.19"
+roxmltree = "0.20"
+rustybuzz = "=0.20.1"
+smallvec = "1"
+zeroize = "1"
 open = { version = "5.4.5", features = ["shellexecute-on-windows"] }
 unicode-script = "0.5"
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = { version = "1", features = ["serde"] }
 sha2 = "0.10.9"
 tempfile = "3.27.0"
 toml = "0.8.23"
 trash = "5.3.0"
+nanobug-plugin-sdk = { path = "plugins/sdk" }
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[target.'cfg(any(windows, target_os = "linux", target_os = "macos"))'.dependencies]
+futures-channel = "=0.3.34"
 
 [target.'cfg(windows)'.dependencies]
+gpui_windows = { package = "gpui-pre-windows", version = "=0.3.10", default-features = false }
+keyring-core = "=1.0.1"
 raw-window-handle = "0.6.2"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
     "Win32_System_LibraryLoader",
     "Win32_UI_Input_Ime",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(windows)'.dev-dependencies]
+gpui_windows = { package = "gpui-pre-windows", version = "=0.3.10", default-features = false, features = ["test-support"] }
+
+[dev-dependencies]
+wat = "1"
+
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-rustix = { version = "1.1.5", features = ["fs"] }
+rustix = { version = "1.1.5", features = ["fs", "process"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", default-features = false, features = ["wayland", "x11"] }
+gpui_linux = { package = "gpui-pre-linux", version = "=0.3.10", default-features = false, features = ["x11-modal-ime", "wayland-modal-ime"] }
+secret-service = { version = "=5.2.0", default-features = false }
+zbus = { version = "=5.19.0", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", default-features = false, features = ["font-kit"] }
+libc = "0.2"
+security-framework = "=3.7.0"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", default-features = false, features = ["test-support"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+gpui_apple = { package = "gpui-pre-apple", version = "=0.3.10", default-features = false, features = ["font-kit", "atlas-test-support"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["CFDictionary"] }
+objc2-core-video = { version = "=0.3.2", default-features = false, features = ["CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
+
+[[test]]
+name = "macos_svg_atlas"
+harness = false
+
+[[test]]
+name = "linux_svg_atlas"
+harness = false
 
 [profile.dev]
 debug = 0
@@ -44,3 +102,11 @@ debug = 0
 strip = true
 
 [workspace]
+members = ["experiments/plugin-probe", "experiments/plugin-probe/wire", "plugins/runtime", "plugins/sdk"]
+default-members = ["."]
+exclude = ["vendor/gpui-pre-apple", "vendor/gpui-pre-linux", "vendor/gpui-pre-windows"]
+
+[patch.crates-io]
+gpui-pre-apple = { path = "vendor/gpui-pre-apple" }
+gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+gpui-pre-windows = { path = "vendor/gpui-pre-windows" }

@@ -5,5 +5,7 @@ pub(crate) mod backdrop;
 pub(crate) mod icons;
 pub(crate) mod ime;
 pub(crate) mod keys;
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+pub(crate) mod native_atlas;
 pub(crate) mod text;
 pub(crate) mod theme;

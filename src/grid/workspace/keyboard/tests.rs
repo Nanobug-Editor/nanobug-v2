@@ -88,6 +88,27 @@ fn explorer_open_requires_the_normal_mode_leader() {
     );
 }
 
+#[test]
+fn plugin_manager_requires_space_then_shift_p_outside_text_input() {
+    let leader = Some(PendingPrefix::Leader(LeaderPrefix::ROOT));
+    assert_eq!(
+        shell_shortcut(Focus::Editor, Mode::Normal, None, leader, "shift-p"),
+        Some(ShellShortcut::OpenPluginManager)
+    );
+    assert_eq!(
+        shell_shortcut(Focus::Editor, Mode::Normal, None, None, "shift-p"),
+        None
+    );
+    assert_eq!(
+        shell_shortcut(Focus::Editor, Mode::Insert, None, leader, "shift-p"),
+        None
+    );
+    assert_eq!(
+        shell_shortcut(Focus::Editor, Mode::Normal, None, leader, "p"),
+        Some(ShellShortcut::AwaitLeader(LeaderPrefix("p")))
+    );
+}
+
 /// Uppercase L opens the picker only from the root leader hint and outside editor text entry.
 #[test]
 fn leader_language_picker_requires_uppercase_l() {

@@ -13,8 +13,37 @@ use nanobug::{animation::scroll::ScrollInput, vim::Mode};
 use std::ops::Range;
 
 impl Workspace {
+    /// End the composition of any surface that stopped accepting native text.
+    pub(super) fn sync_text_input(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if !self.accepts_native_text() {
+            self.plugins.composition.clear();
+            if let Some(project) = self.projects.active_project_mut() {
+                project.editor.composition.clear();
+            }
+            self.help.composition.clear();
+            #[cfg(feature = "plugin-probe")]
+            if let Some(probe) = &mut self.probe {
+                probe.composition.clear();
+            }
+        }
+        #[cfg(windows)]
+        self.sync_native_ime(window, cx);
+        #[cfg(not(windows))]
+        let _ = (window, cx);
+    }
+
     /// Read preedit from the surface that currently owns native input.
     fn composition(&self) -> Option<&Composition> {
+        if self.plugins.owns_input() {
+            return self
+                .plugins
+                .accepts_text()
+                .then_some(&self.plugins.composition);
+        }
+        #[cfg(feature = "plugin-probe")]
+        if self.probe_has_focus() {
+            return self.probe.as_ref().map(|probe| &probe.composition);
+        }
         if self.help.is_open() {
             Some(&self.help.composition)
         } else if let Some(session) = &self.file_picker {
@@ -32,6 +61,16 @@ impl Workspace {
 
     /// Update preedit on the surface that currently owns native input.
     fn composition_mut(&mut self) -> Option<&mut Composition> {
+        if self.plugins.owns_input() {
+            return self
+                .plugins
+                .accepts_text()
+                .then_some(&mut self.plugins.composition);
+        }
+        #[cfg(feature = "plugin-probe")]
+        if self.probe_has_focus() {
+            return self.probe.as_mut().map(|probe| &mut probe.composition);
+        }
         if self.help.is_open() {
             Some(&mut self.help.composition)
         } else if let Some(session) = &mut self.file_picker {
@@ -49,6 +88,13 @@ impl Workspace {
 
     /// Whether the active surface accepts native text input at this moment.
     pub(super) fn accepts_native_text(&self) -> bool {
+        if self.plugins.owns_input() {
+            return self.plugins.accepts_text();
+        }
+        #[cfg(feature = "plugin-probe")]
+        if self.probe_has_focus() {
+            return true;
+        }
         if self.small_modal_open() {
             false
         } else if self.help.is_open() {
@@ -147,6 +193,16 @@ impl EntityInputHandler for Workspace {
             && let Some(composition) = self.composition_mut()
         {
             composition.mark(range, text, selection);
+            self.trace_plugin_preedit(text.encode_utf16().count());
+            #[cfg(feature = "plugin-probe")]
+            if self.probe_has_focus()
+                && let Some(client) = self.probe.as_ref().and_then(|probe| probe.client.as_ref())
+            {
+                client.mark(
+                    "draft_preedit",
+                    serde_json::json!({ "units": text.encode_utf16().count() }),
+                );
+            }
             self.repaint_preedit(window, cx);
         }
     }
@@ -159,6 +215,9 @@ impl EntityInputHandler for Workspace {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if let Some(bounds) = self.canvas_input_caret_bounds() {
+            return Some(bounds);
+        }
         let (x, y, width, _, _) = self.caret();
         Some(Bounds::new(
             self.metrics.at(x, y),

@@ -1,0 +1,17 @@
+name = "Workspace Panel"
+id = "workspace-panel"
+version = "1.0.0"
+description = "A workspace note field drawn by the plugin UI SDK."
+permissions = ["read_project"]
+
+[engines]
+nanobug = "^0.1.0"
+
+[experiments]
+ui = "ui-2026-11-12-1"
+
+[[modules]]
+id = "notes"
+wasm = "workspace_panel.wasm"
+rule = "detect.js"
+interactive = true

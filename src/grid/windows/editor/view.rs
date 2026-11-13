@@ -84,11 +84,12 @@ impl EditorWindow {
             ""
         };
         for visible in 0..=body.h {
-            let line = first + visible;
-            if line >= vim.doc.starts.len() {
+            let display_row = first + visible;
+            if display_row >= vim.doc.display_rows() {
                 numbers.text(2, visible, "~", MUTED, 1);
                 continue;
             }
+            let line = vim.doc.document_row(display_row);
             let current = row == line && active;
             if current {
                 numbers.tint(visible, 0, gutter, CURRENT);
@@ -96,12 +97,22 @@ impl EditorWindow {
             numbers.text(
                 0,
                 visible,
-                &format!("{:>width$} │", line + 1, width = gutter.saturating_sub(2)),
+                &format!(
+                    "{:>width$} {}",
+                    line + 1,
+                    if vim.doc.folded_at(line) {
+                        "▸"
+                    } else {
+                        "│"
+                    },
+                    width = gutter.saturating_sub(2)
+                ),
                 if current { GOLD } else { MUTED },
                 gutter,
             );
             let (displayed, preedit) = buffer.displayed_line(line, composition);
             let tint = if current { CURRENT } else { 0 };
+            let highlights = buffer.highlights();
             text.viewport_line(
                 visible,
                 context.spacing.cells(&displayed),
@@ -110,13 +121,27 @@ impl EditorWindow {
                 |byte| {
                     if preedit.as_ref().is_some_and(|range| range.contains(&byte)) {
                         (GOLD, 0xc9a3f251)
-                    } else if selection
-                        .as_ref()
-                        .is_some_and(|range| range.contains(&(vim.doc.starts[line] + byte)))
-                    {
-                        (TEXT, selection_tint)
                     } else {
-                        (TEXT, tint)
+                        let byte = byte
+                            - preedit
+                                .as_ref()
+                                .filter(|range| byte >= range.end)
+                                .map_or(0, |range| range.len());
+                        let offset = vim.doc.starts[line] + byte;
+                        let index = highlights.partition_point(|span| span.range.end <= offset);
+                        let color = highlights
+                            .get(index)
+                            .filter(|span| span.range.start <= offset)
+                            .map_or(TEXT, |span| crate::ui::theme::syntax_color(span.kind));
+                        let background = if selection
+                            .as_ref()
+                            .is_some_and(|range| range.contains(&offset))
+                        {
+                            selection_tint
+                        } else {
+                            tint
+                        };
+                        (color, background)
                     }
                 },
             );

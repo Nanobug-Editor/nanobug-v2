@@ -17,14 +17,15 @@ use super::{
 };
 use crate::ui::{
     icons::{Icon, IconCache},
-    theme::BACKGROUND,
+    theme::style,
 };
 #[cfg(windows)]
 use gpui::WindowControlArea;
 use gpui::{
     AnyElement, Bounds, Context, Corners, ElementInputHandler, Entity, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Pixels, Render, StatefulInteractiveElement,
-    StyleRefinement, Styled, Window, canvas, div, point, px, rgba, size,
+    IntoElement, MouseButton, NavigationDirection, ParentElement, Pixels, Render,
+    StatefulInteractiveElement, StyleRefinement, Styled, Window, canvas, div, point, px, rgba,
+    size,
 };
 
 /// Cross drawn in the border gap for a hovered pane or popup.
@@ -149,7 +150,7 @@ fn clipped_entity<V: Render>(
 impl Render for Workspace {
     /// Compose the workspace with the active popup, if any.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.derive_layout(window) != self.layout {
+        if self.update_display_scale(window, cx) || self.derive_layout(window) != self.layout {
             self.sync(window, cx);
         }
         if !window.is_window_hovered() {
@@ -159,7 +160,7 @@ impl Render for Workspace {
             .id("nanobug")
             .relative()
             .size_full()
-            .bg(rgba(BACKGROUND))
+            .bg(rgba(style(cx).background()))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
@@ -170,6 +171,18 @@ impl Render for Workspace {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_scroll(cx.listener(Self::scroll));
+        if self.has_canvas_button_callbacks() {
+            for button in [
+                MouseButton::Right,
+                MouseButton::Middle,
+                MouseButton::Navigate(NavigationDirection::Back),
+                MouseButton::Navigate(NavigationDirection::Forward),
+            ] {
+                root = root
+                    .on_mouse_down(button, cx.listener(Self::plugin_canvas_aux_down))
+                    .on_mouse_up(button, cx.listener(Self::plugin_canvas_up));
+            }
+        }
         let layers = self
             .file_picker_layers()
             .or_else(|| self.grid_layers().map(Vec::from));
@@ -188,10 +201,12 @@ impl Render for Workspace {
         let editor_close = self.editor_close_area();
         let language_picker = self.language_picker_area();
         let picker_filter = self.file_picker_filter_area();
+        let document_results = self.document_results_area();
         let small_popup = if self.help.is_open() {
             None
         } else {
-            editor_close
+            document_results
+                .or(editor_close)
                 .or(language_picker)
                 .or(picker_filter)
                 .or_else(|| self.leader_hint_area())
@@ -315,13 +330,18 @@ impl Render for Workspace {
                         .top_0()
                         .size_full()
                         .children(visible);
-                    if !self.small_modal_open() && picker_filter.is_none() {
+                    if !self.small_modal_open()
+                        && picker_filter.is_none()
+                        && document_results.is_none()
+                    {
                         underlay =
                             underlay.child(clipped_entity(self.cursor.clone(), viewport, region));
                     }
                     root = root.child(underlay);
                 }
-                if self.small_modal_open() || picker_filter.is_some() {
+                if document_results.is_none()
+                    && (self.small_modal_open() || picker_filter.is_some())
+                {
                     root = root.child(
                         self.popup_panel
                             .clone()
@@ -334,7 +354,7 @@ impl Render for Workspace {
                                 .cached(positioned(language_list_bounds(area, self.metrics))),
                         );
                     }
-                } else {
+                } else if document_results.is_none() {
                     root = root.child(self.leader_hint_element(area, cx));
                 }
             } else {
@@ -352,9 +372,19 @@ impl Render for Workspace {
             origin: point(self.metrics.origin.x, px(OUTER_INSET_Y)),
             ..self.metrics
         };
+        #[cfg(feature = "plugin-probe")]
+        {
+            root = root.children(self.probe_layer(window, cx).and_then(layer_element));
+            self.probe_after_frame(window, cx);
+        }
         root = root.child(self.tabs.element(tab_metrics, window, cx));
+        root = root.children(self.plugin_element(window, cx));
+        self.plugin_after_frame(window, cx);
         if editor_close.is_none()
-            && (language_picker.is_some() || picker_filter.is_some() || small_popup.is_none())
+            && (language_picker.is_some()
+                || picker_filter.is_some()
+                || document_results.is_some()
+                || small_popup.is_none())
         {
             root = root.child(
                 self.cursor.clone().cached(
@@ -452,7 +482,11 @@ impl Render for Workspace {
                             &workspace.focus_handle,
                             ElementInputHandler::new(bounds, cx.entity()),
                             cx,
-                        )
+                        );
+                        workspace.trace_document_scene();
+                        workspace.retire_canvas_images_after_paint(window, cx);
+                        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+                        crate::ui::native_atlas::finish_frame(window, cx);
                     });
                 },
             )

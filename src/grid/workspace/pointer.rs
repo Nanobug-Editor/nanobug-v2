@@ -84,6 +84,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.plugin_click(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        #[cfg(feature = "plugin-probe")]
+        if self.probe_click(event.position, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         #[cfg(windows)]
         if event.position.y < self.native_caption_height() {
             // GPUI forwards caption presses here before Windows starts its native move.
@@ -198,6 +207,10 @@ impl Workspace {
             self.set_controls_hover(self.corner_controls_at(event.position), cx);
             return;
         }
+        if self.drag_plugin_field(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         let Some(project) = self.projects.active_project_mut() else {
             return;
         };
@@ -218,6 +231,7 @@ impl Workspace {
                 return;
             }
         } else {
+            self.plugin_canvas_move(event);
             self.set_controls_hover(self.corner_controls_at(event.position), cx);
             return;
         }
@@ -225,10 +239,19 @@ impl Workspace {
     }
 
     /// End pointer resizing/selection, including releases outside the native client bounds.
-    pub(super) fn mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+    pub(super) fn mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut native_drag = self.end_plugin_field_drag() || self.resizing;
         self.resizing = false;
         if let Some(project) = self.projects.active_project_mut() {
-            project.editor.dragging = None;
+            native_drag |= project.editor.dragging.take().is_some();
+        }
+        if !native_drag {
+            self.plugin_canvas_up(event, window, cx);
         }
     }
 
@@ -241,6 +264,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if self.small_modal_open() {
+            cx.stop_propagation();
+            return;
+        }
+        if self.plugin_canvas_scroll(event) {
             cx.stop_propagation();
             return;
         }

@@ -3,4 +3,5 @@
 pub mod animation;
 pub mod document;
 pub mod i18n;
+pub mod plugins;
 pub mod vim;

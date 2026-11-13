@@ -23,6 +23,8 @@ pub struct Vim {
     pub mode: Mode,
     /// Current Ex command or literal search query, without its prefix.
     pub command: String,
+    /// Visual range retained while an Ex command is being entered.
+    command_selection: Option<Range<usize>>,
     /// Last feedback shown in the status line.
     pub message: String,
     /// Visual selection anchor in UTF-8 bytes.
@@ -48,6 +50,7 @@ impl Vim {
             doc,
             mode: Mode::Normal,
             command: String::new(),
+            command_selection: None,
             message: String::new(),
             anchor: 0,
             pending: String::new(),

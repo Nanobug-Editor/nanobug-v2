@@ -86,6 +86,8 @@ struct HelpBackdrop {
     viewport: Size<Pixels>,
     /// Rounded popup bounds reserved in the image.
     outline: Bounds<Pixels>,
+    /// Clear cache validity without releasing the currently rendered atlas entry.
+    valid: bool,
     /// Downsampled, blurred workspace texture.
     image: Arc<RenderImage>,
 }

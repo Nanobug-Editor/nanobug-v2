@@ -17,6 +17,15 @@ pub(super) struct RecentProjects {
 }
 
 impl RecentProjects {
+    /// Keep experimental project paths local to this window.
+    pub(super) fn in_memory() -> Self {
+        Self {
+            path: None,
+            roots: Vec::new(),
+            error: None,
+        }
+    }
+
     /// Load history and record `roots` from explicit startup arguments in their display order.
     pub(super) fn new(roots: impl Iterator<Item = PathBuf>) -> Self {
         let mut recent = Self {

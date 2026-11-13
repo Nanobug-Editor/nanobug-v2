@@ -3,6 +3,8 @@
 
 mod app;
 mod grid;
+#[cfg(feature = "plugin-probe")]
+mod plugin_probe;
 mod ui;
 
 /// Start the native application with its command-line project or file.

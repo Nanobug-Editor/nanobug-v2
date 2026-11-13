@@ -7,8 +7,8 @@ use crate::{
         backdrop::BackdropRaster,
         text::{UNITS_PER_COLUMN, chinese_base},
         theme::{
-            ACCENT, CURSOR_TEXT, GRID_CHINESE_FONT, GRID_RULE_FONT_FAMILY, GRID_TEXT_FONT,
-            TREE_GUIDE,
+            ACCENT, CURSOR_TEXT, GRID_CHINESE_FONT, GRID_RULE_FONT_FAMILY, GridFont, Style,
+            TREE_GUIDE, style,
         },
     },
 };
@@ -45,9 +45,9 @@ impl GridFace {
     }
 
     /// Return the font descriptor for shaping cells in this run.
-    fn font(self) -> Font {
+    fn font(self, grid: GridFont) -> Font {
         match self {
-            Self::Text => GRID_TEXT_FONT.clone(),
+            Self::Text => grid.descriptor(),
             Self::Chinese => GRID_CHINESE_FONT.clone(),
             Self::BoxDrawing => font(GRID_RULE_FONT_FAMILY),
         }
@@ -70,8 +70,10 @@ struct Run {
     clusters: Vec<usize>,
     /// Horizontal translations from shaped cluster origins to measured positions.
     shifts: Vec<Pixels>,
-    /// Base ink color.
+    /// Base ink color resolved through the current theme.
     color: u32,
+    /// Foreground and shadow opacity selected by the label.
+    opacity: f32,
 }
 
 impl Run {
@@ -165,6 +167,8 @@ struct PanelData {
     frame: Frame,
     /// Font/grid metrics.
     metrics: Metrics,
+    /// Editor style used when resolving cell roles and shaping the row.
+    style: Style,
     /// None marks a changed row whose text must be shaped again.
     cache: Vec<Option<PreparedRow>>,
     /// Current text waves, independent of row shaping.
@@ -184,6 +188,7 @@ impl Panel {
             data: Rc::new(RefCell::new(PanelData {
                 frame: Frame::new(0, 0),
                 metrics,
+                style: Style::default(),
                 cache: Vec::new(),
                 waves: Vec::new(),
             })),
@@ -194,6 +199,23 @@ impl Panel {
         if self.data.borrow_mut().set_frame(frame) {
             cx.notify();
         }
+    }
+
+    /// Repaint retained rows if their geometry, font or palette changed.
+    pub fn set_appearance(&mut self, metrics: Metrics, cx: &mut Context<Self>) {
+        let style = style(cx);
+        let mut data = self.data.borrow_mut();
+        if data.metrics != metrics || data.style != style {
+            data.metrics = metrics;
+            data.style = style;
+            data.cache.iter_mut().for_each(|row| *row = None);
+            cx.notify();
+        }
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn metrics(&self) -> Metrics {
+        self.data.borrow().metrics
     }
 
     /// Install sampled `waves` without invalidating the prepared rows.
@@ -242,7 +264,7 @@ impl Panel {
                                 subpixel_rendering: false,
                                 dilation: 0,
                             },
-                            run.color,
+                            (run.color << 8) | (run.opacity * 255.).round() as u32,
                             clip,
                         );
                     }
@@ -251,13 +273,18 @@ impl Panel {
         }
         for &chevron in &data.frame.chevrons {
             let area = data.frame.chevron_bounds(chevron, bounds.origin, metrics);
-            raster.chevron(area, clip, chevron.points_left, chevron.color);
+            raster.chevron(
+                area,
+                clip,
+                chevron.points_left,
+                data.style.tint(chevron.color),
+            );
         }
         let scale = window.scale_factor();
         for guide in &data.frame.guides {
             raster.fill(
                 guide.bounds(bounds.origin, metrics, scale).intersect(&clip),
-                TREE_GUIDE,
+                data.style.tint(TREE_GUIDE),
             );
         }
         for icon in &data.frame.icons {
@@ -374,7 +401,9 @@ impl PanelData {
             if color != 0 {
                 let x = self.metrics.spacing_px(positioned.x(start));
                 let end = self.metrics.spacing_px(positioned.x(col));
-                prepared.backgrounds.push((x, end - x, color));
+                prepared
+                    .backgrounds
+                    .push((x, end - x, self.style.tint(color)));
             }
         }
         Self::shape_runs(
@@ -383,6 +412,7 @@ impl PanelData {
             self.metrics,
             text_system,
             LabelStyle::Text,
+            self.style,
             &mut prepared.runs,
         );
         for label in &self.frame.labels[row] {
@@ -392,6 +422,7 @@ impl PanelData {
                 self.metrics,
                 text_system,
                 label.style,
+                self.style,
                 &mut prepared.label_runs,
             );
         }
@@ -400,16 +431,18 @@ impl PanelData {
     }
 
     /// Shape `row` at `origin` spacing units using `metrics` and `text_system`, appending to `runs`.
-    /// `style` selects any font or decoration override for the label.
+    /// `label` selects any font or decoration override for the label.
     fn shape_runs(
         row: &FrameRow,
         origin: isize,
         metrics: Metrics,
         text_system: &WindowTextSystem,
-        style: LabelStyle,
+        label: LabelStyle,
+        style: Style,
         runs: &mut Vec<Run>,
     ) {
         let cells = &row.cells;
+        let opacity = if label == LabelStyle::Dimmed { 0.5 } else { 1. };
         let mut col = 0;
         while col < cells.len() {
             if cells[col].text.is_empty() {
@@ -435,18 +468,19 @@ impl PanelData {
             if text.trim().is_empty() {
                 continue;
             }
+            let color = style.foreground(color);
             let run = TextRun {
                 len: text.len(),
-                font: match style {
+                font: match label {
                     LabelStyle::Symbol => font(if cfg!(windows) {
                         "Segoe UI Symbol"
                     } else {
                         GRID_RULE_FONT_FAMILY
                     }),
-                    _ => face.font(),
+                    _ => face.font(style.font),
                 },
-                color: rgb(color).into(),
-                underline: (style == LabelStyle::Key).then_some(UnderlineStyle {
+                color: rgb(color).opacity(opacity).into(),
+                underline: (label == LabelStyle::Key).then_some(UnderlineStyle {
                     thickness: px(1.),
                     color: None,
                     wavy: false,
@@ -459,7 +493,7 @@ impl PanelData {
                 .collect();
             let shared: gpui::SharedString = text.into();
             let shadow_run = TextRun {
-                color: rgba(0x00000070).into(),
+                color: rgba(style.shadow()).opacity(opacity).into(),
                 underline: None,
                 ..run.clone()
             };
@@ -480,6 +514,7 @@ impl PanelData {
                 clusters,
                 shifts: Vec::new(),
                 color,
+                opacity,
             };
             if units != (width * UNITS_PER_COLUMN) as isize {
                 // Native shaping can leave small advance differences. Move each whole cluster
@@ -557,7 +592,7 @@ impl PanelData {
                         } else {
                             &[]
                         };
-                        paint_glyph_run(run, origin, self.metrics.lh, waves, window);
+                        paint_glyph_run(run, origin, self.metrics.lh, waves, self.style, window);
                         continue;
                     }
                     let _ = run.shadow.paint(
@@ -593,14 +628,14 @@ impl PanelData {
                 path.line_to(point(base, area.bottom()));
                 path.close();
                 if let Ok(path) = path.build() {
-                    window.paint_path(path, rgba(chevron.color));
+                    window.paint_path(path, rgba(self.style.tint(chevron.color)));
                 }
             }
             let scale = window.scale_factor();
             for guide in &self.frame.guides {
                 window.paint_quad(fill(
                     guide.bounds(bounds.origin, self.metrics, scale),
-                    rgba(TREE_GUIDE),
+                    rgba(self.style.tint(TREE_GUIDE)),
                 ));
             }
             for icon in &self.frame.icons {
@@ -616,7 +651,7 @@ impl PanelData {
 }
 
 /// Return the accumulated tint and bounded glyph displacement of `waves` at `center`.
-fn sample_waves(waves: &[Wave], center: Vec2) -> (f32, Point<Pixels>) {
+pub(in crate::grid) fn sample_waves(waves: &[Wave], center: Vec2) -> (f32, Point<Pixels>) {
     let (light, shift) = waves
         .iter()
         .fold((0., Vec2::default()), |(light, shift), wave| {
@@ -638,6 +673,7 @@ fn paint_glyph_run(
     origin: Point<Pixels>,
     height: f32,
     waves: &[Wave],
+    style: Style,
     window: &mut Window,
 ) {
     let layout = &run.line;
@@ -654,14 +690,15 @@ fn paint_glyph_run(
             if glyph.is_emoji {
                 let _ = window.paint_emoji(at, shaped.font_id, glyph.id, layout.font_size);
             } else {
-                let color =
-                    rgb(run.color).blend(rgba((ACCENT << 8) | (light.clamp(0., 1.) * 205.) as u32));
+                let color = rgb(run.color).opacity(run.opacity).blend(rgba(
+                    (style.foreground(ACCENT) << 8) | (light.clamp(0., 1.) * 205.) as u32,
+                ));
                 let _ = window.paint_glyph(
                     at + point(px(0.), px(1.)),
                     shaped.font_id,
                     glyph.id,
                     layout.font_size,
-                    rgba(0x00000070).into(),
+                    rgba(style.shadow()).opacity(run.opacity).into(),
                 );
                 let _ = window.paint_glyph(
                     at,
@@ -677,7 +714,14 @@ fn paint_glyph_run(
 
 impl Render for Panel {
     /// Draw this panel with a single retained canvas and cached row layouts.
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let style = style(cx);
+        let mut data = self.data.borrow_mut();
+        if data.style != style {
+            data.style = style;
+            data.cache.iter_mut().for_each(|row| *row = None);
+        }
+        drop(data);
         let prepare = self.data.clone();
         let paint = self.data.clone();
         canvas(

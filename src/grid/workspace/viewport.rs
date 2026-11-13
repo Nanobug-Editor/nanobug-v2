@@ -45,11 +45,23 @@ pub(super) enum CursorSpace {
     FilePicker,
     /// Editable filter, path, or filename prompt.
     FilePickerInput,
+    PluginManager,
+    PluginInput,
+    /// The experiment's locally owned text input.
+    #[cfg(feature = "plugin-probe")]
+    PluginProbe,
 }
 
 impl Workspace {
     /// Resolve the logical caret's position and width in visual grid columns, plus its input state.
     pub(super) fn caret(&self) -> (f32, f32, f32, bool, bool) {
+        if let Some(caret) = self.plugin_caret() {
+            return caret;
+        }
+        #[cfg(feature = "plugin-probe")]
+        if let Some((x, y)) = self.probe_caret() {
+            return (x, y, 1., true, true);
+        }
         if let Some(list) = &self.help.list {
             let area = self.help_layout();
             if let Some((x, y)) = self.help.filter_caret(area, &self.spacing, self.metrics) {
@@ -126,7 +138,7 @@ impl Workspace {
         let retained_left = (buffer.columns.first_cell() * UNITS_PER_COLUMN) as isize;
         let x = (span.start as isize - retained_left) as f32 / UNITS_PER_COLUMN as f32
             - buffer.columns.fraction();
-        let y = body.y as f32 + row as f32 - buffer.scroll.position();
+        let y = body.y as f32 + vim.doc.display_row(row) as f32 - buffer.scroll.position();
         (
             body.x as f32 + x,
             y,
@@ -142,6 +154,16 @@ impl Workspace {
 
     /// Coordinate system that should move with a scrolling viewport.
     fn cursor_space(&self) -> CursorSpace {
+        if self.plugins.open {
+            return CursorSpace::PluginManager;
+        }
+        if self.plugins.surface_focus {
+            return CursorSpace::PluginInput;
+        }
+        #[cfg(feature = "plugin-probe")]
+        if self.probe_has_focus() {
+            return CursorSpace::PluginProbe;
+        }
         if self.help.is_filtering() {
             CursorSpace::HelpFilter
         } else if self.help.is_open() {
@@ -171,6 +193,10 @@ impl Workspace {
     /// Rebuild changed panel cells and retarget the independent animated cursor.
     pub(super) fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.layout = self.derive_layout(window);
+        self.sync_plugin_projects();
+        self.refresh_document_presentation();
+        #[cfg(feature = "plugin-probe")]
+        self.sync_probe_projects();
         self.sync_start_preview(window, cx);
         self.repaint([ScrollInput::Reveal; 3], window, cx);
     }
@@ -220,17 +246,20 @@ impl Workspace {
             ""
         };
         let buffer = &mut project.editor.buffers[project.editor.active];
-        let row =
-            (!matches!(buffer.vim.mode, Mode::Command | Mode::Search)).then(|| buffer.cursor_row());
+        let opened_fold = buffer.reveal_cursor_fold();
+        let row = (!matches!(buffer.vim.mode, Mode::Command | Mode::Search))
+            .then(|| buffer.vim.doc.display_row(buffer.cursor_row()));
         let (next_row, document_delta) = buffer.scroll.track_rows(
             document_input,
             row,
             text.h,
-            buffer.vim.doc.starts.len(),
+            buffer.vim.doc.display_rows(),
             now,
         );
-        let document_changed = next_row != row;
-        if let Some(next_row) = next_row.filter(|_| document_changed) {
+        let moved = next_row != row;
+        let document_changed = moved || opened_fold;
+        let next_row = next_row.map(|row| buffer.vim.doc.document_row(row));
+        if let Some(next_row) = next_row.filter(|_| moved) {
             buffer.vim.move_to_row(next_row);
         }
         let caret_line = next_row.map(|row| buffer.displayed_line(row, composition).0);
@@ -246,7 +275,8 @@ impl Workspace {
                 // A short caret line should not prevent panning a long visible line.
                 let first = buffer.scroll.first_cell();
                 let last = first + text.h + usize::from(buffer.scroll.fraction() > 0.);
-                (first..last.min(buffer.vim.doc.starts.len()))
+                (first..last.min(buffer.vim.doc.display_rows()))
+                    .map(|row| buffer.vim.doc.document_row(row))
                     .map(|row| {
                         self.spacing
                             .columns(&buffer.displayed_line(row, composition).0)
@@ -283,7 +313,11 @@ impl Workspace {
                 | CursorSpace::HelpFilter
                 | CursorSpace::FilePicker
                 | CursorSpace::FilePickerInput
+                | CursorSpace::PluginManager
+                | CursorSpace::PluginInput
                 | CursorSpace::LanguageList => None,
+                #[cfg(feature = "plugin-probe")]
+                CursorSpace::PluginProbe => None,
             };
             if let Some((rows, delta, columns)) = owned {
                 self.follow_cursor_scroll(rows, delta, columns, cx);
@@ -346,6 +380,7 @@ impl Workspace {
 
     /// Retarget the shared cursor in `window` using the active surface and its geometry through `cx`.
     pub(super) fn update_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_canvas_text_layout(window);
         let (x, y, width, insert, visible) = self.caret();
         let space = self.cursor_space();
         let start = if matches!(space, CursorSpace::Start(_)) {
@@ -399,7 +434,11 @@ impl Workspace {
             | CursorSpace::HelpFilter
             | CursorSpace::FilePicker
             | CursorSpace::FilePickerInput
+            | CursorSpace::PluginManager
+            | CursorSpace::PluginInput
             | CursorSpace::LanguageList => None,
+            #[cfg(feature = "plugin-probe")]
+            CursorSpace::PluginProbe => None,
         };
         let cell_width = metrics.cw;
         let mut painted_width = cell_width * width;
@@ -412,6 +451,7 @@ impl Workspace {
                 | CursorSpace::HelpList
                 | CursorSpace::LanguageList
                 | CursorSpace::FilePicker
+                | CursorSpace::PluginManager
                 | CursorSpace::Start(StartFocus::Projects)
         ) {
             painted_width *= 0.5;
@@ -463,6 +503,11 @@ impl Workspace {
                 .map(|area| language_list_bounds(area, self.metrics));
             // The choices own nearby-text effects while the cursor can travel across the workspace.
             (Some(self.language_list.clone()), clip, None)
+        } else if matches!(space, CursorSpace::PluginManager | CursorSpace::PluginInput) {
+            self.plugin_cursor_panel()
+                .map_or((None, None, None), |(panel, area, field)| {
+                    (Some(panel), Some(area.pixels(self.metrics)), field)
+                })
         } else {
             let clip_metrics = if space == CursorSpace::HelpList {
                 HelpWindow::content_metrics(self.metrics)
@@ -496,11 +541,14 @@ impl Workspace {
             let scale = window.scale_factor();
             painted_width = painted_width.min((ink * scale).ceil() / scale);
         }
+        let height = self
+            .canvas_input_caret_bounds()
+            .map_or(metrics.lh, |bounds| f32::from(bounds.size.height));
         let geometry = Geometry::new(
             f32::from(target.x),
             f32::from(target.y),
             painted_width,
-            metrics.lh,
+            height,
         );
         self.cursor.update(cx, |cursor, cx| {
             cursor.set_viewport(
@@ -524,8 +572,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        #[cfg(windows)]
-        self.sync_native_ime(window, cx);
+        self.sync_text_input(window, cx);
         #[cfg(windows)]
         if let Some(shortcut) = &self.alt_escape {
             shortcut.set_enabled(self.editor_accepts_alt_escape());
@@ -548,6 +595,8 @@ impl Workspace {
             self.advance_scrolling(inputs, cx);
         }
         self.refresh_panels(cx);
+        #[cfg(feature = "plugin-probe")]
+        self.refresh_probe(cx);
         self.finish_scroll_frame(window, cx);
     }
 
@@ -558,8 +607,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        #[cfg(windows)]
-        self.sync_native_ime(window, cx);
+        self.sync_text_input(window, cx);
         self.advance_help_scrolling(input, cx);
         self.refresh_help_panels(cx);
         self.finish_scroll_frame(window, cx);

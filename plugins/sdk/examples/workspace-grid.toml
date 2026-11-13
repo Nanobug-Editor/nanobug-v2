@@ -1,0 +1,17 @@
+name = "Workspace Grid"
+id = "workspace-grid"
+version = "1.0.0"
+description = "A note field using Nanobug's character grid."
+permissions = ["read_project"]
+
+[engines]
+nanobug = "^0.1.0"
+
+[experiments]
+ui = "ui-2026-11-12-1"
+
+[[modules]]
+id = "notes"
+wasm = "workspace_grid.wasm"
+rule = "detect.js"
+interactive = true

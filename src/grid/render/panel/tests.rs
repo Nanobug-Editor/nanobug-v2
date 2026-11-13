@@ -147,6 +147,7 @@ fn tree_names_keep_glyph_positions_when_selected() {
         let mut data = PanelData {
             frame,
             metrics,
+            style: Style::default(),
             cache: vec![None],
             waves: Vec::new(),
         };
@@ -206,6 +207,7 @@ fn shell_labels_use_measured_widths_with_fixed_anchors() {
     let mut data = PanelData {
         frame,
         metrics,
+        style: Style::default(),
         cache: vec![None, None, None],
         waves: Vec::new(),
     };
@@ -307,6 +309,7 @@ fn wide_cursor_uses_ink_without_counting_grid_padding() {
     let mut data = PanelData {
         frame,
         metrics,
+        style: Style::default(),
         cache: vec![None],
         waves: Vec::new(),
     };

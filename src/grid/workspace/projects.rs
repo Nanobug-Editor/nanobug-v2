@@ -10,10 +10,13 @@ use std::{
     borrow::Cow,
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 /// Retained state of a project or standalone file tab.
 pub(super) struct Project {
+    /// Unique opening used to bind plugin state to this tab's lifetime.
+    pub(super) plugin_scope: u64,
     /// Project root or standalone file's parent, used to resolve relative paths.
     pub(super) root: PathBuf,
     /// Last focused pane in this project.
@@ -55,11 +58,13 @@ impl Project {
         manager: Option<ManagerWindow>,
         mut status: String,
     ) -> Self {
+        static NEXT_SCOPE: AtomicU64 = AtomicU64::new(1);
         let cursor_config = CursorConfig::load(&root).unwrap_or_else(|error| {
             status = i18n::format("cursor.config_error", &[("error", &error)]);
             CursorConfig::default()
         });
         Self {
+            plugin_scope: NEXT_SCOPE.fetch_add(1, Ordering::Relaxed),
             manager,
             root,
             focus: Focus::Editor,
@@ -149,7 +154,7 @@ impl Tab {
 }
 
 /// Nonempty display order shared by project tabs and start pages.
-pub(super) struct WorkspaceTabs {
+pub(crate) struct WorkspaceTabs {
     /// The strip in left-to-right order.
     tabs: Vec<Tab>,
     /// Index of the tab receiving input.
@@ -160,7 +165,7 @@ pub(super) struct WorkspaceTabs {
 
 impl WorkspaceTabs {
     /// Load explicit startup `paths` in order, or create a start page for an empty list.
-    pub(super) fn new(paths: Vec<PathBuf>) -> Self {
+    pub(crate) fn new(paths: Vec<PathBuf>) -> Self {
         let mut tabs = Self {
             tabs: Vec::new(),
             selected: 0,

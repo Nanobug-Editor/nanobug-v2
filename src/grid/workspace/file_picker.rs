@@ -59,6 +59,11 @@ pub(super) struct PickerSession {
 }
 
 impl PickerSession {
+    /// Retained layers share the workspace grid for painting and pointer hit testing.
+    pub(super) fn panels(&self) -> [&Entity<Panel>; 3] {
+        [&self.panel, &self.text_panel, &self.message_panel]
+    }
+
     /// Allocate the panels using workspace grid `metrics` through `cx`.
     fn new(metrics: Metrics, cx: &mut Context<Workspace>) -> Self {
         Self {

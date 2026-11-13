@@ -1,0 +1,227 @@
+{
+  "surface": {
+    "title": "Canvas parity",
+    "canvas": {
+      "interaction": { "next_frame": "underlined" },
+      "draw": [
+        {
+          "op": "group",
+          "offset": [18, 14],
+          "clip": [0, 0, 252, 148],
+          "draw": [
+            {
+              "op": "shadows",
+              "bounds": [4, 5, 112, 45],
+              "corners": [8, 3, 7, 4],
+              "values": [
+                { "color": 303375816, "offset": [3, 5], "blur": 6, "spread": 1 },
+                { "color": 1463317408, "offset": [-2, 3], "blur": 3, "spread": 0 }
+              ]
+            },
+            {
+              "op": "quad",
+              "bounds": [4, 5, 112, 45],
+              "corners": [8, 3, 7, 4],
+              "fill": { "fill": "linear", "angle": 28, "from": [1063359487, 0], "to": [3330914303, 1], "oklab": true },
+              "borders": [1, 2, 3, 4],
+              "border": 3453744307,
+              "dashed": true
+            },
+            {
+              "op": "shadows",
+              "bounds": [4, 5, 112, 45],
+              "corners": [8, 3, 7, 4],
+              "inset": true,
+              "values": [{ "color": 286998704, "offset": [-2, 3], "blur": 4, "spread": 0, "inset": true }]
+            },
+            {
+              "op": "quad",
+              "bounds": [133, 6, 138, 42],
+              "corners": [4, 4, 4, 4],
+              "fill": { "fill": "slash", "color": 3701566975, "width": 3, "interval": 8 }
+            },
+            {
+              "op": "group",
+              "offset": [7, 62],
+              "layer": [0, 0, 220, 37],
+              "draw": [
+                {
+                  "op": "path",
+                  "segments": [
+                    { "segment": "move", "to": [0, 8] },
+                    { "segment": "cubic", "first": [13, -4], "second": [33, 37], "to": [49, 10] },
+                    { "segment": "line", "to": [77, 8] }
+                  ],
+                  "style": { "kind": "stroke", "width": 4, "start_cap": "round", "end_cap": "square", "join": "bevel" },
+                  "dash": [6, 3],
+                  "transform": [1, 0.125, -0.25, 1, 4, 2],
+                  "fill": { "fill": "solid", "color": 1321977343 }
+                },
+                {
+                  "op": "group",
+                  "opacity": 0.6,
+                  "draw": [
+                    {
+                      "op": "group",
+                      "opacity": 0.5,
+                      "draw": [
+                        { "op": "image", "bounds": [102, 1, 72, 31], "image_bounds": [90, 0, 89, 34],
+                          "asset": "sample.png", "corners": [5, 5, 5, 5] }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "op": "text",
+              "origin": [6, 102],
+              "text": "GPUI text\nWrap & paint",
+              "size": 16,
+              "line_height": 18,
+              "wrap": 98,
+              "layout": { "align": "center", "width": 118, "max_lines": 2 },
+              "runs": [
+                { "length": 22, "color": 3925147647, "background": 860116360, "font": "PARITY_TEXT_FONT",
+                  "font_options": { "weight": 700, "slant": "italic", "features": { "kern": 1 }, "fallbacks": ["PARITY_TEXT_FALLBACK"] },
+                  "underline": { "thickness": 1.5, "color": 4206723583 },
+                  "strike": { "thickness": 1.2, "color": 4252597759 } }
+              ]
+            },
+            {
+              "op": "underline",
+              "origin": [133, 119],
+              "width": 86,
+              "style": { "thickness": 1.5, "color": 4206723583, "wavy": true },
+              "exclusions": [[12, 20], [44, 50]]
+            },
+            {
+              "op": "strike",
+              "origin": [133, 130],
+              "width": 86,
+              "style": { "thickness": 1.2, "color": 4252597759 }
+            },
+            {
+              "op": "group",
+              "offset": [127, 56],
+              "layer": [0, 0, 118, 45],
+              "clip": [0, 0, 106, 40],
+              "draw": [
+                { "op": "quad", "bounds": [-4, 0, 113, 29],
+                  "fill": { "fill": "solid", "color": 965594879 } },
+                { "op": "group", "layer": [4, 2, 102, 24], "opacity": 0.65,
+                  "draw": [
+                    { "op": "quad", "bounds": [4, 2, 102, 24],
+                      "fill": { "fill": "solid", "color": 3778089215 } },
+                    { "op": "shaped_line", "origin": [2, 4], "text": "Loc中Style", "size": 14,
+                      "line_height": 18, "layout": { "align": "right", "width": 93 },
+                      "runs": [
+                        { "length": 3, "font": "PARITY_TEXT_FONT", "color": 3623419903,
+                          "underline": { "thickness": 1.1, "color": 3623419903, "wavy": true } },
+                        { "length": 3, "font": "PARITY_TEXT_FONT", "color": 3623419903,
+                          "underline": { "thickness": 2, "color": 3623419903 } },
+                        { "length": 5, "font": "PARITY_TEXT_FONT", "color": 3623419903,
+                          "underline": { "thickness": 1.1, "color": 3623419903, "wavy": true } }
+                      ],
+                      "underlines": [
+                        { "range": [0, 3], "skip": true },
+                        { "range": [6, 11], "style": { "thickness": 1.5, "wavy": true },
+                          "exclusions": [[5.5, 10.25], [17, 23]] }
+                      ],
+                      "underline_tag": 17 }
+                  ]
+                },
+                { "op": "underline", "origin": [21, 31], "width": 72,
+                  "style": { "thickness": 2, "color": 1642455039 } }
+              ]
+            },
+            {
+              "op": "group",
+              "absolute_offset": [236, 135],
+              "draw": [
+                {
+                  "op": "quad",
+                  "bounds": [0, 0, 50, 20],
+                  "fill": { "fill": "checkerboard", "color": 3100700927, "size": 4 }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "op": "group",
+          "offset": [16, 163],
+          "clip": [0, -2, 270, 13],
+          "draw": [
+            { "op": "quad", "bounds": [1, 0, 53, 8],
+              "fill": { "fill": "solid", "color": 0 },
+              "borders": [1, 1, 1, 1], "border": 2582480127 },
+            { "op": "path", "style": { "kind": "fill", "rule": "non_zero" },
+              "segments": [
+                { "segment": "polygon", "points": [[72, 0], [106, 0], [106, 8], [72, 8]], "closed": true },
+                { "segment": "polygon", "points": [[83, 2], [96, 2], [96, 6], [83, 6]], "closed": true }
+              ],
+              "fill": { "fill": "checkerboard", "color": 1539358463, "size": 2 } },
+            { "op": "path", "stroke": 1.5,
+              "segments": [
+                { "segment": "move", "to": [126, 7] },
+                { "segment": "line", "to": [139, 0] },
+                { "segment": "line", "to": [163, 0] }
+              ],
+              "fill": { "fill": "solid", "color": 3786440447 } }
+          ]
+        },
+        {
+          "op": "group",
+          "absolute_offset": [18, 174],
+          "clip": [0, 0, 264, 76],
+          "draw": [
+            {
+              "op": "group",
+              "opacity": 0.65,
+              "draw": [
+                { "op": "svg", "bounds": [4, 12, 52, 40], "asset": "mark.svg",
+                  "color": 4106844927, "scale": [1.15, 0.8], "rotation": 0.45, "offset": [7, 4] }
+              ]
+            },
+            {
+              "op": "glyphs", "baseline": [83, 44], "text": "A",
+              "font": "PARITY_TEXT_FONT", "size": 25, "color": 2514284543
+            },
+            {
+              "op": "group",
+              "opacity": 0.55,
+              "draw": [
+                { "op": "glyphs", "baseline": [111, 44], "text": "PARITY_EMOJI_TEXT",
+                  "font": "PARITY_EMOJI_FONT", "size": 31, "color": 4294967295 }
+              ]
+            },
+            {
+              "op": "image", "bounds": [156, 12, 38, 40], "asset": "frames.gif",
+              "corners": [3, 3, 3, 3], "frame": 0
+            },
+            {
+              "op": "image", "bounds": [207, 12, 38, 40], "asset": "frames.gif",
+              "corners": [3, 3, 3, 3], "frame": 1, "grayscale": true
+            },
+            {
+              "op": "svg", "bounds": [74, 56, 52, 16], "asset": "mark.svg",
+              "color": 2444879615, "transform": [0.9, -0.1, 0.45, 1, 1, -2]
+            },
+            {
+              "op": "path",
+              "segments": [
+                { "segment": "move", "to": [145, 55] },
+                { "segment": "arc", "radii": [19, 9], "rotation": 13, "large": false, "sweep": true, "to": [182, 59] },
+                { "segment": "quadratic", "control": [160, 84], "to": [145, 55] },
+                { "segment": "close" }
+              ],
+              "style": { "kind": "fill", "rule": "even_odd" },
+              "fill": { "fill": "linear", "angle": 77, "from": [3698880511, 0], "to": [3939011839, 1] }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

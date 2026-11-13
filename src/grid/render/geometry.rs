@@ -3,12 +3,13 @@
 use super::BORDER_LABEL_INSET;
 use crate::ui::text::UNITS_PER_COLUMN;
 use gpui::{Bounds, Pixels, Point, point, px, size};
+use std::ops::Range;
 
 /// Grid columns occupied by each corner button, including its clickable padding.
 const CORNER_BUTTON_COLUMNS: usize = 3;
 
 /// Common font geometry, shared by grid drawing, pointer hit testing and the cursor.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Metrics {
     /// Narrow-cell advance in logical pixels, snapped to a whole device pixel.
     pub cw: f32,
@@ -70,6 +71,11 @@ impl Rect {
                 px(self.h as f32 * metrics.lh),
             ),
         )
+    }
+
+    /// Columns available for a title in this rectangle's top rule without corner controls.
+    pub(in crate::grid) fn border_title_columns(self) -> Range<usize> {
+        self.x + BORDER_LABEL_INSET + 1..self.x + self.w.saturating_sub(3)
     }
 
     /// Place corner buttons at the right inset, with help to the left when `include_help` fits.

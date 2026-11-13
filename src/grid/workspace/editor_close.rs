@@ -270,6 +270,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.prepare_plugin_close(target, window, cx) {
+            return;
+        }
         if !self.begin_close(target) {
             self.finish_close(target, window, cx);
         }

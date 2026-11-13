@@ -1,12 +1,12 @@
 //! GPU cursor layer: a unified cursor silhouette, optional overlays and demand-driven frames.
 use super::{CursorCell, Panel};
-use crate::ui::theme::CURSOR_FILL;
+use crate::ui::theme::style;
 use gpui::{
     Bounds, ContentMask, Context, Entity, IntoElement, PathBuilder, Pixels, Render, Styled, Task,
     Window, canvas, point, px, rgba, size,
 };
 use nanobug::animation::cursor::{
-    CubicSegment, CursorConfig, CursorMotion, Effect, Geometry, Target, Vec2,
+    CubicSegment, CursorConfig, CursorMotion, Effect, Geometry, Target, Vec2, Wave,
 };
 use std::time::{Duration, Instant};
 
@@ -161,13 +161,17 @@ impl Cursor {
     /// Send the current waves to the owned body without reshaping its cached rows.
     fn publish_waves(&self, cx: &mut Context<Self>) {
         if let Some(body) = &self.body {
-            let waves = self
-                .motion
-                .waves()
-                .filter(|wave| self.visible && wave.target != Target::Cursor)
-                .collect();
+            let waves = self.nearby_text_waves();
             body.update(cx, |panel, cx| panel.set_waves(waves, cx));
         }
+    }
+
+    /// Snapshot the same text waves for non-grid glyphs in a semantic Canvas field.
+    pub(in crate::grid) fn nearby_text_waves(&self) -> Vec<Wave> {
+        self.motion
+            .waves()
+            .filter(|wave| self.visible && wave.target != Target::Cursor)
+            .collect()
     }
 
     /// Update the painters and request the next necessary wake.
@@ -266,6 +270,7 @@ fn paint_fluid(outline: &[CubicSegment], color: u32, alpha: u32, window: &mut Wi
 impl Render for Cursor {
     /// Paint effects and the cursor silhouette, then recolor the glyph inside its head.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let color = style(cx).cursor();
         let (opacity, scale) = self.motion.appearance();
         let alpha = (184. * opacity).clamp(0., 255.) as u32;
         let head = self.motion.head();
@@ -335,7 +340,7 @@ impl Render for Cursor {
                 }
                 window.with_content_mask(clip.map(|bounds| ContentMask { bounds }), |window| {
                     for (ghost, opacity) in &ghosts {
-                        paint_polygon(ghost, CURSOR_FILL, (65. * opacity * opacity) as u32, window);
+                        paint_polygon(ghost, color, (65. * opacity * opacity) as u32, window);
                     }
                     for wave in &pulses {
                         let radius = wave.front();
@@ -357,7 +362,7 @@ impl Render for Cursor {
                             window.paint_path(
                                 path,
                                 rgba(
-                                    (CURSOR_FILL << 8)
+                                    (color << 8)
                                         | ((1. - wave.progress).powi(2) * 170. * wave.strength)
                                             .min(255.)
                                             as u32,
@@ -366,9 +371,9 @@ impl Render for Cursor {
                         }
                     }
                     if let Some(outline) = &fluid {
-                        paint_fluid(outline, CURSOR_FILL, alpha, window);
+                        paint_fluid(outline, color, alpha, window);
                     } else if let Some(outline) = &polygon {
-                        paint_polygon(outline, CURSOR_FILL, alpha, window);
+                        paint_polygon(outline, color, alpha, window);
                     }
                     if let Some((text, bounds)) = &text {
                         window.with_content_mask(Some(ContentMask { bounds: *bounds }), |window| {

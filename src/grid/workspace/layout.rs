@@ -88,6 +88,10 @@ pub(super) struct Layout {
     pub(super) cols: usize,
     /// Total grid rows.
     pub(super) rows: usize,
+    /// Whole columns that fit the native client area, before the pane minimum.
+    pub(super) visible_cols: usize,
+    /// Whole rows that fit below the native client area's grid origin.
+    pub(super) visible_rows: usize,
     /// Signed offset from the grid footer row that aligns the visible badges with the top inset.
     pub(super) footer_offset: Pixels,
     /// Manager viewport, excluding global chrome.
@@ -132,15 +136,20 @@ impl Workspace {
     /// Resolve this window's current dimensions to the two panel rectangles.
     pub(super) fn derive_layout(&self, window: &Window) -> Layout {
         let size = window.viewport_size();
-        let cols = ((f32::from(size.width) - 2. * f32::from(self.metrics.origin.x))
+        let visible_cols = ((f32::from(size.width) - 2. * f32::from(self.metrics.origin.x))
             / self.metrics.cw)
-            .floor()
-            .max(60.) as usize;
+            .floor() as usize;
+        let visible_rows = ((f32::from(size.height) - f32::from(self.metrics.origin.y))
+            / self.metrics.lh)
+            .floor() as usize;
+        let cols = visible_cols.max(60);
         let (rows, footer_offset) = footer_geometry(size.height, self.metrics.lh);
         let Some(project) = self.projects.active_project() else {
             return Layout {
                 cols,
                 rows,
+                visible_cols,
+                visible_rows,
                 footer_offset,
                 ..Layout::default()
             };
@@ -157,6 +166,8 @@ impl Workspace {
         Layout {
             cols,
             rows,
+            visible_cols,
+            visible_rows,
             footer_offset,
             tree: Rect {
                 x: 0,

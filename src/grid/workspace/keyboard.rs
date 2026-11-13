@@ -55,6 +55,11 @@ const LEADER_BINDINGS: &[LeaderBinding] = &[
         shortcut: Some(ShellShortcut::OpenFilePicker),
     },
     LeaderBinding {
+        sequence: "P",
+        description_key: "leader.open_plugins",
+        shortcut: Some(ShellShortcut::OpenPluginManager),
+    },
+    LeaderBinding {
         sequence: "p",
         description_key: "leader.project_group",
         shortcut: None,
@@ -141,6 +146,8 @@ enum ShellShortcut {
     OpenLanguagePicker,
     /// Open the workspace's three-column file picker.
     OpenFilePicker,
+    /// Open the native plugin manager.
+    OpenPluginManager,
     /// Add a tab showing the start page.
     OpenStart,
     /// Close the current project or window after resolving unsaved buffers.
@@ -212,6 +219,13 @@ impl Workspace {
         if !self.accepts_native_text() {
             return;
         }
+        if self.plugin_commit(text, window, cx) {
+            return;
+        }
+        #[cfg(feature = "plugin-probe")]
+        if self.probe_commit(text, window, cx) {
+            return;
+        }
         if let Some(list) = &mut self.help.list {
             list.commit_filter(text, self.scroll_epoch.elapsed().as_secs_f64());
             self.repaint_help(ScrollInput::Advance, window, cx);
@@ -227,6 +241,10 @@ impl Workspace {
         let text = text.replace("\r\n", "\n");
         self.run_vim(|vim, register| vim.text(&text, register), window, cx);
         self.sync(window, cx);
+        #[cfg(feature = "plugin-probe")]
+        if let Some(client) = self.probe.as_ref().and_then(|probe| probe.client.as_ref()) {
+            client.mark("editor_input", serde_json::json!({ "bytes": text.len() }));
+        }
     }
 
     /// Cancel the active pane's partial navigation before a shell shortcut.
@@ -273,12 +291,33 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.plugins.owns_input() {
+            if self.plugin_key(event, window, cx) {
+                cx.stop_propagation();
+            }
+            return;
+        }
+        if event.keystroke.key == "escape" {
+            self.clear_canvas_focus();
+        }
+        if self.plugin_shortcut(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if !self.modal_open()
             && let Some(shortcut) = ProjectShortcut::resolve(&event.keystroke)
         {
+            #[cfg(feature = "plugin-probe")]
+            if self.probe_has_focus() {
+                self.set_probe_focus(false, window, cx);
+            }
             self.dismiss_leader_hint(cx);
             self.project_shortcut(shortcut, window, cx);
             cx.stop_propagation();
+            return;
+        }
+        #[cfg(feature = "plugin-probe")]
+        if self.probe_key(event, window, cx) {
             return;
         }
         let raw = event.keystroke.key.as_str();
@@ -408,10 +447,15 @@ impl Workspace {
         if !self.projects.active().editor.composition.is_empty()
             && !modifiers.control
             && !modifiers.platform
+            // Windows delivers a composing Escape as a modal command.
+            && !(cfg!(windows) && raw == "escape" && !modifiers.modified())
         {
             return;
         }
         if let Some(shortcut) = shortcut {
+            if matches!(shortcut, ShellShortcut::Select(_)) {
+                self.clear_canvas_focus();
+            }
             self.apply_shell_shortcut(shortcut, raw, window, cx);
             cx.stop_propagation();
             return;
@@ -445,6 +489,12 @@ impl Workspace {
             }
             cx.stop_propagation();
             return;
+        } else if prefix.is_none()
+            && !matches!(mode, Mode::Insert | Mode::Command | Mode::Search)
+            && self.plugin_canvas_key(event)
+        {
+            cx.stop_propagation();
+            return;
         } else if self.projects.active().focus == Focus::Manager {
             let key = if modifiers.control || modifiers.alt || modifiers.platform {
                 ""
@@ -476,6 +526,19 @@ impl Workspace {
             };
             if input.clear_status {
                 self.projects.active_mut().status.clear();
+            }
+            #[cfg(feature = "plugin-probe")]
+            if let Some(client) = self.probe.as_ref().and_then(|probe| probe.client.as_ref())
+                && mode != self.projects.active().editor.vim().mode
+            {
+                let current = self.projects.active().editor.vim();
+                client.mark(
+                    "editor_mode",
+                    serde_json::json!({
+                        "insert": current.mode == Mode::Insert,
+                        "revision": current.doc.revision,
+                    }),
+                );
             }
             self.apply_edit(input.edit, window, cx);
         }
@@ -570,7 +633,12 @@ impl Workspace {
 
     /// Switch the shared cursor preset in `window` and report it in the current tab.
     /// `reverse` selects the previous preset.
-    fn cycle_cursor_effect(&mut self, reverse: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn cycle_cursor_effect(
+        &mut self,
+        reverse: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let effect = self
             .cursor
             .update(cx, |cursor, cx| cursor.cycle(reverse, window, cx));
@@ -605,6 +673,7 @@ impl Workspace {
             ShellShortcut::Stay => {}
             ShellShortcut::OpenLanguagePicker => self.open_language_picker(window, cx),
             ShellShortcut::OpenFilePicker => self.open_file_picker(window, cx),
+            ShellShortcut::OpenPluginManager => self.open_plugin_manager(window, cx),
             ShellShortcut::OpenStart => self.open_start_tab(window, cx),
             ShellShortcut::Close(target) => {
                 self.held_close_key = Some(raw.into());

@@ -1,0 +1,11 @@
+[package]
+name = "nanobug-probe-worker"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+nanobug-probe-wire = { path = "wire" }
+rquickjs = { version = "=0.14.0", default-features = false }
+wasmtime = { version = "=50.0.0", default-features = false, features = ["anyhow", "cranelift", "runtime", "std", "wat"] }

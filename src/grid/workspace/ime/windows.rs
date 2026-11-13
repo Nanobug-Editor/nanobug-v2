@@ -23,12 +23,6 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let enabled = self.accepts_native_text();
-        if !enabled {
-            if let Some(project) = self.projects.active_project_mut() {
-                project.editor.composition.clear();
-            }
-            self.help.composition.clear();
-        }
         let Some(hwnd) = window_hwnd(window) else {
             return;
         };
@@ -50,6 +44,30 @@ impl Workspace {
                     ))
                 }) {
                     set_ime_attached(hwnd, enabled);
+                }
+            })
+            .detach();
+    }
+
+    /// Cancel a previous surface's preedit when moving between two native text targets.
+    #[cfg(feature = "plugin-probe")]
+    pub(in crate::grid::workspace) fn cancel_probe_preedit(
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut window = window.to_async(cx);
+        cx.foreground_executor()
+            .spawn_with_priority(Priority::High, async move {
+                if let Ok(Some(hwnd)) = window.update(|window, _| window_hwnd(window)) {
+                    unsafe {
+                        if GetFocus() == hwnd {
+                            let context = ImmGetContext(hwnd);
+                            if !context.is_null() {
+                                ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+                                ImmReleaseContext(hwnd, context);
+                            }
+                        }
+                    }
                 }
             })
             .detach();

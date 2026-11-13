@@ -28,14 +28,19 @@ impl EditorWindow {
             self.active = index;
         } else {
             let doc = Document::open(&path)?;
-            self.buffers.push(Buffer::new(doc));
-            self.active = self.buffers.len() - 1;
+            self.active = self.retain_document(doc);
         }
         let buffer = &mut self.buffers[self.active];
         buffer.scroll.snap(buffer.scroll.first_cell(), now);
         buffer.columns.snap(buffer.columns.first_cell(), now);
         self.composition.clear();
         Ok(())
+    }
+
+    /// Retain a prepared document without changing focus or doing disk I/O.
+    pub(in crate::grid) fn retain_document(&mut self, doc: Document) -> usize {
+        self.buffers.push(Buffer::new(doc));
+        self.buffers.len() - 1
     }
 
     /// Move buffer `index` to another tab, retaining a valid editor in this tab.

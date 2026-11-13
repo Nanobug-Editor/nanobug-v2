@@ -1,0 +1,7 @@
+# GPUI Windows backend
+
+This directory contains the Apache-2.0 source of `gpui-pre-windows` 0.3.10, Zed revision `08cbb88a152c3751a43e853425a70e9f631a5918`. The published package SHA-256 is `80670f987b920fba019917b2e222ecf2b377f2a6d77872010c7d284c235837b3`. [Published package](https://crates.io/crates/gpui-pre-windows/0.3.10)
+
+Nanobug opts into `WindowsPlatform::new_with_parallel_graphics` in `src/app/mod.rs`. It creates the first DirectX device on a worker while the main thread initializes Win32 and DirectWrite. The worker hands off the device and its unused immediate context before the UI thread creates the swap chain or submits a draw. Session validation, headless behavior, device recovery and the renderer continue through the existing GPUI methods. [Direct3D threading rules](https://learn.microsoft.com/en-us/windows/win32/direct3d11/overviews-direct3d-11-render-multi-thread-intro)
+
+Nanobug also opts into `WindowsPlatform::with_modal_escape`. The message loop recovers plain Escape from an IME-processed key before translation and delivers it to the focused text handler's application. If the application handles the key and leaves text entry, the backend cancels preedit and detaches the input context before processing the next key. The default constructor keeps the upstream key path. [ImmGetVirtualKey](https://learn.microsoft.com/en-us/windows/win32/api/imm/nf-imm-immgetvirtualkey)

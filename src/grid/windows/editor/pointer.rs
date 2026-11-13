@@ -23,7 +23,10 @@ impl EditorWindow {
             + buffer.scroll.position())
         .floor()
         .max(0.) as usize;
-        let row = row.min(buffer.vim.doc.starts.len() - 1);
+        let row = buffer
+            .vim
+            .doc
+            .document_row(row.min(buffer.vim.doc.display_rows() - 1));
         let x = f32::from(position.x - metrics.at(body.x as f32, 0.).x) / metrics.cw;
         let (line, preedit) = buffer.displayed_line(row, &self.composition.text);
         let visual_x =

@@ -9,6 +9,7 @@ mod panel;
 pub(in crate::grid) use cursor::Cursor;
 pub(crate) use geometry::{Metrics, Rect};
 pub(in crate::grid) use layer::GridLayer;
+pub(in crate::grid) use panel::sample_waves;
 pub(crate) use panel::{CursorCell, Panel};
 
 use crate::ui::{
@@ -134,6 +135,8 @@ impl FrameRow {
 pub(in crate::grid) enum LabelStyle {
     /// Ordinary grid text.
     Text,
+    /// Grid text drawn at half opacity for shortcut hints.
+    Dimmed,
     /// Underlined keyboard key name.
     Key,
     /// Text glyph from the symbol face.
@@ -583,43 +586,26 @@ impl Frame {
         include_help: bool,
         draw_title: impl FnOnce(&mut Self, Range<usize>, u32) -> usize,
     ) {
-        let height = self.rows.len();
-        let width = self.rows.first().map_or(0, |row| row.cells.len());
-        if width < 2 || height < 2 {
+        let area = Rect {
+            w: self.rows.first().map_or(0, |row| row.cells.len()),
+            h: self.rows.len(),
+            ..Rect::default()
+        };
+        if area.w < 2 || area.h < 2 {
             return;
         }
         let color = if active { ACCENT } else { MUTED };
-        self.text(0, 0, &format!("╭{}╮", "─".repeat(width - 2)), color, width);
-        self.text(
-            0,
-            height - 1,
-            &format!("╰{}╯", "─".repeat(width - 2)),
-            color,
-            width,
-        );
-        for row in 1..height - 1 {
-            self.text(0, row, "│", color, 1);
-            self.text(width - 1, row, "│", color, 1);
+        self.border_rules(area, color, false);
+        let controls = show_controls
+            .then(|| area.corner_controls(include_help))
+            .flatten();
+        let mut columns = area.border_title_columns();
+        if let Some(controls) = &controls {
+            columns.end = controls.area().x - 2;
         }
-        let controls = if show_controls {
-            Rect {
-                w: width,
-                h: height,
-                ..Rect::default()
-            }
-            .corner_controls(include_help)
-        } else {
-            None
-        };
-        let title_start = BORDER_LABEL_INSET + 1;
-        // Leave room for the title's trailing space and a rule before the controls.
-        let title_end = controls
-            .as_ref()
-            .map_or(width.saturating_sub(3), |controls| controls.area().x - 2);
-        if title_end > title_start {
-            let end = draw_title(self, title_start..title_end, color);
-            let gap = end + 1 - BORDER_LABEL_INSET;
-            self.text(BORDER_LABEL_INSET, 0, &" ".repeat(gap), color, gap);
+        if !columns.is_empty() {
+            let end = draw_title(self, columns, color);
+            self.clear_border_title(area, end, color);
         }
         if let Some(controls) = controls {
             let area = controls.area();
@@ -628,5 +614,55 @@ impl Frame {
                 self.text(help.x + help.w / 2, 0, "?", GOLD, 1);
             }
         }
+    }
+
+    /// Draw a titled grid section within `area`. `dashed` selects the description-style rule.
+    /// `draw_title` paints within the available columns and returns its last occupied edge.
+    pub(in crate::grid) fn section_border(
+        &mut self,
+        area: Rect,
+        color: u32,
+        dashed: bool,
+        draw_title: impl FnOnce(&mut Self, Range<usize>) -> usize,
+    ) {
+        if area.w < 2 || area.h < 2 {
+            return;
+        }
+        self.border_rules(area, color, dashed);
+        let columns = area.border_title_columns();
+        if !columns.is_empty() {
+            let end = draw_title(self, columns);
+            self.clear_border_title(area, end, color);
+        }
+    }
+
+    /// Paint `area`'s corners and edges using the grid rule font and `color`.
+    fn border_rules(&mut self, area: Rect, color: u32, dashed: bool) {
+        let Rect { x, y, w, h } = area;
+        let (top_left, top_right, bottom_left, bottom_right, horizontal, vertical) = if dashed {
+            ("┌", "┐", "└", "┘", "╌", "╎")
+        } else {
+            ("╭", "╮", "╰", "╯", "─", "│")
+        };
+        let rule = horizontal.repeat(w - 2);
+        self.text(x, y, &format!("{top_left}{rule}{top_right}"), color, w);
+        self.text(
+            x,
+            y + h - 1,
+            &format!("{bottom_left}{rule}{bottom_right}"),
+            color,
+            w,
+        );
+        for row in y + 1..y + h - 1 {
+            self.text(x, row, vertical, color, 1);
+            self.text(x + w - 1, row, vertical, color, 1);
+        }
+    }
+
+    /// Leave a cell of padding around the measured title in `area`'s top rule.
+    fn clear_border_title(&mut self, area: Rect, end: usize, color: u32) {
+        let start = area.x + BORDER_LABEL_INSET;
+        let gap = end + 1 - start;
+        self.text(start, area.y, &" ".repeat(gap), color, gap);
     }
 }

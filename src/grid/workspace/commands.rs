@@ -1,6 +1,7 @@
 //! Apply editor actions to retained buffers, files and the native window.
 
 use crate::grid::windows::editor::EditResult;
+use crate::ui::theme::{AppearanceSettings, GridFont, ThemeChoice};
 
 use super::{
     Workspace,
@@ -42,8 +43,6 @@ impl Workspace {
 
     /// Execute modal `action` in `window` through `cx`, preserving buffers on I/O errors.
     fn action(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
-        let active = self.projects.active().editor.active;
-        let tab = self.projects.selected;
         match action {
             Action::None => {}
             Action::Open(name) => {
@@ -56,21 +55,91 @@ impl Workspace {
             }
             Action::Save(name) => {
                 let path = name.map(|name| self.projects.active().root.join(name));
-                match self.projects.save_buffer(tab, active, path) {
-                    Ok(()) => {
-                        let project = self.projects.active_mut();
-                        project.status = i18n::text("workspace.saved").into();
-                        if let Some(manager) = &mut project.manager {
-                            let _ = manager.tree.refresh();
+                self.save_with_plugins(path, false, window, cx);
+            }
+            Action::SaveClose => self.save_with_plugins(None, true, window, cx),
+            Action::Format(selection) => self.manual_format(selection, window, cx),
+            Action::CancelFormat => self.cancel_format(window, cx),
+            Action::UndoPlugin => self.undo_plugin_edits(window, cx),
+            Action::PluginComplete => {
+                self.plugin_language(nanobug::plugins::package::Provider::Complete, window, cx)
+            }
+            Action::PluginDiagnose => {
+                self.plugin_language(nanobug::plugins::package::Provider::Diagnose, window, cx)
+            }
+            Action::PluginOutline => self.plugin_outline(window, cx),
+            Action::PluginFold => self.plugin_fold(window, cx),
+            Action::PluginCommand(id) => self.plugin_command_by_id(&id, window, cx),
+            Action::Appearance(option, value) => {
+                let mut next = self.appearance;
+                let normalized = value.trim().to_ascii_lowercase();
+                let number = normalized.parse::<f32>().ok();
+                if option == "font"
+                    && matches!(normalized.as_str(), "maple" | "maple mono nl cn")
+                    && let Err(error) = GridFont::ensure_maple(self.glyphs.as_ref())
+                {
+                    self.set_status(i18n::format(
+                        "editor.appearance_font_error",
+                        &[("error", &error)],
+                    ));
+                    return;
+                }
+                let accepted = match (option.as_str(), normalized.as_str()) {
+                    ("theme" | "font" | "fontsize" | "zoom", "default") => {
+                        let defaults = AppearanceSettings::default();
+                        match option.as_str() {
+                            "theme" => next.theme = defaults.theme,
+                            "font" => next.font = defaults.font,
+                            "fontsize" => next.base_size = defaults.base_size,
+                            "zoom" => next.zoom = defaults.zoom,
+                            _ => unreachable!(),
                         }
+                        true
                     }
-                    Err(error) => self.set_status(format!("{error:#}")),
+                    ("theme", "dark") => {
+                        next.theme = ThemeChoice::Dark;
+                        true
+                    }
+                    ("theme", "light") => {
+                        next.theme = ThemeChoice::Light;
+                        true
+                    }
+                    ("theme", "system") => {
+                        next.theme = ThemeChoice::System;
+                        true
+                    }
+                    ("font", "rec" | "rec mono casual") => {
+                        next.font = GridFont::RecMono;
+                        true
+                    }
+                    ("font", "maple" | "maple mono nl cn") => {
+                        next.font = GridFont::MapleMono;
+                        true
+                    }
+                    ("fontsize", _) => number
+                        .filter(|size| (12. ..=24.).contains(size))
+                        .is_some_and(|size| {
+                            next.base_size = size;
+                            true
+                        }),
+                    ("zoom", _) => normalized
+                        .strip_suffix('%')
+                        .unwrap_or(&normalized)
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|percent| (75. ..=150.).contains(percent))
+                        .is_some_and(|percent| {
+                            next.zoom = percent / 100.;
+                            true
+                        }),
+                    _ => false,
+                };
+                if accepted {
+                    self.apply_appearance(next, window, cx);
+                } else {
+                    self.set_status(i18n::text("editor.appearance_usage").into());
                 }
             }
-            Action::SaveClose => match self.projects.save_buffer(tab, active, None) {
-                Ok(()) => self.request_close(CloseTarget::Quit, window, cx),
-                Err(error) => self.set_status(format!("{error:#}")),
-            },
             Action::Close(false) => self.request_close(CloseTarget::Quit, window, cx),
             Action::Close(true) => window.remove_window(),
         }

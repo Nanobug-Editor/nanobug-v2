@@ -5,7 +5,7 @@ use crate::{
     grid::render::{Frame, Metrics, Panel, Rect},
     ui::{
         text::{TextSpacing, UNITS_PER_COLUMN},
-        theme::{CURSOR_FILL, CURSOR_TEXT, MUTED, TEXT},
+        theme::{CURSOR_TEXT, MUTED, TEXT, style},
     },
 };
 use gpui::{
@@ -114,6 +114,16 @@ pub(super) struct TabBar {
 }
 
 impl TabBar {
+    /// Layout depends on measured glyph positions as well as the number of columns.
+    pub(super) fn set_metrics(&mut self, metrics: Metrics, geometry_changed: bool, cx: &mut App) {
+        if geometry_changed {
+            self.layout = None;
+        }
+        for panel in [&self.labels, &self.covered] {
+            panel.update(cx, |panel, cx| panel.set_appearance(metrics, cx));
+        }
+    }
+
     /// Create the retained strip at the workspace's `metrics` in `cx`.
     pub(super) fn new(metrics: Metrics, cx: &mut App) -> Self {
         Self {
@@ -245,7 +255,7 @@ impl TabBar {
                     .top(block.origin.y)
                     .w(px((right - left) * metrics.cw))
                     .h(block.size.height)
-                    .bg(rgb(CURSOR_FILL))
+                    .bg(rgb(style(cx).cursor()))
                     .overflow_hidden()
                     .child(self.covered.clone().cached(positioned(masked))),
             )

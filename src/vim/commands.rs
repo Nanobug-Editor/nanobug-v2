@@ -17,6 +17,21 @@ pub enum Action {
     Close(bool),
     /// Save the active file, then request closing the app.
     SaveClose,
+    /// Format the current document through its selected plugin provider.
+    Format(Option<std::ops::Range<usize>>),
+    /// Cancel the current manual format request.
+    CancelFormat,
+    UndoPlugin,
+    PluginComplete,
+    PluginDiagnose,
+    /// Show the document symbols contributed by the active language plugin.
+    PluginOutline,
+    /// Toggle the fold at the cursor in the current editor viewport.
+    PluginFold,
+    /// Invoke a declared plugin command by ID.
+    PluginCommand(String),
+    /// Update an editor-wide appearance preference through the native shell.
+    Appearance(String, String),
 }
 
 impl Vim {
@@ -35,6 +50,7 @@ impl Vim {
                 let search = self.mode == Mode::Search;
                 self.mode = Mode::Normal;
                 let text = std::mem::take(&mut self.command);
+                let selection = self.command_selection.take();
                 if search {
                     if !text.is_empty() {
                         self.last_search = text;
@@ -49,6 +65,17 @@ impl Vim {
                     "q" | "quit" | "qa" | "qall" => Action::Close(false),
                     "q!" | "quit!" => Action::Close(true),
                     "wq" | "x" => Action::SaveClose,
+                    "format" => Action::Format(selection),
+                    "formatcancel" => Action::CancelFormat,
+                    "undo-plugin" => Action::UndoPlugin,
+                    "complete" => Action::PluginComplete,
+                    "diagnose" => Action::PluginDiagnose,
+                    "outline" => Action::PluginOutline,
+                    "fold" => Action::PluginFold,
+                    "plugin" if !args.is_empty() => Action::PluginCommand(args.into()),
+                    "theme" | "font" | "fontsize" | "zoom" => {
+                        Action::Appearance(name.into(), args.into())
+                    }
                     "e" | "edit" if !args.is_empty() => Action::Open(args.into()),
                     _ => {
                         self.message =

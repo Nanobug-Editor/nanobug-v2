@@ -4,9 +4,11 @@ use crate::ui::text::{TextSpacing, UNITS_PER_COLUMN};
 use nanobug::{
     animation::scroll::GridScroll,
     document::Document,
+    plugins::session::DocumentPresentation,
     vim::{Mode, Vim},
 };
-use std::{borrow::Cow, ops::Range};
+use nanobug_plugin_sdk::language::{Highlight, Symbol};
+use std::{borrow::Cow, ops::Range, sync::Arc};
 
 /// Extra text columns on either side for fractional scrolling and wide glyphs.
 pub(in crate::grid) const TEXT_OVERSCAN: usize = 4;
@@ -19,6 +21,8 @@ pub(in crate::grid) struct Buffer {
     pub(in crate::grid) scroll: GridScroll,
     /// Continuous horizontal offset in base grid columns, independent of logical text columns.
     pub(in crate::grid) columns: GridScroll,
+    /// Validated syntax data from the selected language provider for this buffer.
+    presentation: Option<(nanobug::plugins::session::Key, Arc<DocumentPresentation>)>,
 }
 
 impl Buffer {
@@ -28,7 +32,103 @@ impl Buffer {
             vim: Vim::new(doc),
             scroll: GridScroll::default(),
             columns: GridScroll::default(),
+            presentation: None,
         }
+    }
+
+    /// Replace the current provider result, clearing collapsed folds when the provider disappears.
+    pub(in crate::grid) fn set_presentation(
+        &mut self,
+        presentation: Option<(nanobug::plugins::session::Key, Arc<DocumentPresentation>)>,
+    ) -> bool {
+        if self
+            .presentation
+            .as_ref()
+            .zip(presentation.as_ref())
+            .is_some_and(|((old_key, old), (new_key, new))| {
+                old_key == new_key && Arc::ptr_eq(old, new)
+            })
+            || self.presentation.is_none() && presentation.is_none()
+        {
+            return false;
+        }
+        if self.presentation_owner()
+            != presentation
+                .as_ref()
+                .map(|(key, data)| (key, data.generation))
+        {
+            self.vim.doc.clear_hidden_rows();
+        }
+        self.presentation = presentation;
+        true
+    }
+
+    /// Provider that owns the retained folds while this buffer awaits fresh presentation data.
+    pub(in crate::grid) fn presentation_owner(
+        &self,
+    ) -> Option<(&nanobug::plugins::session::Key, u64)> {
+        self.presentation
+            .as_ref()
+            .map(|(key, data)| (key, data.generation))
+    }
+
+    /// Syntax data applies only to the exact revision of the visible buffer.
+    fn presentation(&self) -> Option<&DocumentPresentation> {
+        self.presentation
+            .as_ref()
+            .map(|(_, data)| data.as_ref())
+            .filter(|data| data.version == (self.vim.doc.opening, self.vim.doc.revision))
+    }
+
+    /// Sorted syntax spans for the currently displayed revision.
+    pub(super) fn highlights(&self) -> &[Highlight] {
+        self.presentation()
+            .map_or(&[], |data| &data.features.highlights)
+    }
+
+    /// Outline entries in source order for the currently displayed revision.
+    pub(in crate::grid) fn symbols(&self) -> &[Symbol] {
+        self.presentation()
+            .map_or(&[], |data| &data.features.symbols)
+    }
+
+    /// Expand the fold containing the cursor after a jump to a hidden document row.
+    pub(in crate::grid) fn reveal_cursor_fold(&mut self) -> bool {
+        let row = self.cursor_row();
+        self.vim.doc.reveal_row(row)
+    }
+
+    /// Toggle the innermost available fold around the cursor.
+    pub(in crate::grid) fn toggle_fold(&mut self) -> bool {
+        let row = self.cursor_row();
+        if self.vim.doc.open_fold_at(row) {
+            return true;
+        }
+        let Some(data) = self.presentation() else {
+            return false;
+        };
+        let doc = &self.vim.doc;
+        let fold = data
+            .features
+            .folds
+            .iter()
+            .filter_map(|range| {
+                let first = doc.starts.partition_point(|&start| start <= range.start) - 1;
+                let last = doc
+                    .starts
+                    .partition_point(|&start| start < range.end)
+                    .saturating_sub(1);
+                (first <= row && row <= last && first < last).then_some(first..last + 1)
+            })
+            .min_by_key(Range::len);
+        let Some(fold) = fold else {
+            return false;
+        };
+        self.vim.doc.collapse_rows(fold.start + 1..fold.end);
+        if row != fold.start {
+            self.vim.set_cursor(self.vim.doc.starts[fold.start]);
+        }
+        true
     }
 
     /// Return the active byte cursor's document row without scanning graphemes.

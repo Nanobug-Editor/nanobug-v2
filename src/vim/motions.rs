@@ -37,6 +37,11 @@ impl Vim {
 
     /// Move according to `key` and repeat count `n`; report whether the key is a supported motion.
     pub(super) fn motion(&mut self, key: &str, n: usize) -> bool {
+        self.motion_with_rows(key, n, false)
+    }
+
+    /// Resolve `key` and count `n`, optionally using the visible rows for cursor motion.
+    fn motion_with_rows(&mut self, key: &str, n: usize, visible: bool) -> bool {
         let (row, col) = self.doc.location(self.doc.cursor);
         let range = self.doc.line_range(row);
         match key {
@@ -51,10 +56,21 @@ impl Vim {
                 }
             }
             "j" | "Down" | "k" | "Up" => {
+                let row = if visible {
+                    self.doc.display_row(row)
+                } else {
+                    row
+                };
                 let target = if matches!(key, "j" | "Down") {
                     row.saturating_add(n)
                 } else {
                     row.saturating_sub(n)
+                };
+                let target = if visible {
+                    self.doc
+                        .document_row(target.min(self.doc.display_rows() - 1))
+                } else {
+                    target
                 };
                 self.place_row(target, col);
                 return true;
@@ -82,6 +98,11 @@ impl Vim {
         }
         self.desired_column = None;
         true
+    }
+
+    /// Apply an ordinary cursor motion with folded rows skipped for vertical movement.
+    pub(super) fn cursor_motion(&mut self, key: &str, n: usize) {
+        self.motion_with_rows(key, n, true);
     }
 
     /// Move to the first non-whitespace byte on the current line.

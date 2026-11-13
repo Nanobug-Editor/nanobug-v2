@@ -1,11 +1,21 @@
 //! Help-window backdrop reuse and native image lifetime management.
 
 use super::{HelpBackdrop, HelpWindow, view::HELP_CORNER_RADIUS};
-use crate::{grid::render::GridLayer, ui::backdrop::BackdropRaster};
+use crate::{
+    grid::render::GridLayer,
+    ui::{backdrop::BackdropRaster, theme::style},
+};
 use gpui::{App, Bounds, Pixels, PlatformTextSystem, RenderImage, Window};
 use std::sync::Arc;
 
 impl HelpWindow {
+    /// Rebuild the image from the reflowed panels on the next render.
+    pub(in crate::grid) fn invalidate_backdrop(&mut self) {
+        if let Some(backdrop) = &mut self.backdrop {
+            backdrop.valid = false;
+        }
+    }
+
     /// Release the cached native image in `window` once the popup is closed.
     pub(in crate::grid) fn release_backdrop(&mut self, window: &mut Window) {
         if let Some(backdrop) = self.backdrop.take() {
@@ -25,6 +35,7 @@ impl HelpWindow {
     ) -> Arc<RenderImage> {
         let viewport = window.viewport_size();
         if let Some(backdrop) = &self.backdrop
+            && backdrop.valid
             && backdrop.viewport == viewport
             && backdrop.outline == outline
         {
@@ -40,10 +51,11 @@ impl HelpWindow {
                     .stamp_backdrop(layer.bounds, clip, &mut raster, window);
             }
         }
-        let image = raster.finish(outline, HELP_CORNER_RADIUS);
+        let image = raster.finish(outline, HELP_CORNER_RADIUS, style(cx).background());
         if let Some(previous) = self.backdrop.replace(HelpBackdrop {
             viewport,
             outline,
+            valid: true,
             image: image.clone(),
         }) {
             let _ = window.drop_image(previous.image);

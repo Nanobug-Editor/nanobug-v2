@@ -6,4 +6,4 @@ pub(crate) mod windows;
 mod workspace;
 
 pub(crate) use windows::file_picker::PreviewHighlighter;
-pub(crate) use workspace::Workspace;
+pub(crate) use workspace::{Workspace, WorkspaceTabs};

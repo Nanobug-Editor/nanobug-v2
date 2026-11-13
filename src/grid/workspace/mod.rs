@@ -4,6 +4,7 @@
 #[cfg(windows)]
 mod alt_escape;
 mod commands;
+mod dpi;
 mod editor_close;
 mod explorer;
 mod file_picker;
@@ -13,7 +14,12 @@ mod keyboard;
 mod language;
 mod layout;
 mod leader_hint;
+#[cfg(all(test, windows))]
+mod native_test;
+mod plugin_manager;
 mod pointer;
+#[cfg(feature = "plugin-probe")]
+mod probe;
 mod projects;
 mod recent_projects;
 mod start_page;
@@ -30,19 +36,16 @@ use self::{
     editor_close::{CloseTarget, EditorClose},
     file_picker::PickerSession,
     keyboard::PendingPrefix,
-    layout::{Layout, OUTER_INSET_Y, ShellWindow, TAB_GAP_Y},
-    projects::WorkspaceTabs,
+    layout::{Layout, ShellWindow},
     recent_projects::RecentProjects,
     start_page::StartPreview,
     tabs::TabBar,
     viewport::CursorSpace,
 };
-use crate::ui::{
-    text::TextSpacing,
-    theme::{GRID_CHINESE_FONT, GRID_FONT_SIZE, GRID_RULE_FONT_FAMILY, GRID_TEXT_FONT},
-};
-use gpui::{AppContext, Context, Entity, FocusHandle, PlatformTextSystem, Window, font, point, px};
+use crate::ui::{text::TextSpacing, theme::AppearanceSettings};
+use gpui::{AppContext, Context, Entity, FocusHandle, PlatformTextSystem, Window};
 use nanobug::{animation::cursor::Effect, i18n::Locale};
+pub(crate) use projects::WorkspaceTabs;
 use std::{path::PathBuf, sync::Arc, time::Instant};
 
 /// Application state. The document owns logical input; cached panels and cursor only draw it.
@@ -84,6 +87,10 @@ pub(crate) struct Workspace {
     prefix: Option<PendingPrefix>,
     /// Current shared font geometry.
     metrics: Metrics,
+    /// Editor-wide theme, grid font and independent user zoom.
+    appearance: AppearanceSettings,
+    /// Device scale used to snap the current logical grid geometry.
+    display_scale: f32,
     /// Native metrics for the actual glyphs selected by the window's text layout.
     glyphs: Arc<dyn PlatformTextSystem>,
     /// Shared document advances for rendering, scrolling and pointer input.
@@ -110,51 +117,52 @@ pub(crate) struct Workspace {
     resizing: bool,
     /// Accumulated vertical wheel delta, supporting high-resolution touchpads.
     wheel: f32,
+    /// Manager and the optional plugin surface that share the native keyboard and cursor.
+    plugins: plugin_manager::PluginUi,
+    /// Optional native surface and host draft for the P0 experiment.
+    #[cfg(feature = "plugin-probe")]
+    probe: Option<probe::Probe>,
 }
 
 impl Workspace {
     /// Open project `paths` in `window` through `cx`, using `glyphs` for text geometry.
     pub(crate) fn new(
-        paths: Vec<PathBuf>,
+        projects: WorkspaceTabs,
         glyphs: Arc<dyn PlatformTextSystem>,
         window: &mut Window,
         cx: &mut Context<Self>,
+        plugins: nanobug::plugins::session::Options,
+        plugin_trace: Option<nanobug::plugins::session::Trace>,
+        #[cfg(feature = "plugin-probe")] probe: Option<crate::plugin_probe::Options>,
     ) -> Self {
-        let projects = WorkspaceTabs::new(paths);
-        let recent_projects =
-            RecentProjects::new(projects.ordered().map(|project| project.root.clone()));
-        let system = window.text_system();
-        let font_id = system.resolve_font(&GRID_TEXT_FONT);
-        let rule_font_id = system.resolve_font(&font(GRID_RULE_FONT_FAMILY));
-        let font_size = GRID_FONT_SIZE;
-        let scale = window.scale_factor();
-        let advance = f32::from(
-            system
-                .advance(font_id, px(font_size), 'M')
-                .expect("font advance")
-                .width,
-        );
-        let height = f32::from(system.ascent(rule_font_id, px(font_size))).abs()
-            + f32::from(system.descent(rule_font_id, px(font_size))).abs();
-        let metrics = Metrics {
-            // Snap the base font's advance to whole device pixels to match the reference grid.
-            cw: (advance * scale).round().max(1.) / scale,
-            lh: (height * scale).ceil() / scale,
-            font_size,
-            origin: point(px(14.), px(OUTER_INSET_Y + TAB_GAP_Y)),
+        #[cfg(feature = "plugin-probe")]
+        let isolated = probe.is_some();
+        #[cfg(not(feature = "plugin-probe"))]
+        let isolated = false;
+        let recent_projects = if isolated || plugins.isolated() {
+            RecentProjects::in_memory()
+        } else {
+            RecentProjects::new(projects.ordered().map(|project| project.root.clone()))
         };
-        let chinese_face = system.resolve_font(&GRID_CHINESE_FONT);
-        let spacing = TextSpacing::new(glyphs.clone(), chinese_face, font_size, metrics.cw);
+        let appearance = AppearanceSettings::default();
+        cx.set_global(appearance.style(window.appearance()));
+        let (metrics, spacing) = dpi::measure(window, &glyphs, appearance);
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         let weak = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             weak.update(cx, |workspace, cx| {
-                if workspace.editor_close.is_some() || workspace.picker_operation_pending() {
+                if workspace.editor_close.is_some()
+                    || workspace.picker_operation_pending()
+                    || workspace.plugins.file_busy
+                {
                     return false;
                 }
                 if workspace.file_picker.take().is_some() {
                     workspace.help.close();
+                }
+                if workspace.prepare_plugin_close(CloseTarget::Quit, window, cx) {
+                    return false;
                 }
                 if workspace.begin_close(CloseTarget::Quit) {
                     workspace.sync(window, cx);
@@ -172,7 +180,7 @@ impl Workspace {
             #[cfg(windows)]
             {
                 if window.is_window_active() {
-                    workspace.sync_native_ime(window, cx);
+                    workspace.sync_text_input(window, cx);
                 }
                 workspace.alt_escape = alt_escape::AltEscape::install(
                     window,
@@ -180,6 +188,10 @@ impl Workspace {
                     workspace.editor_accepts_alt_escape(),
                 );
             }
+        })
+        .detach();
+        cx.observe_window_appearance(window, |workspace, window, cx| {
+            workspace.apply_appearance(workspace.appearance, window, cx);
         })
         .detach();
         #[cfg(windows)]
@@ -209,6 +221,8 @@ impl Workspace {
             alt_escape,
             prefix: None,
             metrics,
+            appearance,
+            display_scale: window.scale_factor(),
             glyphs,
             spacing,
             layout: Layout::default(),
@@ -230,12 +244,23 @@ impl Workspace {
             cursor: cx.new(|_| Cursor::new(Effect::Afterglow, config)),
             resizing: false,
             wheel: 0.,
+            plugins: plugin_manager::PluginUi::new(
+                (!isolated).then_some(plugins),
+                plugin_trace,
+                metrics,
+                cx,
+            ),
+            #[cfg(feature = "plugin-probe")]
+            probe: probe.map(|options| probe::Probe::new(options, metrics, cx)),
         }
     }
 
     /// Whether a popup currently owns pane input.
     fn modal_open(&self) -> bool {
-        self.file_picker.is_some() || self.help.is_open() || self.small_modal_open()
+        self.plugins.open
+            || self.file_picker.is_some()
+            || self.help.is_open()
+            || self.small_modal_open()
     }
 
     /// Whether the language picker or editor close dialog currently owns pane input.

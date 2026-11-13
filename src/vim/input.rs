@@ -23,6 +23,7 @@ impl Vim {
             self.mode = Mode::Normal;
             self.cancel_pending();
             self.command.clear();
+            self.command_selection = None;
             self.clamp_normal();
             return Action::None;
         }
@@ -184,6 +185,7 @@ impl Vim {
             "D" | "C" => self.operator(if key == "D" { "d" } else { "c" }, "$", n, register),
             "p" | "P" => self.paste(register, key == "P", n),
             ":" | "/" => {
+                self.command_selection = (key == ":").then(|| self.selection()).flatten();
                 self.mode = if key == ":" {
                     Mode::Command
                 } else {
@@ -212,7 +214,7 @@ impl Vim {
                 }
             }
             _ => {
-                self.motion(key, n);
+                self.cursor_motion(key, n);
             }
         }
         self.clamp_normal();
@@ -274,7 +276,7 @@ impl Vim {
             }
             "Tab" => text = "\t".into(),
             "Left" | "Right" | "Up" | "Down" | "Home" | "End" => {
-                self.motion(key, 1);
+                self.cursor_motion(key, 1);
                 return;
             }
             _ if key.starts_with("Ctrl+")

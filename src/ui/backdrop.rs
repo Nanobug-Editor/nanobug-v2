@@ -1,5 +1,5 @@
 //! Rasterize the workspace layers once for the shortcut popup's frosted backdrop.
-use crate::{ui::icons::Icon, ui::theme::BACKGROUND};
+use crate::ui::icons::Icon;
 use gpui::{
     Bounds, DevicePixels, ObjectFit, Pixels, PlatformTextSystem, Point, RenderGlyphParams,
     RenderImage, Size, SvgRenderer, point, size,
@@ -119,7 +119,7 @@ impl<'a> BackdropRaster<'a> {
         }
     }
 
-    /// Stamp a glyph at its baseline `at` in RGB `color`, constrained by the pane's `clip`.
+    /// Stamp a glyph at its baseline `at` in RGBA `color`, constrained by the pane's `clip`.
     pub(crate) fn glyph(
         &mut self,
         at: Point<Pixels>,
@@ -186,7 +186,12 @@ impl<'a> BackdropRaster<'a> {
     }
 
     /// Blur the workspace and return a GPUI image with a clear rounded `popup` of radius `radius`.
-    pub(crate) fn finish(mut self, popup: Bounds<Pixels>, radius: f32) -> Arc<RenderImage> {
+    pub(crate) fn finish(
+        mut self,
+        popup: Bounds<Pixels>,
+        radius: f32,
+        background: u32,
+    ) -> Arc<RenderImage> {
         for pixel in self.pixels.pixels_mut() {
             let alpha = u16::from(pixel[3]);
             for channel in &mut pixel.0[..3] {
@@ -194,7 +199,7 @@ impl<'a> BackdropRaster<'a> {
             }
         }
         let mut blurred = imageops::fast_blur(&self.pixels, BLUR_SIGMA * self.scale);
-        let mut wash = BACKGROUND.to_be_bytes();
+        let mut wash = background.to_be_bytes();
         wash[3] = WASH_ALPHA;
         for (x, y, pixel) in blurred.enumerate_pixels_mut() {
             // Premultiplied color is zero at transparent pixels.
@@ -212,7 +217,7 @@ impl<'a> BackdropRaster<'a> {
     }
 }
 
-/// Blend a glyph `mask` into `pixels` at logical `at`, in RGB `color`, inside raster `clip`.
+/// Blend a glyph `mask` into `pixels` at logical `at`, in RGBA `color`, inside raster `clip`.
 fn stamp(
     pixels: &mut RgbaImage,
     scale: f32,
@@ -230,12 +235,14 @@ fn stamp(
         ),
     )
     .intersect(&clip);
-    let mut rgba = (color << 8).to_be_bytes();
+    let mut rgba = color.to_be_bytes();
+    let opacity = u16::from(rgba[3]);
     for y in area.top().0..area.bottom().0 {
         for x in area.left().0..area.right().0 {
-            rgba[3] = mask
+            let coverage = mask
                 .pixels
                 .get_pixel((x - origin.x.0) as u32, (y - origin.y.0) as u32)[0];
+            rgba[3] = ((u16::from(coverage) * opacity + 127) / 255) as u8;
             if rgba[3] > 0 {
                 pixels.get_pixel_mut(x as u32, y as u32).blend(&Rgba(rgba));
             }
@@ -271,7 +278,7 @@ mod tests {
             0xffffffff,
         );
         let popup = Bounds::new(point(px(28.), px(28.)), size(px(44.), px(44.)));
-        let image = raster.finish(popup, 12.);
+        let image = raster.finish(popup, 12., crate::ui::theme::BACKGROUND);
         let pixels = image.as_bytes(0).unwrap();
         let alpha = |x: usize, y: usize| pixels[(y * 50 + x) * 4 + 3];
         assert!(alpha(11, 4) > WASH_ALPHA);
