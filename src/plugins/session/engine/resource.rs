@@ -80,11 +80,11 @@ impl Engine {
                 .or_default()
                 .layout_queue_bytes += measurement_bytes(&request.lines, &request.prepared);
         }
-        for (key, bytes) in self.pending_measurements.values() {
+        for (key, bytes) in self.requests.pending_measurements.values() {
             by_scope.entry(key.clone()).or_default().layout_queue_bytes += bytes;
         }
         let mut snapshots = BTreeMap::new();
-        for (namespace, runtime) in &self.runtimes {
+        for (namespace, runtime) in &self.lifecycle.runtimes {
             for (instance, live) in &runtime.instances {
                 let key = Key {
                     namespace: namespace.clone(),

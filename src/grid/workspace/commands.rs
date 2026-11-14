@@ -1,13 +1,14 @@
 //! Apply editor actions to retained buffers, files and the native window.
 
 use crate::grid::windows::editor::EditResult;
-use crate::ui::theme::{AppearanceSettings, GridFont, ThemeChoice};
+use crate::ui::theme::{AppearanceChange, GridFont};
 
 use super::{
     Workspace,
     editor_close::CloseTarget,
     layout::{Focus, ShellWindow},
 };
+use anyhow::Context as _;
 use gpui::{Context, Window};
 use nanobug::{
     i18n,
@@ -34,7 +35,7 @@ impl Workspace {
             return;
         }
         self.last_cursor_space = None;
-        project.focus = Focus::Editor;
+        project.focus_pane(Focus::Editor);
         if project.hidden_pane == Some(Focus::Editor) {
             project.hidden_pane = None;
         }
@@ -42,7 +43,7 @@ impl Workspace {
     }
 
     /// Execute modal `action` in `window` through `cx`, preserving buffers on I/O errors.
-    fn action(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn action(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
         match action {
             Action::None => {}
             Action::Open(name) => {
@@ -51,6 +52,83 @@ impl Workspace {
                     self.open_project(&path, window, cx);
                 } else {
                     self.open(path, window, cx);
+                }
+            }
+            Action::OpenAt(name, line) => {
+                let path = self.vim_file_path(&name);
+                match path.canonicalize() {
+                    Ok(path) if path.is_file() => {
+                        self.open(path.clone(), window, cx);
+                        if let Some(project) = self.projects.active_project_mut()
+                            && project.editor.vim().doc.path.as_ref() == Some(&path)
+                        {
+                            project.editor.edit(|vim, _| {
+                                vim.move_to_row(line.saturating_sub(1).min(vim.line_count() - 1));
+                                Action::None
+                            });
+                        }
+                    }
+                    _ => self.set_status(i18n::format("vim_g.missing_file", &[("path", &name)])),
+                }
+            }
+            Action::OpenExternal(target) => {
+                let result = if url::Url::parse(&target)
+                    .is_ok_and(|url| matches!(url.scheme(), "https" | "http" | "mailto"))
+                {
+                    open::that_detached(&target)
+                } else {
+                    let path = self.vim_file_path(&target);
+                    if !path.is_file() && !path.is_dir() {
+                        self.set_status(i18n::format("vim_g.missing_file", &[("path", &target)]));
+                        return;
+                    }
+                    open::that_detached(path)
+                };
+                if let Err(error) = result {
+                    self.set_status(error.to_string());
+                }
+            }
+            Action::TabNavigate(direction, count) => {
+                self.navigate_vim_tab(direction, count, window, cx)
+            }
+            Action::TabNew(file) => self.open_editor_page(file, window, cx),
+            Action::TabClose => {
+                let now = self.scroll_epoch.elapsed().as_secs_f64();
+                if self.projects.active_mut().close_page(now) {
+                    self.projects.active_mut().status.clear();
+                    self.reset_tab_view(window, cx);
+                } else {
+                    self.set_status(i18n::text("editor.last_tabpage").into());
+                }
+            }
+            Action::BracketBuffer {
+                forward,
+                edge,
+                count,
+            } => {
+                let project = self.projects.active_mut();
+                if project.editor.navigate_buffers(forward, edge, count) {
+                    self.last_cursor_space = None;
+                    project.status.clear();
+                } else {
+                    project.status = i18n::text("vim_bracket.no_buffer").into();
+                }
+            }
+            Action::BracketDiagnostic {
+                forward,
+                edge,
+                count,
+            } => {
+                let project = self.projects.active_mut();
+                if let Some(offset) = project
+                    .editor
+                    .buffer()
+                    .diagnostic_target(forward, edge, count)
+                {
+                    project.editor.jump_to(offset);
+                    project.status.clear();
+                } else {
+                    project.status = i18n::text("editor.no_diagnostics").into();
                 }
             }
             Action::Save(name) => {
@@ -67,82 +145,234 @@ impl Workspace {
             Action::PluginDiagnose => {
                 self.plugin_language(nanobug::plugins::package::Provider::Diagnose, window, cx)
             }
+            Action::PluginDefinition => {
+                self.plugin_language(nanobug::plugins::package::Provider::Definition, window, cx)
+            }
             Action::PluginOutline => self.plugin_outline(window, cx),
             Action::PluginFold => self.plugin_fold(window, cx),
             Action::PluginCommand(id) => self.plugin_command_by_id(&id, window, cx),
             Action::Appearance(option, value) => {
-                let mut next = self.appearance;
-                let normalized = value.trim().to_ascii_lowercase();
-                let number = normalized.parse::<f32>().ok();
-                if option == "font"
-                    && matches!(normalized.as_str(), "maple" | "maple mono nl cn")
-                    && let Err(error) = GridFont::ensure_maple(self.glyphs.as_ref())
-                {
-                    self.set_status(i18n::format(
-                        "editor.appearance_font_error",
-                        &[("error", &error)],
-                    ));
-                    return;
-                }
-                let accepted = match (option.as_str(), normalized.as_str()) {
-                    ("theme" | "font" | "fontsize" | "zoom", "default") => {
-                        let defaults = AppearanceSettings::default();
-                        match option.as_str() {
-                            "theme" => next.theme = defaults.theme,
-                            "font" => next.font = defaults.font,
-                            "fontsize" => next.base_size = defaults.base_size,
-                            "zoom" => next.zoom = defaults.zoom,
-                            _ => unreachable!(),
-                        }
-                        true
-                    }
-                    ("theme", "dark") => {
-                        next.theme = ThemeChoice::Dark;
-                        true
-                    }
-                    ("theme", "light") => {
-                        next.theme = ThemeChoice::Light;
-                        true
-                    }
-                    ("theme", "system") => {
-                        next.theme = ThemeChoice::System;
-                        true
-                    }
-                    ("font", "rec" | "rec mono casual") => {
-                        next.font = GridFont::RecMono;
-                        true
-                    }
-                    ("font", "maple" | "maple mono nl cn") => {
-                        next.font = GridFont::MapleMono;
-                        true
-                    }
-                    ("fontsize", _) => number
-                        .filter(|size| (12. ..=24.).contains(size))
-                        .is_some_and(|size| {
-                            next.base_size = size;
-                            true
-                        }),
-                    ("zoom", _) => normalized
-                        .strip_suffix('%')
-                        .unwrap_or(&normalized)
-                        .parse::<f32>()
-                        .ok()
-                        .filter(|percent| (75. ..=150.).contains(percent))
-                        .is_some_and(|percent| {
-                            next.zoom = percent / 100.;
-                            true
-                        }),
-                    _ => false,
-                };
-                if accepted {
-                    self.apply_appearance(next, window, cx);
+                if let Some(change) = AppearanceChange::from_command(&option, &value) {
+                    self.change_appearance(change, window, cx);
                 } else {
                     self.set_status(i18n::text("editor.appearance_usage").into());
                 }
             }
             Action::Close(false) => self.request_close(CloseTarget::Quit, window, cx),
             Action::Close(true) => window.remove_window(),
+            Action::Filter { range, command } => self.filter_lines(range, command, window, cx),
         }
+    }
+
+    /// Resolve a file name from under the caret relative to the buffer and then the project.
+    pub(super) fn vim_file_path(&self, name: &str) -> PathBuf {
+        let project = self.projects.active();
+        if let Some(parent) = project
+            .editor
+            .vim()
+            .doc
+            .path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+        {
+            let path = parent.join(name);
+            if path.exists() {
+                return path;
+            }
+        }
+        project.root.join(name)
+    }
+
+    /// Switch pages inside a directory project, or top-level tabs from a standalone editor.
+    /// `direction` and the optional one-based `count` follow the Vim tab commands.
+    pub(super) fn navigate_vim_tab(
+        &mut self,
+        direction: i32,
+        count: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(project) = self.projects.active_project()
+            && project.manager.is_some()
+        {
+            let editor = &project.editor;
+            if let Some(index) = tab_destination(
+                editor.active_tabpage(),
+                editor.tabpage_count(),
+                editor.previous_tabpage(),
+                direction,
+                count,
+            ) {
+                self.select_editor_page(index, window, cx);
+            }
+            return;
+        }
+        let total = self.projects.len();
+        let selected = self.projects.selected;
+        let index = tab_destination(
+            selected,
+            total,
+            self.projects.previous_tab_index(),
+            direction,
+            count,
+        );
+        if let Some(index) = index {
+            self.activate_project_tab(index, window, cx);
+        }
+    }
+
+    /// Restore editor page `index` and repaint its saved layout in `window`.
+    pub(super) fn select_editor_page(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_open()
+            || self.projects.active_project().is_none_or(|project| {
+                index == project.editor.active_tabpage() || index >= project.editor.tabpage_count()
+            })
+        {
+            return;
+        }
+        self.finish_editor_input(window, cx);
+        let now = self.scroll_epoch.elapsed().as_secs_f64();
+        if let Some(project) = self.projects.active_project_mut()
+            && project.select_page(index, now)
+        {
+            project.status.clear();
+            self.reset_tab_view(window, cx);
+            self.sync(window, cx);
+        }
+    }
+
+    /// Finish transient editor input before changing its page or displayed buffer.
+    pub(super) fn finish_editor_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let edit = self.projects.active_mut().editor.finish_buffer_input();
+        self.apply_edit(edit, window, cx);
+    }
+
+    /// Open a page showing the current buffer or a project-relative `file`.
+    fn open_editor_page(
+        &mut self,
+        file: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.projects.manager_available() {
+            self.set_status(i18n::text("editor.tabpage_requires_project").into());
+            return;
+        }
+        let now = self.scroll_epoch.elapsed().as_secs_f64();
+        let project = self.projects.active_mut();
+        let path = file.map(|file| project.root.join(file));
+        match project.open_page(path, now) {
+            Ok(()) => {
+                project.status.clear();
+                self.reset_tab_view(window, cx);
+            }
+            Err(error) => self.set_status(format!("{error:#}")),
+        }
+    }
+
+    /// Apply `change` in `window` through `cx`, then write the selected setting for future launches.
+    fn change_appearance(
+        &mut self,
+        change: AppearanceChange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(change, AppearanceChange::Font(GridFont::MapleMono))
+            && let Err(error) = GridFont::ensure_maple(self.glyphs.as_ref())
+        {
+            self.set_status(i18n::format(
+                "editor.appearance_font_error",
+                &[("error", &error)],
+            ));
+            return;
+        }
+        let mut next = self.appearance;
+        change.apply(&mut next);
+        self.apply_appearance(next, window, cx);
+        let save = self
+            .appearance_settings_path
+            .as_deref()
+            .context("Editor settings path is unavailable")
+            .and_then(|path| change.save(path));
+        if let Err(error) = save {
+            self.set_status(i18n::format(
+                "editor.appearance_save_failed",
+                &[("error", &format_args!("{error:#}"))],
+            ));
+        }
+    }
+
+    /// Run a line filter off the UI thread and apply it only to the same buffer revision.
+    fn filter_lines(
+        &mut self,
+        range: std::ops::Range<usize>,
+        command: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let project = self.projects.active_mut();
+        let buffer = project.editor.buffer();
+        let id = buffer.id;
+        let revision = buffer.vim.doc.revision;
+        let text = buffer.vim.doc.text[range.clone()].to_owned();
+        let root = project.root.clone();
+        project.status = i18n::text("editor.filter_running").into();
+        let worker = cx
+            .background_executor()
+            .spawn(async move { nanobug::vim::run_filter(&root, &command, &text) });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = worker.await;
+            let _ = cx.update(|window, cx| {
+                view.update(cx, |workspace, cx| {
+                    let mut changed_path = None;
+                    for project in workspace.projects.iter_mut() {
+                        let Some(index) = project
+                            .editor
+                            .buffers()
+                            .iter()
+                            .position(|buffer| buffer.id == id)
+                        else {
+                            continue;
+                        };
+                        project.status = match result {
+                            Ok(output)
+                                if project.editor.buffers()[index].vim.doc.revision == revision =>
+                            {
+                                changed_path = project
+                                    .editor
+                                    .edit_buffer(index, |vim, _| {
+                                        vim.apply_filter(range, &output);
+                                        nanobug::vim::Action::None
+                                    })
+                                    .changed_path;
+                                i18n::text("editor.filter_complete").into()
+                            }
+                            Ok(_) => i18n::text("editor.filter_changed").into(),
+                            Err(error) => i18n::format(
+                                "editor.filter_failed",
+                                &[("error", &format!("{error:#}"))],
+                            ),
+                        };
+                        break;
+                    }
+                    workspace.apply_edit(
+                        EditResult {
+                            action: Action::None,
+                            changed_path,
+                        },
+                        window,
+                        cx,
+                    );
+                    workspace.sync(window, cx);
+                })
+            });
+        })
+        .detach();
     }
 
     /// Apply editor `input`, then coordinate its effects through `window` and `cx`.
@@ -169,10 +399,38 @@ impl Workspace {
                 .iter_mut()
                 .filter_map(|project| project.manager.as_mut())
             {
-                manager.transfers.invalidate(&path);
+                manager.invalidate_history(&path);
             }
         }
         self.action(edit.action, window, cx);
+    }
+
+    /// Close the surface that owns input in `window`, using `cx` for any confirmation and repaint.
+    pub(super) fn close_focused_grid(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor_close.is_some() {
+            self.cancel_editor_close(window, cx);
+            return;
+        }
+        if self.language_selection.is_some() {
+            self.finish_language_picker(None, window, cx);
+            return;
+        }
+        if self.help.is_open() {
+            self.close_grid_window(ShellWindow::ShortcutHelp, window, cx);
+        } else if let Some(session) = &self.file_picker {
+            if session.state.delete.is_some() {
+                self.confirm_picker_delete(false, window, cx);
+                return;
+            }
+            self.close_grid_window(ShellWindow::FilePicker, window, cx);
+        } else if let Some(page) = self.projects.start_mut() {
+            if page.picker.take().is_some() {
+                page.status.clear();
+            }
+        } else {
+            self.close_grid_window(ShellWindow::Pane(self.projects.active().focus), window, cx);
+        }
+        self.sync(window, cx);
     }
 
     /// Close `target` in `window` through `cx`, resolving dirty buffers in its closing scope.
@@ -188,9 +446,9 @@ impl Workspace {
             .active_project_mut()
             .and_then(|project| project.manager.as_mut())
         {
-            manager.paste_timer = None;
-            manager.count = 0;
-            manager.click = None;
+            manager.cancel_pending_undo();
+            manager.clear_count();
+            manager.clear_click();
         }
         // Require a fresh hover before exposing the close button on an expanded pane.
         self.hovered_controls = None;
@@ -198,15 +456,14 @@ impl Workspace {
             ShellWindow::ShortcutHelp => self.help.close(),
             ShellWindow::FilePicker => {
                 if !self.picker_operation_pending() {
-                    self.file_picker = None;
-                    self.wheel = 0.;
+                    self.finish_file_picker(None, window, cx);
                 }
             }
-            ShellWindow::Pane(Focus::Editor) if !self.projects.manager_available() => {
-                self.request_close(CloseTarget::Project, window, cx)
-            }
-            ShellWindow::Pane(_) if self.projects.active().hidden_pane.is_some() => {
-                self.request_close(CloseTarget::Quit, window, cx)
+            ShellWindow::Pane(_)
+                if !self.projects.manager_available()
+                    || self.projects.active().hidden_pane.is_some() =>
+            {
+                self.request_close(CloseTarget::Tab, window, cx)
             }
             ShellWindow::Pane(Focus::Editor) => self.request_close(CloseTarget::Editor, window, cx),
             ShellWindow::Pane(Focus::Manager) => self.hide_pane(Focus::Manager),
@@ -218,15 +475,32 @@ impl Workspace {
         let project = self.projects.active_mut();
         if pane == Focus::Editor {
             let editor = &mut project.editor;
-            editor.buffers[editor.active].vim.cancel_pending();
-            editor.composition.clear();
+            editor.cancel_pending();
+            editor.composition_mut().clear();
         }
         project.hidden_pane = Some(pane);
-        project.focus = pane.other();
+        project.focus_pane(pane.other());
         project.status = i18n::text(match pane {
             Focus::Manager => "workspace.manager_closed",
             Focus::Editor => "workspace.editor_closed",
         })
         .into();
+    }
+}
+
+/// Resolve a one-based absolute tab count or a wrapping relative movement.
+fn tab_destination(
+    selected: usize,
+    total: usize,
+    previous: Option<usize>,
+    direction: i32,
+    count: Option<usize>,
+) -> Option<usize> {
+    match (direction, count) {
+        (0, _) => previous,
+        (1, Some(count)) if count > total => None,
+        (1, Some(count)) => Some(count.saturating_sub(1)),
+        (1, None) => Some((selected + 1) % total),
+        _ => Some((selected + total - count.unwrap_or(1) % total) % total),
     }
 }

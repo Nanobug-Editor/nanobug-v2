@@ -1,5 +1,9 @@
 Nanobug leader hint icons
 
+keyboard-space.svg is adapted from Pictogrammers Material Design Icons keyboard-space.
+https://github.com/Templarian/MaterialDesign-SVG/blob/master/svg/keyboard-space.svg
+The canvas is cropped to the original path and the fill is set for Nanobug.
+
 leader-close.svg is adapted from Pictogrammers Material Design Icons keyboard-esc.
 https://github.com/Templarian/MaterialDesign-SVG/blob/master/svg/keyboard-esc.svg
 
@@ -12,7 +16,7 @@ key-enter.svg uses Pictogrammers Material Design Icons keyboard-return from the 
 https://github.com/folke/which-key.nvim/blob/main/lua/which-key/config.lua#L137-L165
 https://github.com/ryanoasis/nerd-fonts/releases/tag/v3.5.1
 
-Apache License 2.0 applies to the Esc and Enter SVGs.
+Apache License 2.0 applies to the Space, Esc and Enter SVGs.
 
                                  Apache License
                            Version 2.0, January 2004

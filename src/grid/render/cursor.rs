@@ -1,6 +1,6 @@
 //! GPU cursor layer: a unified cursor silhouette, optional overlays and demand-driven frames.
 use super::{CursorCell, Panel};
-use crate::ui::theme::style;
+use crate::ui::theme::{CURSOR_TEXT, ThemeComponent, style};
 use gpui::{
     Bounds, ContentMask, Context, Entity, IntoElement, PathBuilder, Pixels, Render, Styled, Task,
     Window, canvas, point, px, rgba, size,
@@ -30,6 +30,8 @@ pub struct Cursor {
     head_clip: Option<Bounds<Pixels>>,
     /// Character to recolor inside the animated block head.
     text_cell: Option<CursorCell>,
+    /// Component supplying the caret colors at its current logical destination.
+    theme_component: Option<ThemeComponent>,
 }
 impl Cursor {
     /// Construct a hidden cursor with the initial `effect` and the project's `config`.
@@ -47,6 +49,19 @@ impl Cursor {
             clip: None,
             head_clip: None,
             text_cell: None,
+            theme_component: None,
+        }
+    }
+
+    /// Set the color scope of the logical caret's new owning `component`.
+    pub(in crate::grid) fn set_theme_component(
+        &mut self,
+        component: Option<ThemeComponent>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.theme_component != component {
+            self.theme_component = component;
+            cx.notify();
         }
     }
     /// Select the adjacent behavior; `reverse` cycles backwards without changing document state.
@@ -270,7 +285,12 @@ fn paint_fluid(outline: &[CubicSegment], color: u32, alpha: u32, window: &mut Wi
 impl Render for Cursor {
     /// Paint effects and the cursor silhouette, then recolor the glyph inside its head.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let color = style(cx).cursor();
+        let appearance = style(cx);
+        let appearance = self
+            .theme_component
+            .map_or(appearance, |component| appearance.for_component(component));
+        let color = appearance.cursor();
+        let cursor_ink = appearance.foreground(CURSOR_TEXT);
         let (opacity, scale) = self.motion.appearance();
         let alpha = (184. * opacity).clamp(0., 255.) as u32;
         let head = self.motion.head();
@@ -377,7 +397,7 @@ impl Render for Cursor {
                     }
                     if let Some((text, bounds)) = &text {
                         window.with_content_mask(Some(ContentMask { bounds: *bounds }), |window| {
-                            text.paint(text_alpha, window);
+                            text.paint(cursor_ink, text_alpha, window);
                         });
                     }
                 });

@@ -1,43 +1,34 @@
 //! Editor palettes and bundled monospace font descriptors shared by native and SDK drawing.
 
+mod palette;
+mod preferences;
+
+pub(crate) use palette::{
+    ACCENT, ACTIVE_FILE, CURRENT, CURSOR_TEXT, ERROR_BORDER, ERROR_TEXT, FOOTER_BLUE,
+    FOOTER_DETAILS, FOOTER_INSERT, FOOTER_VISUAL, GOLD, MUTED, PLUGIN_ERROR, PREEDIT, SELECTION,
+    TEXT, TREE_GUIDE, ThemeComponent, WARNING_BORDER, WARNING_TEXT, load_for_editor,
+};
+
+pub(crate) use preferences::AppearanceChange;
+
 use gpui::{App, Font, FontFeatures, Global, PlatformTextSystem, WindowAppearance, font};
 use std::{borrow::Cow, sync::LazyLock};
 
-/// Bundled face whose box glyphs define the pane rules and row height.
+/// Bundled face for box-drawing glyphs and the grid's row-height metrics.
 pub const GRID_RULE_FONT_FAMILY: &str = "Nanobug Grid";
 /// Editor and chrome font size in logical pixels.
 pub const GRID_FONT_SIZE: f32 = 16.;
-/// Foreground color of normal text.
-pub const TEXT: u32 = 0xc8d3f5;
-/// Foreground color of secondary text.
-pub const MUTED: u32 = 0x8a9eb3;
-/// Accent for focused panes, mode labels and text waves.
-pub const ACCENT: u32 = 0x9df0d4;
-/// Warm accent for project names and the active line number.
-pub const GOLD: u32 = 0xf2d09b;
-/// Shared material tint: approximately 84% opacity (16% transparent), independent of text.
-pub const BACKGROUND: u32 = 0x0b1624d6;
-/// Base RGB fill of the cursor and its motion effects.
-pub const CURSOR_FILL: u32 = 0x9df0d4;
-/// RGB ink for the character covered by a block cursor.
-pub const CURSOR_TEXT: u32 = BACKGROUND >> 8;
-/// Selection tint, matching the Glass Editor reference.
-pub const SELECTION: u32 = 0x65baa558;
-/// Subtle current-line/status tint above the panel's material.
-pub const CURRENT: u32 = 0x85bcd522;
-/// Low-contrast RGBA ink for Explorer hierarchy guides.
-pub(crate) const TREE_GUIDE: u32 = 0x4f627aff;
 /// Resolve plugin syntax `kind` to a host palette role used by retained editor cells.
 pub(crate) fn syntax_color(kind: nanobug_plugin_sdk::language::SyntaxKind) -> u32 {
     use nanobug_plugin_sdk::language::SyntaxKind::*;
     match kind {
-        Keyword => 0xc4a7f4,
-        Type => 0x89c8f2,
-        Function => 0x97b8ff,
-        String => 0xa9d69b,
-        Constant => 0xe9ab8c,
-        Comment => MUTED,
-        Attribute => GOLD,
+        Keyword => palette::SYNTAX_KEYWORD,
+        Type => palette::SYNTAX_TYPE,
+        Function => palette::SYNTAX_FUNCTION,
+        String => palette::SYNTAX_STRING,
+        Constant => palette::SYNTAX_CONSTANT,
+        Comment => palette::SYNTAX_COMMENT,
+        Attribute => palette::SYNTAX_ATTRIBUTE,
     }
 }
 
@@ -59,7 +50,7 @@ pub(crate) enum GridFont {
 }
 
 impl GridFont {
-    /// Register the alternative bundled font on demand, outside the startup path.
+    /// Register the alternative bundled font when the selected appearance uses it.
     pub(crate) fn ensure_maple(text: &dyn PlatformTextSystem) -> gpui::Result<()> {
         if text.font_id(&Self::MapleMono.descriptor()).is_err() {
             text.add_fonts(vec![Cow::Borrowed(include_bytes!(concat!(
@@ -124,6 +115,8 @@ impl Default for AppearanceSettings {
 pub(crate) struct Style {
     pub(crate) light: bool,
     pub(crate) font: GridFont,
+    /// Component whose color overrides take precedence over the global palette.
+    component: Option<ThemeComponent>,
 }
 
 impl Global for Style {}
@@ -143,6 +136,7 @@ impl AppearanceSettings {
                 }
             },
             font: self.font,
+            component: None,
         }
     }
 }
@@ -153,50 +147,46 @@ pub(crate) fn style(cx: &App) -> Style {
 }
 
 impl Style {
-    /// Resolve only editor palette roles. Explicit SDK colors bypass this mapping.
+    /// Apply the color overrides for `component` while retaining the theme and font.
+    pub(crate) fn for_component(self, component: ThemeComponent) -> Self {
+        Self {
+            component: Some(component),
+            ..self
+        }
+    }
+
+    /// Return the nearest configured component background over the existing window material.
+    pub(crate) fn component_background(self) -> Option<u32> {
+        palette::component_color(self.light, self.component?, palette::BACKGROUND)
+    }
+
+    /// Resolve a retained RGB role using this palette.
     pub(crate) fn foreground(self, role: u32) -> u32 {
-        if !self.light {
-            return role;
-        }
-        match role {
-            0xc4a7f4 => 0x70439c,
-            0x89c8f2 => 0x235a82,
-            0x97b8ff => 0x344aa2,
-            0xa9d69b => 0x376431,
-            0xe9ab8c => 0x8c3e27,
-            TEXT => 0x263454,
-            MUTED => 0x495c73,
-            ACCENT => 0x146858,
-            GOLD => 0x895218,
-            _ => role,
-        }
+        palette::resolve(self.light, self.component, role)
     }
 
+    /// Resolve a retained RGBA role using this palette.
     pub(crate) fn tint(self, role: u32) -> u32 {
-        if !self.light {
-            return role;
-        }
-        match role {
-            SELECTION => 0x579a935c,
-            CURRENT => 0x546c9b22,
-            TREE_GUIDE => 0x7c90a9ff,
-            _ => role,
-        }
+        palette::resolve(self.light, self.component, role)
     }
 
+    /// Return the translucent material behind the editor.
     pub(crate) fn background(self) -> u32 {
-        if self.light { 0xe8eef9ef } else { BACKGROUND }
+        self.tint(palette::BACKGROUND)
     }
 
+    /// Return the opaque background used by plugin panels.
     pub(crate) fn panel(self) -> u32 {
         self.background() | 0xff
     }
 
+    /// Return RGB cursor fill, with opacity determined by the animation.
     pub(crate) fn cursor(self) -> u32 {
-        if self.light { 0x91d7c2 } else { CURSOR_FILL }
+        self.foreground(palette::CURSOR_FILL)
     }
 
+    /// Return RGBA ink for text shadows.
     pub(crate) fn shadow(self) -> u32 {
-        if self.light { 0x00000000 } else { 0x00000070 }
+        self.tint(palette::SHADOW)
     }
 }

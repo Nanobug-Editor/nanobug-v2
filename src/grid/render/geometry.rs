@@ -5,6 +5,37 @@ use crate::ui::text::UNITS_PER_COLUMN;
 use gpui::{Bounds, Pixels, Point, point, px, size};
 use std::ops::Range;
 
+/// Split `viewport` into the four strips outside `cutout`, returning empty strips as needed.
+pub(in crate::grid) fn exposed_regions(
+    viewport: Bounds<Pixels>,
+    cutout: Bounds<Pixels>,
+) -> [Bounds<Pixels>; 4] {
+    let hole = viewport.intersect(&cutout);
+    if hole.is_empty() {
+        return [
+            viewport,
+            Bounds::default(),
+            Bounds::default(),
+            Bounds::default(),
+        ];
+    }
+    [
+        Bounds::from_corners(viewport.origin, point(viewport.right(), hole.top())),
+        Bounds::from_corners(
+            point(viewport.left(), hole.top()),
+            point(hole.left(), hole.bottom()),
+        ),
+        Bounds::from_corners(
+            point(hole.right(), hole.top()),
+            point(viewport.right(), hole.bottom()),
+        ),
+        Bounds::from_corners(
+            point(viewport.left(), hole.bottom()),
+            viewport.bottom_right(),
+        ),
+    ]
+}
+
 /// Grid columns occupied by each corner button, including its clickable padding.
 const CORNER_BUTTON_COLUMNS: usize = 3;
 
@@ -73,9 +104,16 @@ impl Rect {
         )
     }
 
-    /// Columns available for a title in this rectangle's top rule without corner controls.
-    pub(in crate::grid) fn border_title_columns(self) -> Range<usize> {
-        self.x + BORDER_LABEL_INSET + 1..self.x + self.w.saturating_sub(3)
+    /// Return local columns for this border's title, leaving room for the visible controls.
+    pub(in crate::grid) fn border_title_columns(
+        self,
+        controls: Option<&CornerControls>,
+    ) -> Range<usize> {
+        let start = BORDER_LABEL_INSET + 1;
+        let end = controls.map_or(self.w.saturating_sub(3), |controls| {
+            (controls.area().x - self.x).saturating_sub(2)
+        });
+        start..end.max(start)
     }
 
     /// Place corner buttons at the right inset, with help to the left when `include_help` fits.

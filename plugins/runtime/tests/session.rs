@@ -128,6 +128,68 @@ fn wait(session: &Session, predicate: impl Fn(&View) -> bool) -> Arc<View> {
     }
 }
 
+/// Only a local picker selection updates the location, including across profile restarts.
+#[test]
+fn local_zip_location_is_saved_per_profile_on_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let profile = root.join("profile");
+    let directory = root.join("本地 ZIP");
+    fs::create_dir(&directory).unwrap();
+    let archive = directory.join("package.ZIP");
+    bundle(&archive, ">=0.1.0", "true", false, "1.0.0", false);
+
+    let editor = session(&profile, false);
+    editor.send(Action::InspectChosenZip(archive)).unwrap();
+    let review = wait(&editor, |view| view.review.is_some());
+    assert_eq!(
+        review.local_zip_directory.as_deref(),
+        Some(directory.as_path())
+    );
+    editor.send(Action::CancelInstall).unwrap();
+    wait(&editor, |view| view.review.is_none());
+    drop(editor);
+
+    let editor = session(&profile, false);
+    let reopened = wait(&editor, |view| view.operation_root.is_some());
+    assert_eq!(
+        reopened.local_zip_directory.as_deref(),
+        Some(directory.as_path())
+    );
+    let other_archive = root.join("other.ZIP");
+    bundle(&other_archive, ">=0.1.0", "true", false, "1.0.1", false);
+    editor.send(Action::InspectZip(other_archive)).unwrap();
+    let review = wait(&editor, |view| view.review.is_some());
+    assert_eq!(
+        review.local_zip_directory.as_deref(),
+        Some(directory.as_path())
+    );
+    editor.send(Action::CancelInstall).unwrap();
+    wait(&editor, |view| view.review.is_none());
+    let invalid_archive = root.join("invalid.ZIP");
+    fs::write(&invalid_archive, "not a ZIP").unwrap();
+    editor
+        .send(Action::InspectChosenZip(invalid_archive))
+        .unwrap();
+    wait(&editor, |view| {
+        view.local_zip_directory.as_deref() == Some(root.as_path()) && !view.installing
+    });
+    let reopened = session(&profile, false);
+    assert_eq!(
+        wait(&reopened, |view| view.operation_root.is_some())
+            .local_zip_directory
+            .as_deref(),
+        Some(root.as_path())
+    );
+
+    let isolated = session(&root.join("isolated"), true);
+    assert!(
+        wait(&isolated, |view| view.operation_root.is_some())
+            .local_zip_directory
+            .is_none()
+    );
+}
+
 fn project(root: &Path, id: u64) -> Project {
     let root = root.join(format!("project-{id}"));
     fs::create_dir_all(&root).unwrap();

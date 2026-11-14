@@ -20,7 +20,7 @@ Copy-Item plugins/sdk/examples/nanobug-plugin.toml,plugins/sdk/examples/detect.j
 
 字符网格示例使用同一个入口。构建 `workspace-grid`，把 `examples/workspace-grid.toml` 复制到新示例目录并命名为 `nanobug-plugin.toml`，再放入 `detect.js` 和构建所得的 `workspace_grid.wasm`。两种面板都能在宿主输入区打字并保存草稿。
 
-开发环境有自己的插件安装、配置和草稿。**Settings** 的 **All projects** 允许为本地构建配置 Cargo 项目，手动构建或开启自动构建。编译目标为 `wasm32-unknown-unknown`，产物文件名需要与清单中的 WASM 文件名对应。自动构建关注 `Cargo.toml`、`src` 和 `build.rs`。编辑器对开发环境中打开的项目仍使用同一份项目文件。
+开发环境有自己的插件安装、配置和草稿。上面的 `test-output/dev-profile` 已被 Git 忽略，清理 Cargo 产物后仍可继续使用。也可用 `--plugin-dev-profile <目录>` 指定其他开发配置。**Settings** 的 **All projects** 允许为本地构建配置 Cargo 项目，手动构建或开启自动构建。编译目标为 `wasm32-unknown-unknown`，产物文件名需要与清单中的 WASM 文件名对应。自动构建关注 `Cargo.toml`、`src` 和 `build.rs`。编辑器对开发环境中打开的项目仍使用同一份项目文件。
 
 用 `--plugin-profile <目录>` 可选择普通插件配置。用 `--no-plugins` 启动时，管理面板仍可查看安装记录。测试市场读取配置目录下的 `marketplace.json`，相对 ZIP 路径从该目录解析。
 
@@ -54,8 +54,12 @@ Copy-Item plugins/sdk/examples/nanobug-plugin.toml,plugins/sdk/examples/detect.j
 - 模块可以声明 `provides = ["document", "complete", "diagnose"]`，并用 `document_extensions = ["rs"]` 限定语言入口。JS 的 `host.documentPath()` 依赖文件名，正文修改时可以复用规则结果。
 - `document` 提供者收到 `Open` 和 `DocumentChanged`，返回 `Output.document_features`。高亮使用主题角色，折叠返回 UTF-8 范围，大纲返回名称和跳转字节。宿主按文档打开代次、修订和运行代次检查结果。声明该能力需要 `read_document`。
 - `Output.completion_items` 可以提供标签和单个替换范围，范围需包含请求的光标位置。原有 `Output.completions` 仍按字符串插入。
+- `definition` 由项目授权的原生语言服务处理。宿主用 `Output.definitions` 传递目标文件及从零开始的行号和 UTF-16 列号。
+- Rust 模块可以声明 `rust_analyzer = true` 和 `document_extensions = ["rs"]`，将已声明的补全、诊断和定义跳转交给宿主管理的 rust-analyzer。项目授权执行后，宿主同步已打开的 Rust 缓冲区，并仅显示与当前文档修订匹配的实时诊断。普通 WASM 事件仍可提供语法和基础补全。
 - `QuerySyntax` 在公共解析进程中对当前正文执行 Tree-sitter 查询，返回捕获范围和语法错误。查询和旧的 `ParseDocument` 共用文档语法树。使用 `await_service = true` 及一条服务请求，`ServiceResult` 的输出将完成原调用，受原调用的截止时间和文档版本约束。
 - `ReadProjectAncestors` 使用相同的等待方式，从当前文档目录向上读取指定文件，边界为打开的项目根，要求 `read_project`。返回按距离排序的项目相对路径和 UTF-8 正文。
+- `format` 提供者收到 `Format` 后，可以用 `Output.edits` 返回文本修改，或用 `Output.format_error` 报告失败。保存到新路径时，事件的可选 `path` 字段会提供目标，但编辑范围仍以当前缓冲区为准。
+- Rust 格式化提供者可以在等待式 `Format` 调用中请求 `Service::Rustfmt`。宿主要求读取和编辑文档、运行本机工具及当前项目执行权限，把当前正文通过标准输入传递给 rustfmt，并以字符串返回标准输出。
 
 ## Canvas 自绘
 

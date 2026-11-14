@@ -12,7 +12,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 /// Catalog currently displayed in the popup.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Scope {
+pub(in crate::grid) enum Scope {
     /// Bindings of the pane that opened help.
     Window,
     /// Shared workspace bindings.
@@ -111,12 +111,15 @@ impl HelpList {
         self.rows.len()
     }
 
-    /// Select `scope` and restart browsing at monotonic time `now` if it changed.
-    pub(super) fn select_scope(&mut self, scope: Scope, now: f64) {
-        if self.scope != scope {
-            self.scope = scope;
-            self.refilter(now);
+    /// Select `scope`, preserving the filter and rebuilding rows at `now` if the tab changed.
+    pub(in crate::grid) fn select_scope(&mut self, scope: Scope, now: f64) -> bool {
+        self.cancel_navigation();
+        if self.scope == scope {
+            return false;
         }
+        self.scope = scope;
+        self.refilter(now);
+        true
     }
 
     /// Move the caret by signed `rows`, returning the reveal intent.
@@ -220,7 +223,7 @@ impl HelpList {
                     && !self.manager_available
                     && matches!(
                         *description,
-                        "global_shortcuts.open_manager"
+                        "global_shortcuts.toggle_manager"
                             | "global_shortcuts.focus_horizontal"
                             | "global_shortcuts.refresh"
                     )

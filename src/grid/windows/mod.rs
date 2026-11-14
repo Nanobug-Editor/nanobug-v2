@@ -6,11 +6,13 @@ pub(crate) mod help;
 pub(crate) mod manager;
 pub(in crate::grid) mod start;
 
+pub(in crate::grid) mod plugin_manager;
+pub(in crate::grid) mod plugin_surface;
+
 mod frame;
 pub(in crate::grid) use frame::WindowFrame;
 
 use nanobug::i18n;
-use std::path::PathBuf;
 
 /// A help row's key label and the catalog key for its description.
 pub(in crate::grid) type Shortcut = (ShortcutKeys, &'static str);
@@ -33,13 +35,7 @@ impl ShortcutKeys {
     }
 }
 
-/// Change to a visible path that open buffers must follow.
-pub(in crate::grid) struct PathChange {
-    /// Previous visible path, or a newly created path whose old cached buffer is stale.
-    pub from: PathBuf,
-    /// New path, or None when the old buffer should be closed.
-    pub to: Option<PathBuf>,
-}
+pub(in crate::grid) use nanobug::filesystem::PathChange;
 
 #[cfg(test)]
 mod tests;

@@ -8,7 +8,7 @@ use crate::{
     grid::render::{Metrics, Rect},
     ui::keys::normal_character,
 };
-use gpui::{KeyDownEvent, Pixels, Point};
+use gpui::{KeyDownEvent, Keystroke, Pixels, Point};
 use nanobug::animation::scroll::ScrollInput;
 
 /// Effect of a help key on the workspace and its native input handler.
@@ -23,6 +23,8 @@ pub(in crate::grid) enum HelpCommand {
     Paste,
     /// Leave the filter prompt, restoring the previous query if `cancel` is true.
     FinishFilter { cancel: bool },
+    /// Run a physical chord through the workspace's command bindings.
+    DispatchChord,
     /// Consume a key without changing the view.
     Ignore,
 }
@@ -35,9 +37,34 @@ impl HelpWindow {
         height: usize,
         now: f64,
     ) -> HelpCommand {
+        if let Some(scope) = scope_key(&event.keystroke) {
+            return if self.select_scope(scope, now) {
+                HelpCommand::Update(ScrollInput::Advance)
+            } else {
+                HelpCommand::Ignore
+            };
+        }
+        if self.keyboard_visible()
+            && let Some(keyboard) = &mut self.keyboard
+        {
+            return keyboard.key(event);
+        }
         self.list.as_mut().map_or(HelpCommand::Ignore, |list| {
             list.key(event, height, now, !self.composition.is_empty())
         })
+    }
+
+    /// Switch to `scope` at `now`, ending text input before exposing the keyboard.
+    pub(in crate::grid) fn select_scope(&mut self, scope: Scope, now: f64) -> bool {
+        self.cancel_keyboard_modifier_tap();
+        let Some(list) = &mut self.list else {
+            return false;
+        };
+        if scope == Scope::Window && self.keyboard.is_some() {
+            self.composition.clear();
+            list.finish_filter(false, now);
+        }
+        list.select_scope(scope, now)
     }
 
     /// End search at animation time `now`; restore the old query when `cancel` is true.
@@ -54,7 +81,7 @@ impl HelpWindow {
         true
     }
 
-    /// Select the row at window-local `position` inside `area`, using `metrics` for hit testing.
+    /// Inspect the key or select the row at window-local `position` inside `area`.
     /// Snap at `now` so the clicked row stays under the pointer as it settles.
     pub(in crate::grid) fn press(
         &mut self,
@@ -64,15 +91,20 @@ impl HelpWindow {
         now: f64,
     ) -> bool {
         let body = self.body(area);
-        let Some(list) = &mut self.list else {
-            return false;
-        };
-        list.cancel_navigation();
         let metrics = Self::content_metrics(metrics);
         let (x, y) = metrics.cell(position);
         if !body.contains(x, y) || !self.composition.is_empty() {
             return false;
         }
+        if self.keyboard_visible()
+            && let Some(keyboard) = &mut self.keyboard
+        {
+            return keyboard.press(body, metrics, position);
+        }
+        let Some(list) = &mut self.list else {
+            return false;
+        };
+        list.cancel_navigation();
         let local = f32::from(position.y - metrics.origin.y) / metrics.lh - body.y as f32;
         let row = (local + list.scroll.position()).floor() as usize;
         if row >= list.len() {
@@ -100,6 +132,13 @@ impl HelpList {
         let raw = key.key.as_str();
         let modifiers = key.modifiers;
         let modified = modifiers.alt || modifiers.platform || modifiers.function;
+        if let Some(scope) = scope_key(key) {
+            return if self.select_scope(scope, now) {
+                Update(ScrollInput::Advance)
+            } else {
+                Ignore
+            };
+        }
         if self.is_filtering() {
             if raw == "v" && (modifiers.control || modifiers.platform) && !modifiers.alt {
                 return Paste;
@@ -125,7 +164,7 @@ impl HelpList {
         }
         let character = normal_character(key);
         let printable = character.as_deref().unwrap_or(raw);
-        if event.is_held && matches!(printable, "q" | "escape" | "/") {
+        if event.is_held && matches!(printable, "escape" | "/") {
             return Ignore;
         }
         if let [digit @ b'0'..=b'9'] = printable.as_bytes()
@@ -140,18 +179,9 @@ impl HelpList {
         let pending_g = self.pending_g.take();
         let rows = count.max(1) as isize;
         match printable {
-            "escape" | "q" if !modifiers.shift => Close,
+            "escape" if !modifiers.shift => Close,
             "/" => {
                 self.start_filter();
-                Update(ScrollInput::Advance)
-            }
-            "h" | "left" | "l" | "right" => {
-                let scope = if matches!(printable, "h" | "left") {
-                    Scope::Window
-                } else {
-                    Scope::Global
-                };
-                self.select_scope(scope, now);
                 Update(ScrollInput::Advance)
             }
             "g" => {
@@ -175,5 +205,23 @@ impl HelpList {
             "n" | "N" => Update(self.repeat_search(printable == "N")),
             _ => Ignore,
         }
+    }
+}
+
+/// Match either page-switch alias for `key` without treating other Ctrl chords as navigation.
+fn scope_key(key: &Keystroke) -> Option<Scope> {
+    let modifiers = key.modifiers;
+    if !modifiers.control
+        || modifiers.alt
+        || modifiers.platform
+        || modifiers.function
+        || modifiers.shift
+    {
+        return None;
+    }
+    match key.key.as_str() {
+        "h" | "left" => Some(Scope::Window),
+        "l" | "right" => Some(Scope::Global),
+        _ => None,
     }
 }

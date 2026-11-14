@@ -1,6 +1,6 @@
 //! Global shortcuts, modal keyboard routing and committed native text.
 
-use crate::grid::windows::{editor::EditorWindow, help::HelpCommand, manager::ManagerWindow};
+use crate::grid::windows::{editor::EditorWindow, help::HelpCommand};
 use crate::ui::keys::normal_character;
 
 use super::{
@@ -8,12 +8,13 @@ use super::{
     editor_close::CloseTarget,
     layout::{Focus, ShellWindow},
     tabs::ProjectShortcut,
+    window_keys::{WindowSequence, direction_target},
 };
 use gpui::{Context, KeyDownEvent, Keystroke, Window};
 use nanobug::{
     animation::{cursor::CursorConfig, scroll::ScrollInput},
     i18n,
-    vim::Mode,
+    vim::{Action, Mode},
 };
 
 /// Default printable key for the workspace's `<leader>` mappings.
@@ -26,15 +27,34 @@ pub(super) enum PendingPrefix {
     Leader(LeaderPrefix),
     /// Explorer's own sequence, beginning with this character.
     Manager(char),
+    /// Window command after Ctrl+w.
+    Window(WindowSequence),
 }
 
 /// The complete suffix entered after the leader, identifying the current group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LeaderPrefix(&'static str);
 
+/// Targets available to the leader hint and keyboard dispatcher.
+#[derive(Clone, Copy)]
+pub(super) struct LeaderAvailability {
+    /// The selected tab has an Explorer.
+    manager: bool,
+    /// The active project pane or file picker has shortcut help.
+    help: bool,
+    /// Restrict the current surface to close bindings.
+    close_only: bool,
+    /// File selection keeps shell actions scoped to the picker.
+    choosing_file: bool,
+    /// A grid window is available to close.
+    grid_window: bool,
+    /// Top-level tab actions are available on this surface.
+    tabs: bool,
+}
+
 /// One continuation shared by keyboard dispatch and the leader hint.
 pub(super) struct LeaderBinding {
-    /// Entire printable sequence after the leader.
+    /// Entire sequence after the leader, using a tab character for the Tab key.
     sequence: &'static str,
     /// Translation key for the action or group shown beside the binding.
     pub(super) description_key: &'static str,
@@ -46,11 +66,11 @@ pub(super) struct LeaderBinding {
 const LEADER_BINDINGS: &[LeaderBinding] = &[
     LeaderBinding {
         sequence: "e",
-        description_key: "leader.open_manager",
-        shortcut: Some(ShellShortcut::Select(Focus::Manager)),
+        description_key: "leader.toggle_manager",
+        shortcut: Some(ShellShortcut::ToggleManager),
     },
     LeaderBinding {
-        sequence: "f",
+        sequence: "E",
         description_key: "leader.open_file_picker",
         shortcut: Some(ShellShortcut::OpenFilePicker),
     },
@@ -65,9 +85,24 @@ const LEADER_BINDINGS: &[LeaderBinding] = &[
         shortcut: None,
     },
     LeaderBinding {
-        sequence: "q",
-        description_key: "leader.quit_group",
+        sequence: "\t",
+        description_key: "leader.tabpage_group",
         shortcut: None,
+    },
+    LeaderBinding {
+        sequence: "q",
+        description_key: "leader.close_focused",
+        shortcut: Some(ShellShortcut::CloseFocused),
+    },
+    LeaderBinding {
+        sequence: "x",
+        description_key: "leader.close_tab",
+        shortcut: Some(ShellShortcut::CloseTabs(CloseTarget::Tab)),
+    },
+    LeaderBinding {
+        sequence: "X",
+        description_key: "leader.close_all_tabs",
+        shortcut: Some(ShellShortcut::CloseTabs(CloseTarget::AllTabs)),
     },
     LeaderBinding {
         sequence: "L",
@@ -75,19 +110,24 @@ const LEADER_BINDINGS: &[LeaderBinding] = &[
         shortcut: Some(ShellShortcut::OpenLanguagePicker),
     },
     LeaderBinding {
+        sequence: "?",
+        description_key: "leader.open_help",
+        shortcut: Some(ShellShortcut::OpenHelp),
+    },
+    LeaderBinding {
         sequence: "pa",
         description_key: "leader.open_start",
         shortcut: Some(ShellShortcut::OpenStart),
     },
     LeaderBinding {
-        sequence: "qq",
-        description_key: "leader.close_project",
-        shortcut: Some(ShellShortcut::Close(CloseTarget::Project)),
+        sequence: "\t\t",
+        description_key: "leader.new_tabpage",
+        shortcut: Some(ShellShortcut::NewTabpage),
     },
     LeaderBinding {
-        sequence: "qa",
-        description_key: "leader.quit",
-        shortcut: Some(ShellShortcut::Close(CloseTarget::Quit)),
+        sequence: "\td",
+        description_key: "leader.close_tabpage",
+        shortcut: Some(ShellShortcut::CloseTabpage),
     },
 ];
 
@@ -113,17 +153,26 @@ impl LeaderPrefix {
         Some(Self(&self.0[..end]))
     }
 
-    /// Yield each immediately available key and binding, in display order.
+    /// Yield the group's bindings in display order for the current `availability`.
     pub(super) fn bindings(
         self,
-        project_active: bool,
-        manager_available: bool,
+        availability: LeaderAvailability,
     ) -> impl Iterator<Item = (&'static str, &'static LeaderBinding)> {
         LEADER_BINDINGS.iter().filter_map(move |binding| {
             let key = binding.sequence.strip_prefix(self.0)?;
             let available = match binding.shortcut {
-                Some(ShellShortcut::Select(Focus::Manager)) => manager_available,
-                Some(ShellShortcut::Close(CloseTarget::Project)) => project_active,
+                Some(ShellShortcut::CloseFocused) => availability.grid_window,
+                Some(ShellShortcut::CloseTabs(CloseTarget::Tab)) => {
+                    availability.tabs && availability.grid_window
+                }
+                Some(ShellShortcut::CloseTabs(_)) => availability.tabs,
+                _ if availability.close_only => false,
+                Some(ShellShortcut::OpenHelp) => availability.help,
+                _ if availability.choosing_file => false,
+                _ if binding.sequence.starts_with('\t') => {
+                    availability.manager && availability.tabs
+                }
+                Some(ShellShortcut::ToggleManager) => availability.manager,
                 _ => true,
             };
             (key.len() == 1 && available).then_some((key, binding))
@@ -140,6 +189,8 @@ enum ShellShortcut {
     CancelLeader,
     /// Focus the target pane and restore it if hidden.
     Select(Focus),
+    /// Hide Explorer or restore and focus it if hidden.
+    ToggleManager,
     /// The direction has no target in this layout.
     Stay,
     /// Open the language picker without changing the active pane.
@@ -148,51 +199,70 @@ enum ShellShortcut {
     OpenFilePicker,
     /// Open the native plugin manager.
     OpenPluginManager,
+    /// Show shortcuts for the active pane or file picker.
+    OpenHelp,
     /// Add a tab showing the start page.
     OpenStart,
-    /// Close the current project or window after resolving unsaved buffers.
-    Close(CloseTarget),
+    /// Create another page for the active buffer inside the current project.
+    NewTabpage,
+    /// Close the active page inside the current project.
+    CloseTabpage,
+    /// Close the grid surface that owns input.
+    CloseFocused,
+    /// Close the selected scope of top-level tabs after resolving unsaved buffers.
+    CloseTabs(CloseTarget),
 }
 
 impl ShellShortcut {
     /// Resolve `key` and its printable `character` after `prefix`; a start page has no pane `focus`.
-    /// The tab's Explorer availability and `hidden_pane` gate pane navigation.
+    /// `mode` gates editor shortcuts, `split` describes pane ordering and orientation,
+    /// and `availability` and `hidden_pane` describe the available targets.
     fn resolve(
         focus: Option<Focus>,
         mode: Mode,
         hidden_pane: Option<Focus>,
-        manager_available: bool,
+        split: (bool, bool),
+        availability: LeaderAvailability,
         prefix: Option<PendingPrefix>,
         key: &Keystroke,
         character: Option<&str>,
     ) -> Option<Self> {
         let modifiers = key.modifiers;
         let uppercase = matches!(character.map(str::as_bytes), Some([b'A'..=b'Z']));
-        if (focus == Some(Focus::Editor) && mode != Mode::Normal)
+        let editing = focus == Some(Focus::Editor) && mode.accepts_text();
+        let visual = focus == Some(Focus::Editor) && mode.is_visual();
+        if editing
             || modifiers.alt
             || modifiers.platform
-            || modifiers.shift != uppercase
+            || (character != Some("?") && modifiers.shift != uppercase)
             || modifiers.function
         {
             return None;
         }
         if modifiers.control {
-            return match (focus?, key.key.as_str()) {
-                (Focus::Editor, "h")
-                    if manager_available && hidden_pane != Some(Focus::Manager) =>
-                {
-                    Some(Self::Select(Focus::Manager))
-                }
-                (Focus::Manager, "l") => Some(Self::Select(Focus::Editor)),
-                (_, "h" | "j" | "k" | "l") => Some(Self::Stay),
-                _ => None,
-            };
+            if visual || availability.close_only {
+                return None;
+            }
+            let direction = key.key.as_str();
+            if !matches!(direction, "h" | "j" | "k" | "l") {
+                return None;
+            }
+            let target = direction_target(focus?, split, direction).filter(|target| {
+                *target == Focus::Editor
+                    || availability.manager && hidden_pane != Some(Focus::Manager)
+            });
+            return Some(target.map_or(Self::Stay, Self::Select));
         }
-        if character == Some(LEADER_KEY) {
+        if character == Some(LEADER_KEY) || character == Some("\\") && !availability.close_only {
             return Some(Self::AwaitLeader(LeaderPrefix::ROOT));
         }
         let Some(PendingPrefix::Leader(prefix)) = prefix else {
             return None;
+        };
+        let continuation = if key.key == "tab" {
+            Some("\t")
+        } else {
+            character
         };
         match key.key.as_str() {
             "escape" => Some(Self::CancelLeader),
@@ -202,8 +272,11 @@ impl ShellShortcut {
                     .map_or(Self::CancelLeader, Self::AwaitLeader),
             ),
             _ => prefix
-                .bindings(focus.is_some(), manager_available)
-                .find(|(key, _)| Some(*key) == character)
+                .bindings(LeaderAvailability {
+                    close_only: availability.close_only || visual,
+                    ..availability
+                })
+                .find(|(key, _)| Some(*key) == continuation)
                 .map(|(_, binding)| {
                     binding
                         .shortcut
@@ -214,7 +287,43 @@ impl ShellShortcut {
 }
 
 impl Workspace {
-    /// Route committed native `text` to the active filter or editor in `window` through `cx`.
+    /// Report the active surface's bindings for both leader input and its hint.
+    pub(super) fn leader_availability(&self) -> LeaderAvailability {
+        let project_picker = self
+            .projects
+            .start()
+            .is_some_and(|page| page.picker.is_some());
+        let picker_busy = self
+            .file_picker
+            .as_ref()
+            .is_some_and(|session| session.state.busy || session.state.delete.is_some());
+        let project = self.projects.active_project();
+        let modal_open = self.modal_open();
+        let visual = project.is_some_and(|project| {
+            project.focus == Focus::Editor
+                && matches!(
+                    project.editor.vim().mode,
+                    Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+                )
+        });
+        LeaderAvailability {
+            manager: self.projects.manager_available(),
+            help: self.file_picker.is_some() || project.is_some(),
+            close_only: self.help.is_open()
+                || self.small_modal_open()
+                || project_picker
+                || picker_busy
+                || visual,
+            choosing_file: self
+                .file_picker
+                .as_ref()
+                .is_some_and(|session| session.choosing_file()),
+            grid_window: project.is_some() || modal_open || project_picker,
+            tabs: !modal_open && !project_picker,
+        }
+    }
+
+    /// Route committed native `text` to the active input in `window` through `cx`.
     pub(super) fn commit_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         if !self.accepts_native_text() {
             return;
@@ -235,12 +344,28 @@ impl Workspace {
             self.file_picker_commit(text, window, cx);
             return;
         }
+        if let Some(page) = self.projects.start_mut()
+            && let Some(picker) = &mut page.picker
+        {
+            picker.commit_filter(text);
+            page.status.clear();
+            self.sync(window, cx);
+            return;
+        }
+        self.commit_editor_text(text, window, cx);
+    }
+
+    /// Deliver `text` to the active editor through `window` and `cx`, including a direct paste chord.
+    fn commit_editor_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.projects.active().editor.vim().accepts_text() {
+            return;
+        }
         self.cursor
             .update(cx, |cursor, cx| cursor.activity(window, cx));
         self.projects.active_mut().status.clear();
         let text = text.replace("\r\n", "\n");
-        self.run_vim(|vim, register| vim.text(&text, register), window, cx);
-        self.sync(window, cx);
+        self.run_vim(|vim, register| vim.commit_text(&text, register), window, cx);
+        self.repaint_editor_input(None, None, window, cx);
         #[cfg(feature = "plugin-probe")]
         if let Some(client) = self.probe.as_ref().and_then(|probe| probe.client.as_ref()) {
             client.mark("editor_input", serde_json::json!({ "bytes": text.len() }));
@@ -248,14 +373,14 @@ impl Workspace {
     }
 
     /// Cancel the active pane's partial navigation before a shell shortcut.
-    fn cancel_pending_pane_input(&mut self) {
+    pub(super) fn cancel_pending_pane_input(&mut self) {
         if let Some(project) = self.projects.active_project_mut() {
             if let Some(manager) = &mut project.manager {
-                manager.count = 0;
+                manager.clear_count();
             }
             if project.focus == Focus::Editor {
                 let editor = &mut project.editor;
-                editor.buffers[editor.active].vim.cancel_pending();
+                editor.cancel_pending();
             }
         }
     }
@@ -271,21 +396,34 @@ impl Workspace {
         self.cancel_pending_pane_input();
         let project = self.projects.active_mut();
         if let Some(manager) = &mut project.manager {
-            manager.paste_timer = None;
-            manager.click = None;
+            manager.cancel_pending_undo();
+            manager.clear_click();
         }
-        project.editor.dragging = None;
-        project.editor.composition.clear();
+        project.editor.stop_drag();
+        project.editor.composition_mut().clear();
         self.hovered_controls = None;
         self.resizing = false;
         self.help
             .open(pane == Focus::Manager, self.projects.manager_available());
+        self.help
+            .update_keyboard_modifiers(window.modifiers(), false);
         self.sync(window, cx);
     }
 
     /// Dispatch shell shortcuts and Vim commands from `event`, updating `window` through `cx`.
     /// Insert, search and command-line text use the native input path.
     pub(super) fn key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch_key_down(event, window, cx);
+        self.sync_sequence_hint_delay(cx);
+    }
+
+    /// Route `event` through the current modal or pane in `window` through `cx`.
+    fn dispatch_key_down(
         &mut self,
         event: &KeyDownEvent,
         window: &mut Window,
@@ -304,15 +442,7 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
-        if !self.modal_open()
-            && let Some(shortcut) = ProjectShortcut::resolve(&event.keystroke)
-        {
-            #[cfg(feature = "plugin-probe")]
-            if self.probe_has_focus() {
-                self.set_probe_focus(false, window, cx);
-            }
-            self.dismiss_leader_hint(cx);
-            self.project_shortcut(shortcut, window, cx);
+        if !self.modal_open() && self.dispatch_project_shortcut(event, window, cx) {
             cx.stop_propagation();
             return;
         }
@@ -321,6 +451,18 @@ impl Workspace {
             return;
         }
         let raw = event.keystroke.key.as_str();
+        if !event.keystroke.modifiers.modified()
+            && let Some(delta) = match raw {
+                "pageup" => Some(-1),
+                "pagedown" => Some(1),
+                _ => None,
+            }
+            && self.page_sequence_hint(delta, cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
+        self.hint_page = 0;
         if self.held_close_key.as_deref() == Some(raw) {
             if event.is_held {
                 cx.stop_propagation();
@@ -328,8 +470,27 @@ impl Workspace {
             }
             self.held_close_key = None;
         }
+        if self.remove_recent_project_key(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         self.cursor
             .update(cx, |cursor, cx| cursor.activity(window, cx));
+        let availability = self.leader_availability();
+        if availability.close_only
+            && !availability.tabs
+            && !self.accepts_native_text()
+            && !self
+                .projects
+                .start()
+                .and_then(|page| page.picker.as_ref())
+                .is_some_and(|picker| picker.filter_focused())
+            && self.dispatch_leader_key(event, None, window, cx)
+        {
+            self.help.cancel_keyboard_modifier_tap();
+            cx.stop_propagation();
+            return;
+        }
         if self.editor_close.is_some() {
             self.editor_close_key(event, window, cx);
             cx.stop_propagation();
@@ -358,46 +519,106 @@ impl Workspace {
                         self.commit_text(&text, window, cx);
                     }
                 }
+                HelpCommand::DispatchChord => {
+                    match ProjectShortcut::resolve(&event.keystroke) {
+                        // Switching tabs resets the current workspace popup.
+                        Some(ProjectShortcut::Select(_)) => {}
+                        Some(shortcut) => self.project_shortcut(shortcut, window, cx),
+                        None if !event.keystroke.modifiers.alt => {
+                            self.pane_key_down(event, availability, window, cx);
+                        }
+                        None => {}
+                    }
+                }
                 HelpCommand::Ignore => {}
             }
             cx.stop_propagation();
             return;
         }
         if self.file_picker.is_some() {
-            if self.file_picker_shell_key(event, window, cx)
+            if self.plugin_preview_key(event, window, cx)
+                || self.file_picker_shell_key(event, window, cx)
                 || self.file_picker_key(event, window, cx)
             {
                 cx.stop_propagation();
             }
             return;
         }
+        self.pane_key_down(event, availability, window, cx);
+    }
+
+    /// Run a tab shortcut from `event` in `window` through `cx` if it matches.
+    fn dispatch_project_shortcut(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(shortcut) = ProjectShortcut::resolve(&event.keystroke) else {
+            return false;
+        };
+        #[cfg(feature = "plugin-probe")]
+        if self.probe_has_focus() {
+            self.set_probe_focus(false, window, cx);
+        }
+        self.dismiss_sequence_hint(cx);
+        self.project_shortcut(shortcut, window, cx);
+        true
+    }
+
+    /// Dispatch `event` to the pane in `window` through `cx`.
+    /// While keyboard help is visible, run only commands that can finish with the popup open.
+    /// `availability` describes the leader and pane targets outside keyboard help.
+    fn pane_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        availability: LeaderAvailability,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let raw = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
         let character = normal_character(&event.keystroke);
-        let Some(project) = self.projects.active_project() else {
-            self.start_key_down(event, character.as_deref(), window, cx);
+        if self.projects.active_project().is_none() {
+            if self.start_key_down(event, character.as_deref(), window, cx) {
+                cx.stop_propagation();
+            }
+            return;
+        }
+        if !self.help.is_open() && self.dispatch_window_key(event, window, cx) {
             cx.stop_propagation();
             return;
-        };
+        }
+        let project = self.projects.active();
         let printable = character.as_deref().unwrap_or(raw);
-        let focus = project.focus;
+        let keyboard_help = self.help.keyboard_visible();
+        let focus = if keyboard_help {
+            Focus::Editor
+        } else {
+            project.focus
+        };
         let mode = project.editor.vim().mode;
-        let shortcut = ShellShortcut::resolve(
-            Some(focus),
-            mode,
-            project.hidden_pane,
-            project.manager.is_some(),
-            self.prefix,
-            &event.keystroke,
-            character.as_deref(),
-        );
-        // A q in a leader sequence belongs to the workspace before Explorer sees it.
+        let awaiting_key = focus == Focus::Editor && project.editor.vim().awaiting_key();
+        let shortcut = if awaiting_key || keyboard_help {
+            None
+        } else {
+            ShellShortcut::resolve(
+                Some(focus),
+                mode,
+                project.hidden_pane,
+                (project.stacked, project.editor_first),
+                availability,
+                self.prefix,
+                &event.keystroke,
+                character.as_deref(),
+            )
+        };
         let leader_pending = matches!(self.prefix, Some(PendingPrefix::Leader(_)));
-        let close_pane = shortcut.is_none()
+        let close_pane = !keyboard_help
+            && shortcut.is_none()
             && !leader_pending
-            && match focus {
-                Focus::Manager => ManagerWindow::matches_close_key(character.as_deref()),
-                Focus::Editor => EditorWindow::matches_close_key(&event.keystroke),
-            };
+            && focus == Focus::Editor
+            && EditorWindow::matches_close_key(&event.keystroke);
         if close_pane {
             if !event.is_held {
                 self.held_close_key = Some(raw.into());
@@ -407,8 +628,6 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
-        let vim_keys = focus == Focus::Manager
-            || matches!(mode, Mode::Normal | Mode::Visual | Mode::VisualLine);
         // A leader sequence advances only on distinct key presses.
         if event.is_held
             && (leader_pending
@@ -419,32 +638,28 @@ impl Workspace {
             return;
         }
         let prefix = self.prefix.take();
-        if leader_pending {
+        if prefix.is_some() {
             cx.notify();
         }
         if let Some(manager) = &mut self.projects.active_mut().manager {
-            manager.paste_timer = None;
+            manager.cancel_pending_undo();
         }
-        if vim_keys && character.as_deref() == Some("?") {
-            self.open_shortcut_help(focus, window, cx);
-            cx.stop_propagation();
-            return;
-        }
-        if focus == Focus::Editor
+        if !keyboard_help
+            && focus == Focus::Editor
             && (modifiers.control || modifiers.platform)
             && raw == "v"
-            && matches!(mode, Mode::Insert | Mode::Command | Mode::Search)
+            && self.projects.active().editor.vim().accepts_text()
         {
             if let Some(item) = cx.read_from_clipboard()
                 && let Some(text) = item.text()
             {
-                self.projects.active_mut().editor.composition.clear();
-                self.commit_text(&text, window, cx);
+                self.projects.active_mut().editor.composition_mut().clear();
+                self.commit_editor_text(&text, window, cx);
             }
             cx.stop_propagation();
             return;
         }
-        if !self.projects.active().editor.composition.is_empty()
+        if !self.projects.active().editor.composition().is_empty()
             && !modifiers.control
             && !modifiers.platform
             // Windows delivers a composing Escape as a modal command.
@@ -457,6 +672,10 @@ impl Workspace {
                 self.clear_canvas_focus();
             }
             self.apply_shell_shortcut(shortcut, raw, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if leader_pending {
             cx.stop_propagation();
             return;
         }
@@ -481,7 +700,7 @@ impl Workspace {
         } else if raw == "f5" {
             let project = self.projects.active_mut();
             if let Some(manager) = &mut project.manager {
-                project.status = match manager.tree.refresh() {
+                project.status = match manager.refresh() {
                     Ok(()) => i18n::text("workspace.project_refreshed").into(),
                     Err(error) => format!("{error:#}"),
                 };
@@ -489,13 +708,10 @@ impl Workspace {
             }
             cx.stop_propagation();
             return;
-        } else if prefix.is_none()
-            && !matches!(mode, Mode::Insert | Mode::Command | Mode::Search)
-            && self.plugin_canvas_key(event)
-        {
+        } else if prefix.is_none() && !mode.accepts_text() && self.plugin_canvas_key(event) {
             cx.stop_propagation();
             return;
-        } else if self.projects.active().focus == Focus::Manager {
+        } else if focus == Focus::Manager {
             let key = if modifiers.control || modifiers.alt || modifiers.platform {
                 ""
             } else {
@@ -515,35 +731,63 @@ impl Workspace {
                 cx.stop_propagation();
             }
             return;
-        } else {
-            let Some(input) = self
-                .projects
-                .active_mut()
-                .editor
-                .key(&event.keystroke, self.layout.editor.h.saturating_sub(2))
-            else {
-                return;
-            };
-            if input.clear_status {
-                self.projects.active_mut().status.clear();
-            }
-            #[cfg(feature = "plugin-probe")]
-            if let Some(client) = self.probe.as_ref().and_then(|probe| probe.client.as_ref())
-                && mode != self.projects.active().editor.vim().mode
-            {
-                let current = self.projects.active().editor.vim();
-                client.mark(
-                    "editor_mode",
-                    serde_json::json!({
-                        "insert": current.mode == Mode::Insert,
-                        "revision": current.doc.revision,
-                    }),
-                );
-            }
-            self.apply_edit(input.edit, window, cx);
         }
-        self.sync(window, cx);
+        let Some(input) = self.projects.active_mut().editor.key(
+            &event.keystroke,
+            self.layout.editor,
+            &self.spacing,
+            keyboard_help,
+        ) else {
+            return;
+        };
+        if input.clear_status {
+            self.projects.active_mut().status.clear();
+        }
+        #[cfg(feature = "plugin-probe")]
+        if let Some(client) = self.probe.as_ref().and_then(|probe| probe.client.as_ref())
+            && mode != self.projects.active().editor.vim().mode
+        {
+            let current = self.projects.active().editor.vim();
+            client.mark(
+                "editor_mode",
+                serde_json::json!({
+                    "insert": current.mode.is_insert(),
+                    "revision": current.doc.revision,
+                }),
+            );
+        }
+        self.apply_edit(input.edit, window, cx);
+        self.repaint_editor_input(input.view_top, input.view_left, window, cx);
         cx.stop_propagation();
+    }
+
+    /// Honor explicit `view_top` or `view_left` targets while the help view may own repaint.
+    fn repaint_editor_input(
+        &mut self,
+        view_top: Option<usize>,
+        view_left: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let explicit = view_top.is_some() || view_left.is_some();
+        let inputs = [
+            if explicit {
+                ScrollInput::Advance
+            } else {
+                ScrollInput::Reveal
+            },
+            view_top.map_or(ScrollInput::Reveal, ScrollInput::PositionWithTail),
+            view_left.map_or(ScrollInput::Reveal, ScrollInput::PositionWithTail),
+        ];
+        if self.help.keyboard_visible() {
+            // The help repaint owns its own scroll. Apply the editor's viewport intent now.
+            self.advance_scrolling(inputs, cx);
+        }
+        if explicit {
+            self.repaint(inputs, window, cx);
+        } else {
+            self.sync(window, cx);
+        }
     }
 
     /// Dispatch the shared leader for `event` while the picker has no local prompt or prefix.
@@ -553,34 +797,60 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let state = &self.file_picker.as_ref().expect("active picker").state;
+        let session = self.file_picker.as_ref().expect("active picker");
+        let state = &session.state;
         if state.busy || state.prompt.is_some() || state.goto || state.delete.is_some() {
+            return false;
+        }
+        if session
+            .focused_editor()
+            .is_some_and(|editor| editor.vim().mode != Mode::Normal || editor.vim().awaiting_key())
+        {
+            return false;
+        }
+        let focus = self.projects.active_project().map(|project| project.focus);
+        self.dispatch_leader_key(event, focus, window, cx)
+    }
+
+    /// Consume a leader `event` in a command surface, using its optional `focus` in `window` through `cx`.
+    /// Both pages of editor help keep leader sequences inactive.
+    fn dispatch_leader_key(
+        &mut self,
+        event: &KeyDownEvent,
+        focus: Option<Focus>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.help.is_editor_help() {
             return false;
         }
         let key = &event.keystroke;
         let character = normal_character(key);
         let pending = matches!(self.prefix, Some(PendingPrefix::Leader(_)));
-        if !pending && character.as_deref() != Some(LEADER_KEY) {
+        let shortcut = ShellShortcut::resolve(
+            focus,
+            Mode::Normal,
+            None,
+            (false, false),
+            self.leader_availability(),
+            self.prefix,
+            key,
+            character.as_deref(),
+        );
+        // Only a leader binding available on this surface can claim a new sequence.
+        if !pending && !matches!(shortcut, Some(ShellShortcut::AwaitLeader(_))) {
             return false;
         }
         if event.is_held {
             return true;
         }
-        let focus = self.projects.active_project().map(|project| project.focus);
-        let shortcut = ShellShortcut::resolve(
-            focus,
-            Mode::Normal,
-            None,
-            self.projects.manager_available(),
-            self.prefix,
-            key,
-            character.as_deref(),
-        );
-        self.dismiss_leader_hint(cx);
+        if !matches!(shortcut, Some(ShellShortcut::AwaitLeader(_))) {
+            self.dismiss_leader_hint(cx);
+        }
         if let Some(shortcut) = shortcut {
             if matches!(
                 shortcut,
-                ShellShortcut::Select(_) | ShellShortcut::OpenStart | ShellShortcut::Close(_)
+                ShellShortcut::Select(_) | ShellShortcut::ToggleManager | ShellShortcut::OpenStart
             ) {
                 self.file_picker = None;
             }
@@ -589,46 +859,31 @@ impl Workspace {
         true
     }
 
-    /// Give leader sequences priority over launcher mnemonics on the start page.
+    /// Route `event` and its ASCII `character` on the start page in `window` through `cx`.
+    /// Return whether it consumed the key, with leader sequences taking priority over launcher keys.
     fn start_key_down(
         &mut self,
         event: &KeyDownEvent,
         character: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         if event.keystroke.key == "f6" {
             self.dismiss_leader_hint(cx);
             self.cycle_cursor_effect(event.keystroke.modifiers.shift, window, cx);
-            return;
+            return true;
         }
         if self
             .projects
             .start()
             .is_some_and(|page| page.picker.is_some())
         {
-            self.project_picker_key(event, character, window, cx);
-            return;
+            return self.project_picker_key(event, character, window, cx);
         }
-        let pending = matches!(self.prefix, Some(PendingPrefix::Leader(_)));
-        let shortcut = ShellShortcut::resolve(
-            None,
-            Mode::Normal,
-            None,
-            false,
-            self.prefix,
-            &event.keystroke,
-            character,
-        );
-        if event.is_held && (pending || matches!(shortcut, Some(ShellShortcut::AwaitLeader(_)))) {
-            return;
+        if !self.dispatch_leader_key(event, None, window, cx) {
+            self.start_page_key(event, character, window, cx);
         }
-        self.dismiss_leader_hint(cx);
-        if let Some(shortcut) = shortcut {
-            self.apply_shell_shortcut(shortcut, &event.keystroke.key, window, cx);
-        } else if !pending {
-            self.start_page_key(event, window, cx);
-        }
+        true
     }
 
     /// Switch the shared cursor preset in `window` and report it in the current tab.
@@ -649,6 +904,16 @@ impl Workspace {
         self.repaint([ScrollInput::Advance; 3], window, cx);
     }
 
+    /// Focus `pane` in the selected project, restoring it and clearing its close status if hidden.
+    fn select_pane(&mut self, pane: Focus) {
+        let project = self.projects.active_mut();
+        project.focus_pane(pane);
+        if project.hidden_pane == Some(pane) {
+            project.hidden_pane = None;
+            project.status.clear();
+        }
+    }
+
     /// Execute a resolved shell `shortcut` from `raw` in `window` through `cx`.
     fn apply_shell_shortcut(
         &mut self,
@@ -662,20 +927,49 @@ impl Workspace {
             ShellShortcut::AwaitLeader(prefix) => self.show_leader_hint(prefix, cx),
             ShellShortcut::CancelLeader => self.held_close_key = Some(raw.into()),
             ShellShortcut::Select(target) => {
-                let project = self.projects.active_mut();
-                project.focus = target;
-                if project.hidden_pane == Some(target) {
-                    project.hidden_pane = None;
-                    project.status.clear();
+                self.select_pane(target);
+                self.sync(window, cx);
+            }
+            ShellShortcut::ToggleManager => {
+                if self.projects.active().hidden_pane == Some(Focus::Manager) {
+                    self.select_pane(Focus::Manager);
+                } else {
+                    self.hide_pane(Focus::Manager);
                 }
+                self.hovered_controls = None;
                 self.sync(window, cx);
             }
             ShellShortcut::Stay => {}
             ShellShortcut::OpenLanguagePicker => self.open_language_picker(window, cx),
             ShellShortcut::OpenFilePicker => self.open_file_picker(window, cx),
             ShellShortcut::OpenPluginManager => self.open_plugin_manager(window, cx),
+            ShellShortcut::OpenHelp => {
+                if self.file_picker.is_some() {
+                    self.open_file_picker_help(window, cx);
+                } else if let Some(pane) =
+                    self.projects.active_project().map(|project| project.focus)
+                {
+                    self.open_shortcut_help(pane, window, cx);
+                }
+            }
             ShellShortcut::OpenStart => self.open_start_tab(window, cx),
-            ShellShortcut::Close(target) => {
+            ShellShortcut::NewTabpage | ShellShortcut::CloseTabpage => {
+                self.finish_editor_input(window, cx);
+                let action = match shortcut {
+                    ShellShortcut::NewTabpage => Action::TabNew(None),
+                    _ => {
+                        self.held_close_key = Some(raw.into());
+                        Action::TabClose
+                    }
+                };
+                self.action(action, window, cx);
+                self.sync(window, cx);
+            }
+            ShellShortcut::CloseFocused => {
+                self.held_close_key = Some(raw.into());
+                self.close_focused_grid(window, cx);
+            }
+            ShellShortcut::CloseTabs(target) => {
                 self.held_close_key = Some(raw.into());
                 self.request_close(target, window, cx);
                 self.sync(window, cx);

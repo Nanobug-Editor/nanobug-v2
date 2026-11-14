@@ -168,7 +168,7 @@ impl Workspace {
         let probe = self.probe.as_ref()?;
         let project = self.probe_project()?;
         if self.modal_open()
-            || self.leader_hint_area().is_some()
+            || self.sequence_hint_area().is_some()
             || (probe.focused != Some(project.scope)
                 && (probe.scene.status.is_empty()
                     || probe.scene.status == "Ready"
@@ -352,12 +352,12 @@ impl Workspace {
             || self
                 .projects
                 .active_project()
-                .is_some_and(|project| !project.editor.composition.is_empty());
+                .is_some_and(|project| !project.editor.composition().is_empty());
         probe.focused = next;
         probe.composition.clear();
         probe.feedback = None;
         if let Some(project) = self.projects.active_project_mut() {
-            project.editor.composition.clear();
+            project.editor.composition_mut().clear();
         }
         self.prefix = None;
         if let Some(client) = &probe.client {

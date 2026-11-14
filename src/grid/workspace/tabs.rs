@@ -1,6 +1,9 @@
-//! Character layout, shortcuts and animated selection for the workspace tab strip.
+//! Character layout, shortcuts, pointer gestures and animated selection for the workspace tab strip.
 
-use super::{Workspace, projects::WorkspaceTabs, view::positioned};
+#[cfg(windows)]
+mod windows;
+
+use super::{Workspace, layout::OUTER_INSET_Y, projects::WorkspaceTabs, view::positioned};
 use crate::{
     grid::render::{Frame, Metrics, Panel, Rect},
     ui::{
@@ -8,9 +11,11 @@ use crate::{
         theme::{CURSOR_TEXT, MUTED, TEXT, style},
     },
 };
+#[cfg(windows)]
+use gpui::Point;
 use gpui::{
     App, AppContext, Bounds, Context, Entity, Keystroke, ParentElement, Pixels, Styled, Window,
-    div, px, rgb,
+    div, point, px, rgb,
 };
 use nanobug::{
     animation::cursor::Spring,
@@ -24,6 +29,21 @@ const TAB_PADDING: usize = 2;
 const TAB_SEPARATOR: usize = 1;
 /// Time for the selection's edges to settle, in seconds.
 const TAB_SETTLE: f64 = 0.24;
+/// Logical pixel tolerance for a click with no native window movement.
+#[cfg(windows)]
+const TAB_CLICK_TOLERANCE: f64 = 4.;
+
+/// A click candidate recorded before Windows processes a caption press.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct TabPress {
+    /// Initial pointer position in window-local pixels.
+    position: Point<Pixels>,
+    /// Visible tab under the press.
+    index: usize,
+    /// Tab revision that the index refers to.
+    revision: u64,
+}
 
 /// Keyboard actions that operate on tab order without focusing the strip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,7 +81,58 @@ impl ProjectShortcut {
 }
 
 impl Workspace {
-    /// Apply `shortcut` to the tab order in `window` through `cx`.
+    /// Locate the tab row above the panes using the workspace's shared grid dimensions.
+    pub(super) fn tab_metrics(&self) -> Metrics {
+        Metrics {
+            origin: point(self.metrics.origin.x, px(OUTER_INSET_Y)),
+            ..self.metrics
+        }
+    }
+
+    /// Capture the tab at window-local `position` before the native caption handles the press.
+    #[cfg(windows)]
+    fn caption_tab_press(&self, position: Point<Pixels>) -> Option<TabPress> {
+        if self.modal_open() {
+            return None;
+        }
+        let index = self.tabs.tab_at(position, self.tab_metrics())?;
+        (index != self.projects.selected).then_some(TabPress {
+            position,
+            index,
+            revision: self.projects.revision,
+        })
+    }
+
+    /// Switch a caption `press` released at `position` over the same tab in `window` through `cx`.
+    #[cfg(windows)]
+    fn finish_caption_tab_click(
+        &mut self,
+        press: TabPress,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if press.revision == self.projects.revision
+            && (position - press.position).magnitude() <= TAB_CLICK_TOLERANCE
+            && self.tabs.tab_at(position, self.tab_metrics()) == Some(press.index)
+        {
+            self.activate_project_tab(press.index, window, cx);
+        }
+    }
+
+    /// Activate the tab at `index` in `window` and refresh its layout through `cx`.
+    pub(super) fn activate_project_tab(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.modal_open() && self.select_tab(index, window, cx) {
+            self.sync(window, cx);
+        }
+    }
+
+    /// Apply the already-routed `shortcut` in `window`, resetting help on tab switches.
     pub(super) fn project_shortcut(
         &mut self,
         shortcut: ProjectShortcut,
@@ -72,7 +143,8 @@ impl Workspace {
         let last = self.projects.len() - 1;
         let target = match shortcut {
             ProjectShortcut::Select(offset) => {
-                if self.select_tab(current.saturating_add_signed(offset).min(last), window, cx) {
+                let target = current.saturating_add_signed(offset).min(last);
+                if self.select_tab(target, window, cx) {
                     self.sync(window, cx);
                 }
                 return;
@@ -101,6 +173,8 @@ pub(super) struct TabBar {
     layout: Option<(usize, u64, Locale)>,
     /// Index of the first visible tab, retained until the selected tab needs room.
     first: usize,
+    /// Visible tab rectangles in order, excluding separators and overflow indicators.
+    targets: Vec<Rect>,
     /// Normal text layer for the full strip.
     labels: Entity<Panel>,
     /// Dark text shown only inside the selection block.
@@ -129,6 +203,7 @@ impl TabBar {
         Self {
             layout: None,
             first: 0,
+            targets: Vec::new(),
             labels: cx.new(|_| Panel::new(metrics)),
             covered: cx.new(|_| Panel::new(metrics)),
             target: [0.; 2],
@@ -153,6 +228,7 @@ impl TabBar {
         let widths: Vec<_> = names.iter().map(|name| spacing.columns(name)).collect();
         let visible = visible_tabs(&widths, cols, self.first, projects.selected);
         self.first = visible.start;
+        self.targets.clear();
         let hidden_left = visible.start;
         let hidden_right = names.len() - visible.end;
         let mut column = hidden_columns(hidden_left);
@@ -190,7 +266,14 @@ impl TabBar {
                     self.sampled_at = Instant::now();
                 }
             }
-            column = end + TAB_PADDING;
+            let next = end + TAB_PADDING;
+            self.targets.push(Rect {
+                x: column,
+                y: 0,
+                w: next - column,
+                h: 1,
+            });
+            column = next;
             if i + 1 < visible.end {
                 label(column..column + TAB_SEPARATOR, "|", MUTED);
                 column += TAB_SEPARATOR;
@@ -202,6 +285,25 @@ impl TabBar {
         self.layout = Some(key);
         self.labels.update(cx, |panel, cx| panel.set(labels, cx));
         self.covered.update(cx, |panel, cx| panel.set(covered, cx));
+    }
+
+    /// Return the index of the visible tab containing `position` in the tab row's `metrics`.
+    #[cfg(windows)]
+    fn tab_at(&self, position: Point<Pixels>, metrics: Metrics) -> Option<usize> {
+        self.click_targets(metrics)
+            .find(|(_, bounds)| bounds.contains(&position))
+            .map(|(index, _)| index)
+    }
+
+    /// Iterate visible tab indices and hit bounds in the row's `metrics`.
+    pub(super) fn click_targets(
+        &self,
+        metrics: Metrics,
+    ) -> impl Iterator<Item = (usize, Bounds<Pixels>)> + '_ {
+        self.targets
+            .iter()
+            .enumerate()
+            .map(move |(offset, target)| (self.first + offset, target.pixels(metrics)))
     }
 
     /// Draw the block and masked text at `metrics`, advancing animation in `window` through `cx`.

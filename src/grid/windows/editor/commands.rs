@@ -2,59 +2,71 @@
 
 use super::{Buffer, EditorWindow};
 use crate::grid::windows::PathChange;
-use nanobug::{
-    animation::scroll::GridScroll,
-    document::Document,
-    vim::{Mode, Vim},
-};
+use nanobug::document::Document;
 use std::path::PathBuf;
 
 impl EditorWindow {
     /// Format command or search input with its prompt, before any transient IME text.
     pub(in crate::grid) fn command_text(&self) -> String {
         let vim = self.vim();
-        let prefix = if vim.mode == Mode::Command { ':' } else { '/' };
-        format!("{prefix}{}", vim.command)
+        let (before, after) = vim.command.split_at(vim.command_cursor());
+        format!("{}{before}{}{after}", vim.prompt(), self.composition.text)
+    }
+
+    /// Command-line text up to the logical caret, for the IME candidate anchor.
+    pub(in crate::grid) fn command_caret_text(&self) -> String {
+        let vim = self.vim();
+        format!("{}{}", vim.prompt(), &vim.command[..vim.command_cursor()])
     }
 
     /// Open `path` at animation time `now`, reusing an existing buffer and retaining unsaved text.
     pub(in crate::grid) fn open(&mut self, path: PathBuf, now: f64) -> anyhow::Result<()> {
+        let index = self.open_buffer(path)?;
+        let previous = self.buffer().id;
+        let replace_empty = self.visible_buffers().count() == 1
+            && self.buffer().vim.doc.path.is_none()
+            && self.buffer().vim.doc.text.is_empty()
+            && !self.buffer().vim.doc.modified();
+        let id = self.buffers[index].id;
+        self.attach_buffer(index);
+        self.select_buffer(id, now);
+        if replace_empty && previous != id {
+            self.remove_buffer_tab(previous, now);
+        }
+        self.composition.clear();
+        Ok(())
+    }
+
+    /// Find or load a canonical buffer for `path` without adding it to the current page.
+    pub(super) fn open_buffer(&mut self, path: PathBuf) -> anyhow::Result<usize> {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         if let Some(index) = self
             .buffers
             .iter()
             .position(|buffer| buffer.vim.doc.path.as_ref() == Some(&path))
         {
-            self.active = index;
+            return Ok(index);
         } else {
             let doc = Document::open(&path)?;
-            self.active = self.retain_document(doc);
+            self.buffers.push(Buffer::new(doc));
         }
-        let buffer = &mut self.buffers[self.active];
-        buffer.scroll.snap(buffer.scroll.first_cell(), now);
-        buffer.columns.snap(buffer.columns.first_cell(), now);
-        self.composition.clear();
-        Ok(())
+        Ok(self.buffers.len() - 1)
     }
 
-    /// Retain a prepared document without changing focus or doing disk I/O.
+    /// Retain a prepared `doc` on the current page without changing focus or doing disk I/O.
     pub(in crate::grid) fn retain_document(&mut self, doc: Document) -> usize {
         self.buffers.push(Buffer::new(doc));
-        self.buffers.len() - 1
+        let index = self.buffers.len() - 1;
+        self.attach_buffer(index);
+        index
     }
 
     /// Move buffer `index` to another tab, retaining a valid editor in this tab.
     pub(in crate::grid) fn take_buffer(&mut self, index: usize) -> Buffer {
+        let was_active = self.buffer().id;
         let mut buffer = self.buffers.remove(index);
-        if index == self.active {
-            self.composition.clear();
-            self.dragging = None;
-        }
         buffer.vim.cancel_pending();
-        if self.buffers.is_empty() {
-            self.buffers.push(Buffer::new(Document::new("")));
-        }
-        self.active = (self.active - usize::from(index < self.active)).min(self.buffers.len() - 1);
+        self.reconcile_tabpage_buffers(was_active, 0.);
         buffer
     }
 
@@ -78,9 +90,10 @@ impl EditorWindow {
     /// Replace buffer `index` with its saved text and a fresh Vim session and viewport.
     pub(in crate::grid) fn discard(&mut self, index: usize) {
         let buffer = &mut self.buffers[index];
-        buffer.vim = Vim::new(buffer.vim.doc.saved_version());
-        buffer.scroll = GridScroll::default();
-        buffer.columns = GridScroll::default();
+        let id = buffer.id;
+        *buffer = Buffer::new(buffer.vim.doc.saved_version());
+        buffer.id = id;
+        self.clear_buffer_views(id);
     }
 
     /// Files with unsaved edits must not be overwritten by manager transfers.
@@ -103,11 +116,8 @@ impl EditorWindow {
         if changes.is_empty() {
             return false;
         }
-        let mut previous_index = 0;
-        let mut active = self.active;
+        let was_active = self.buffer().id;
         self.buffers.retain_mut(|buffer| {
-            let index = previous_index;
-            previous_index += 1;
             if let Some((change, relative)) = buffer.vim.doc.path.as_ref().and_then(|path| {
                 changes.iter().find_map(|change| {
                     path.strip_prefix(&change.from)
@@ -131,13 +141,9 @@ impl EditorWindow {
             }) {
                 return true;
             }
-            active -= usize::from(index < self.active);
             false
         });
-        if self.buffers.is_empty() {
-            self.buffers.push(Buffer::new(Document::new("")));
-        }
-        self.active = active.min(self.buffers.len() - 1);
+        self.reconcile_tabpage_buffers(was_active, 0.);
         true
     }
 }

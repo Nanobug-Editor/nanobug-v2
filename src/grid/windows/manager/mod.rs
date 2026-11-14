@@ -1,17 +1,16 @@
-//! File-manager window state, filesystem navigation, icon associations and reversible transfers.
+//! File-manager navigation and interaction around shared filesystem transfers.
 
 mod commands;
-mod icons;
 mod input;
 mod pointer;
+mod session;
 pub(in crate::grid) mod shortcuts;
-mod transfer;
 mod tree;
 mod view;
 
-pub(in crate::grid) use icons::EntryIcon;
+use crate::ui::file_icons::EntryIcon;
 pub(in crate::grid) use input::ManagerCommand;
-pub(in crate::grid) use transfer::{FileTransfers, TransferKind, move_exclusive};
+use nanobug::filesystem::{FileTransfers, TransferKind};
 
 use super::PathChange;
 
@@ -23,17 +22,17 @@ pub(in crate::grid) use tree::{Entry, Explorer};
 /// The manager window owns filesystem selection, transfer history and scrolling.
 pub(in crate::grid) struct ManagerWindow {
     /// Lazily expanded tree rooted at the current project.
-    pub(in crate::grid) tree: Explorer,
+    tree: Explorer,
     /// Clipboard and undo history for filesystem pastes.
-    pub(in crate::grid) transfers: FileTransfers,
+    transfers: FileTransfers,
     /// Continuous vertical viewport position.
-    pub(in crate::grid) scroll: GridScroll,
+    scroll: GridScroll,
     /// Repeat count accumulated before a tree motion.
-    pub(in crate::grid) count: usize,
+    count: usize,
     /// Delayed standalone undo, canceled when a second prefix key arrives.
-    pub(in crate::grid) paste_timer: Option<Task<()>>,
+    paste_timer: Option<Task<()>>,
     /// First pressed path used to recognize double-click activation.
-    pub(in crate::grid) click: Option<PathBuf>,
+    click: Option<PathBuf>,
 }
 
 impl ManagerWindow {

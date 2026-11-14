@@ -1,18 +1,16 @@
 //! Render the three browser columns, prompt, and selection in the shared character grid.
 
 use super::{FilePicker, PickerEntry, Preview, PromptKind, delete_buttons, display_path, same_row};
+use crate::ui::file_icons::EntryIcon;
 use crate::{
-    grid::{
-        render::{Frame, Rect},
-        windows::manager::EntryIcon,
-    },
+    grid::render::{Frame, MessageLevel, Rect},
     ui::{
         text::{TextSpacing, UNITS_PER_COLUMN},
         theme::{ACCENT, CURRENT, GOLD, MUTED, SELECTION, TEXT},
     },
 };
 use nanobug::i18n;
-use std::{borrow::Cow, ops::Range};
+use std::{borrow::Cow, ops::Range, path::Path};
 
 /// Layout in window cells. Column rectangles are relative to `area`.
 #[derive(Clone, Copy)]
@@ -42,7 +40,7 @@ impl PickerLayout {
                     picker
                         .prompt
                         .as_ref()
-                        .is_some_and(|prompt| !matches!(prompt.kind, PromptKind::Filter))
+                        .is_some_and(|prompt| !prompt.kind.is_floating())
                         || picker.goto,
                 )
             }
@@ -61,6 +59,39 @@ impl PickerLayout {
         }
     }
 
+    /// Divide `area` into the selected file's parent list and its focused preview.
+    pub fn for_file(area: Rect) -> Self {
+        let usable = area.w.saturating_sub(3);
+        let left = usable / 3;
+        let h = area.h.saturating_sub(3);
+        Self {
+            area,
+            parent: Rect {
+                x: 1,
+                y: 2,
+                w: left,
+                h,
+            },
+            current: Rect::default(),
+            preview: Rect {
+                x: left + 2,
+                y: 2,
+                w: usable - left,
+                h,
+            },
+        }
+    }
+
+    /// Locate the focused preview pane, including its shared separator and heading.
+    pub fn preview_editor_area(self) -> Rect {
+        Rect {
+            x: self.area.x + self.preview.x - 1,
+            y: self.area.y + self.preview.y - 1,
+            w: self.preview.w + 2,
+            h: self.preview.h + 2,
+        }
+    }
+
     /// Text-only preview bounds, leaving five columns for line numbers.
     pub fn text_area(self) -> Rect {
         Rect {
@@ -71,13 +102,17 @@ impl PickerLayout {
         }
     }
 
-    /// Lay out a message above the preview without taking rows from the three columns.
-    pub fn message_frame(self, message: &str, spacing: &TextSpacing) -> (Rect, Frame) {
-        const BACKGROUND: u32 = 0x882d3aff;
-        const FOREGROUND: u32 = 0xffe8eb;
+    /// Lay out `message` above the preview with severity `level` and measured text `spacing`.
+    pub fn message_frame(
+        self,
+        level: MessageLevel,
+        message: &str,
+        spacing: &TextSpacing,
+    ) -> (Rect, Frame) {
         let width = spacing
             .columns(message)
-            .min(self.preview.w.saturating_sub(2))
+            .max(level.heading_columns(spacing))
+            .min(self.preview.w.saturating_sub(4))
             .min(54);
         let mut remaining = message;
         let mut lines = Vec::new();
@@ -101,29 +136,29 @@ impl PickerLayout {
             remaining = remaining[end..].trim_start();
         }
         lines.push(spacing.ellipsize(remaining, width));
+        let w = width + 4;
         let area = Rect {
-            x: self.area.x + self.area.w.saturating_sub(width + 3),
+            x: self.area.x + self.area.w.saturating_sub(w + 1),
             y: self.area.y + 1,
-            w: width + 2,
+            w,
             h: lines.len() + 2,
         };
+        let (_, text) = level.colors();
         let mut frame = Frame::new(area.w, area.h);
-        for row in 0..area.h {
-            frame.tint(row, 0, area.w, BACKGROUND);
-        }
+        frame.message_border(level, spacing);
         for (row, line) in lines.into_iter().enumerate() {
-            frame.label(row + 1, 1..area.w - 1, &line, FOREGROUND, spacing);
+            frame.label(row + 1, 2..area.w - 2, &line, text, spacing);
         }
         (area, frame)
     }
 
-    /// Center the filter box horizontally in the upper third of the window work area.
-    fn filter_area(self) -> Rect {
+    /// Center the search or filter box beneath the column headings.
+    fn floating_prompt_area(self) -> Rect {
         let w = self.area.w.saturating_sub(4).min(64);
         let h = 3;
         Rect {
             x: self.area.x + (self.area.w - w) / 2,
-            y: self.area.y + self.area.h.saturating_sub(h) / 3,
+            y: self.area.y + self.current.y.min(self.area.h.saturating_sub(h)),
             w,
             h,
         }
@@ -132,6 +167,17 @@ impl PickerLayout {
     /// Relative row of the active prompt, jump hints or confirmation question.
     fn input_row(self) -> usize {
         self.current.y + self.current.h
+    }
+
+    /// Column rules in cells relative to the picker area.
+    pub(in crate::grid) fn dividers(self) -> [Rect; 2] {
+        let y = self.current.y - 1;
+        [self.parent, self.current].map(|column| Rect {
+            x: column.x + column.w,
+            y,
+            w: 1,
+            h: self.input_row() - y,
+        })
     }
 
     /// Relative row of the deletion confirmation buttons.
@@ -163,6 +209,86 @@ impl PickerLayout {
 }
 
 impl FilePicker {
+    /// Draw the parent of `path` beside the preview, with optional loading or failure `status`.
+    pub fn file_frame(
+        &self,
+        layout: PickerLayout,
+        path: &Path,
+        status: Option<&str>,
+        active: bool,
+        controls_hovered: bool,
+        spacing: &TextSpacing,
+    ) -> Frame {
+        let PickerLayout {
+            area,
+            parent,
+            preview,
+            ..
+        } = layout;
+        let mut frame = picker_border(area, &display_path(path), active, controls_hovered, spacing);
+        for (rect, key) in [
+            (parent, "picker.parent"),
+            (preview, "picker.readonly_preview"),
+        ] {
+            frame.label(
+                1,
+                rect.x + 1..rect.x + rect.w,
+                i18n::text(key),
+                MUTED,
+                spacing,
+            );
+        }
+        for row in 1..area.h.saturating_sub(1) {
+            frame.text(parent.x + parent.w, row, "│", MUTED, 1);
+        }
+        if let Some(listing) = &self.listing {
+            let selected = self.visible.get(self.selected).copied().unwrap_or(0);
+            let first = selected.saturating_add(1).saturating_sub(parent.h);
+            for (row, entry) in listing
+                .entries
+                .iter()
+                .skip(first)
+                .take(parent.h)
+                .enumerate()
+            {
+                self.draw_row(
+                    &mut frame,
+                    entry,
+                    parent,
+                    row,
+                    same_row(&entry.path, path),
+                    false,
+                    false,
+                    spacing,
+                );
+            }
+        }
+        if let Some(status) = status {
+            let slot = preview.x + 1..preview.x + preview.w;
+            frame.label(
+                preview.y,
+                slot.clone(),
+                &spacing.ellipsize(status, slot.len()),
+                MUTED,
+                spacing,
+            );
+        }
+        frame
+    }
+
+    /// Show the committed query in `width` columns using the grid's text `spacing`.
+    fn current_heading(&self, width: usize, spacing: &TextSpacing) -> Cow<'_, str> {
+        if self.filter.is_empty() {
+            return Cow::Borrowed(i18n::text("picker.current"));
+        }
+        let prefix = format!("[{}: ", i18n::text("picker.filter"));
+        let query = spacing.ellipsize(
+            &self.filter,
+            width.saturating_sub(spacing.columns(&prefix) + 1),
+        );
+        Cow::Owned(format!("{prefix}{query}]"))
+    }
+
     /// Draw picker chrome with shared `spacing`, focus `active` and visible `controls_hovered`.
     pub fn frame(
         &self,
@@ -177,26 +303,20 @@ impl FilePicker {
             current,
             preview,
         } = layout;
-        let mut frame = Frame::new(area.w, area.h);
         let title = self.listing.as_ref().map_or(Cow::Borrowed(""), |listing| {
             listing
                 .directory
                 .as_deref()
                 .map_or(Cow::Borrowed(i18n::text("picker.drives")), display_path)
         });
-        frame.border_with_title(active, controls_hovered, true, |frame, slot, color| {
-            let title = spacing.ellipsize(&title, slot.len());
-            frame.label(0, slot, &title, color, spacing)
-        });
+        let mut frame = picker_border(area, &title, active, controls_hovered, spacing);
         let headings = current.y - 1;
-        for (rect, key) in [(parent, "picker.parent"), (current, "picker.current")] {
-            frame.label(
-                headings,
-                rect.x + 1..rect.x + rect.w,
-                i18n::text(key),
-                MUTED,
-                spacing,
-            );
+        let current_label = self.current_heading(current.w.saturating_sub(1), spacing);
+        for (rect, label) in [
+            (parent, i18n::text("picker.parent")),
+            (current, current_label.as_ref()),
+        ] {
+            frame.label(headings, rect.x + 1..rect.x + rect.w, label, MUTED, spacing);
         }
         let preview_label = i18n::text("picker.preview");
         let preview_label = if self.delete.is_none()
@@ -216,9 +336,9 @@ impl FilePicker {
             MUTED,
             spacing,
         );
-        for x in [parent.x + parent.w, current.x + current.w] {
-            for row in headings..layout.input_row() {
-                frame.text(x, row, "│", MUTED, 1);
+        for divider in layout.dividers() {
+            for row in divider.y..divider.y + divider.h {
+                frame.text(divider.x, row, "│", MUTED, 1);
             }
         }
         if let Some(listing) = &self.listing {
@@ -233,7 +353,9 @@ impl FilePicker {
                 let selected = self
                     .directory()
                     .is_some_and(|path| same_row(&entry.path, path));
-                self.draw_row(&mut frame, entry, parent, row, selected, false, spacing);
+                self.draw_row(
+                    &mut frame, entry, parent, row, selected, false, false, spacing,
+                );
             }
         }
         for (row, index) in (self.first..self.first + current.h).enumerate() {
@@ -247,6 +369,7 @@ impl FilePicker {
                 row,
                 index == self.selected,
                 active,
+                self.search_rows.binary_search(&index).is_ok(),
                 spacing,
             );
         }
@@ -289,7 +412,7 @@ impl FilePicker {
             })
     }
 
-    /// Draw one `entry` at row offset `row` inside `rect` using the selection and focus flags.
+    /// Draw `entry` at offset `row` inside `rect` with the selected, active and matched states.
     #[allow(clippy::too_many_arguments)]
     fn draw_row(
         &self,
@@ -299,6 +422,7 @@ impl FilePicker {
         row: usize,
         selected: bool,
         active: bool,
+        matched: bool,
         spacing: &TextSpacing,
     ) {
         let y = rect.y + row;
@@ -319,11 +443,18 @@ impl FilePicker {
             EntryIcon::for_path(&entry.path, entry.directory, selected).image(),
         );
         let slot = rect.x + 4..rect.x + rect.w;
+        let color = if matched {
+            GOLD
+        } else if selected && active {
+            ACCENT
+        } else {
+            TEXT
+        };
         frame.label(
             y,
             slot.clone(),
             &spacing.ellipsize(&entry.name(), slot.len()),
-            if selected && active { ACCENT } else { TEXT },
+            color,
             spacing,
         );
     }
@@ -364,7 +495,7 @@ impl FilePicker {
                     .take(rect.h)
                     .enumerate()
                 {
-                    self.draw_row(frame, entry, rect, row, false, false, spacing);
+                    self.draw_row(frame, entry, rect, row, false, false, false, spacing);
                 }
                 return;
             }
@@ -428,25 +559,29 @@ impl FilePicker {
                 break;
             };
             frame.viewport_line(row, spacing.cells(line), 0..rect.w, 0, |byte| {
-                (text.color(offset + byte).unwrap_or(TEXT), 0)
+                (text.color(offset + byte).unwrap_or(TEXT), 0, false)
             });
         }
         Some(frame)
     }
 
-    /// Return the floating filter bounds in `layout` while that prompt owns text input.
-    pub fn filter_area(&self, layout: PickerLayout) -> Option<Rect> {
+    /// Return the bounds in `layout` of an active search or filter prompt.
+    pub fn floating_prompt_area(&self, layout: PickerLayout) -> Option<Rect> {
         self.prompt
             .as_ref()
-            .filter(|prompt| matches!(prompt.kind, PromptKind::Filter))
-            .map(|_| layout.filter_area())
+            .filter(|prompt| prompt.kind.is_floating())
+            .map(|_| layout.floating_prompt_area())
     }
 
-    /// Draw the floating filter title and input using `layout` and shared text `spacing`.
-    pub fn filter_frame(&self, layout: PickerLayout, spacing: &TextSpacing) -> Option<Frame> {
-        let area = self.filter_area(layout)?;
+    /// Draw the floating prompt and its title using `layout` and text `spacing`.
+    pub fn floating_prompt_frame(
+        &self,
+        layout: PickerLayout,
+        spacing: &TextSpacing,
+    ) -> Option<Frame> {
+        let area = self.floating_prompt_area(layout)?;
         let mut frame = Frame::new(area.w, area.h);
-        frame.border(i18n::text("picker.filter"), true, false, spacing);
+        frame.border(i18n::text(self.prompt_label()), true, false, spacing);
         self.draw_prompt(&mut frame, layout, spacing);
         Some(frame)
     }
@@ -490,7 +625,7 @@ impl FilePicker {
             return;
         }
         if self.prompt.is_some() {
-            if self.filter_area(layout).is_none() {
+            if self.floating_prompt_area(layout).is_none() {
                 self.draw_prompt(frame, layout, spacing);
             }
         } else if self.goto {
@@ -510,7 +645,7 @@ impl FilePicker {
             return;
         };
         let prompt = self.prompt.as_ref().expect("prompt view");
-        let floating = self.filter_area(layout);
+        let floating = self.floating_prompt_area(layout);
         let input = floating.map_or(layout.input_row(), |_| 1);
         let end = floating.unwrap_or(layout.area).w - 2;
         if floating.is_none() {
@@ -547,6 +682,7 @@ impl FilePicker {
     fn prompt_label(&self) -> &'static str {
         match &self.prompt.as_ref().expect("active prompt").kind {
             PromptKind::Filter => "picker.filter",
+            PromptKind::Search => "picker.search",
             PromptKind::Jump => "picker.jump",
             PromptKind::Create => "picker.create",
             PromptKind::Rename(_) => "picker.rename",
@@ -560,7 +696,7 @@ impl FilePicker {
         spacing: &TextSpacing,
     ) -> Option<(usize, usize, usize)> {
         let prompt = self.prompt.as_ref()?;
-        let floating = self.filter_area(layout);
+        let floating = self.floating_prompt_area(layout);
         let area = floating.unwrap_or(layout.area);
         let start = if floating.is_some() {
             2
@@ -585,7 +721,7 @@ impl FilePicker {
     ) -> (f32, f32, f32, bool, bool) {
         let area = layout.area;
         if let Some((_, x, _)) = self.prompt_view(layout, spacing) {
-            let floating = self.filter_area(layout);
+            let floating = self.floating_prompt_area(layout);
             let input_area = floating.unwrap_or(area);
             return (
                 (input_area.x + x) as f32,
@@ -606,10 +742,89 @@ impl FilePicker {
     }
 }
 
+/// Draw the picker boundary and fitted `title` for either column layout.
+fn picker_border(
+    area: Rect,
+    title: &str,
+    active: bool,
+    controls: bool,
+    spacing: &TextSpacing,
+) -> Frame {
+    let mut frame = Frame::new(area.w, area.h);
+    frame.border_with_title(active, controls, true, |frame, slot, color| {
+        let title = spacing.ellipsize(title, slot.len());
+        frame.label(0, slot, &title, color, spacing)
+    });
+    frame
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::Delete;
+    use super::super::{Delete, Prompt};
     use super::*;
+    use gpui::{FontId, NoopTextSystem};
+    use std::sync::Arc;
+
+    /// A focused file fills the former current and preview columns with one body.
+    #[test]
+    fn focused_file_has_one_separator_and_an_editor_sized_body() {
+        let area = Rect {
+            x: 0,
+            y: 1,
+            w: 90,
+            h: 30,
+        };
+        let layout = PickerLayout::for_file(area);
+        let body = crate::grid::windows::editor::EditorWindow::body(layout.preview_editor_area());
+        assert_eq!(layout.current.w, 0);
+        assert_eq!(layout.parent.x + layout.parent.w + 1, layout.preview.x);
+        assert_eq!(body.x + body.w, area.x + area.w - 1);
+        assert_eq!(body.y + body.h, area.y + area.h - 1);
+    }
+
+    /// The prompt sits below the headings and only a committed query replaces Current.
+    #[test]
+    fn filter_uses_top_center_and_shows_the_committed_query() {
+        let area = Rect {
+            x: 1,
+            y: 2,
+            w: 90,
+            h: 36,
+        };
+        let spacing = TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 9.);
+        let mut picker = FilePicker {
+            prompt: Some(Prompt::new(PromptKind::Filter, "notes".into(), 5)),
+            ..FilePicker::default()
+        };
+        let layout = PickerLayout::new(area, Some(&picker));
+        let filter = picker.floating_prompt_area(layout).unwrap();
+        assert_eq!(filter.x, area.x + (area.w - filter.w) / 2);
+        assert_eq!(filter.y, area.y + 2);
+        let width = layout.current.w - 1;
+        assert_eq!(
+            picker.current_heading(width, &spacing),
+            i18n::text("picker.current")
+        );
+
+        picker.filter = picker.prompt.take().unwrap().value;
+        let label = i18n::text("picker.filter");
+        assert!(picker.floating_prompt_area(layout).is_none());
+        assert_eq!(
+            picker.current_heading(width, &spacing),
+            format!("[{label}: notes]")
+        );
+        let narrow = spacing.columns(&format!("[{label}: 123]"));
+        assert_eq!(
+            picker.current_heading(narrow, &spacing),
+            format!("[{label}: no…]")
+        );
+
+        picker.prompt = Some(Prompt::new(PromptKind::Search, String::new(), 0));
+        let search_layout = PickerLayout::new(area, Some(&picker));
+        assert!(picker.floating_prompt_area(search_layout) == Some(filter));
+        assert_eq!(search_layout.current.h, layout.current.h);
+        assert_eq!(picker.prompt_label(), "picker.search");
+    }
 
     /// Columns fill the lower grid, with space reserved for active commands.
     #[test]

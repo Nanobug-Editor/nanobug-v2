@@ -155,11 +155,11 @@ fn closing_selects_the_neighbor_then_a_start_page() {
     assert!(project.editor.modified());
 
     assert!(projects.select(1));
-    projects.close_project();
+    assert!(projects.close_tab());
     assert_eq!(projects.active().name(), "third");
     assert_eq!(projects.selected, 1);
     assert!(projects.project(0).editor.modified());
-    projects.close_project();
+    assert!(projects.close_tab());
     assert_eq!(projects.active().name(), "first");
     assert_eq!(projects.selected, 0);
     assert!(projects.active().editor.modified());
@@ -167,27 +167,46 @@ fn closing_selects_the_neighbor_then_a_start_page() {
     projects.active_mut().editor.open(edited, 0.).unwrap();
     assert_eq!(projects.active().editor.vim().doc.text, "!first");
     projects
-        .save_buffer(0, projects.active().editor.active, None)
+        .save_buffer(0, projects.active().editor.active_index(), None)
         .unwrap();
-    projects.close_project();
+    assert!(projects.close_tab());
     assert_eq!(projects.len(), 1);
     assert!(projects.start().is_some());
-    assert!(!projects.close_start());
+    assert!(!projects.close_tab());
 }
 
-/// Start tabs close in activation order even after the strip was reordered.
+/// Closing a start tab returns to the most recent tab and preserves its draft.
 #[test]
 fn start_page_close_returns_to_the_most_recent_tab() {
     let directory = tempfile::tempdir().unwrap();
     let mut tabs = projects_in(directory.path());
     assert!(tabs.select(1));
+    tabs.active_mut()
+        .editor
+        .edit(|vim, register| vim.text("i!", register));
     let start = tabs.add_start();
     assert!(tabs.select(start));
     let other_start = tabs.add_start();
     assert!(tabs.select(other_start));
     tabs.move_selected(0);
-    assert!(tabs.close_start());
+    assert!(tabs.close_tab());
     assert!(tabs.start().is_some());
-    assert!(tabs.close_start());
+    assert!(tabs.close_tab());
     assert_eq!(tabs.active().name(), "second");
+    assert_eq!(tabs.active().editor.vim().doc.text, "!second");
+    assert!(tabs.active().editor.modified());
+}
+
+/// Closing every resolved tab leaves a new start page selected.
+#[test]
+fn close_all_tabs_leaves_one_start_page() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut tabs = projects_in(directory.path());
+    let start = tabs.add_start();
+    assert!(tabs.select(start));
+    tabs.close_all_tabs();
+    assert_eq!(tabs.len(), 1);
+    assert_eq!(tabs.selected, 0);
+    assert!(tabs.start().is_some());
+    assert_eq!(tabs.ordered().count(), 0);
 }

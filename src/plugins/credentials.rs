@@ -1,7 +1,7 @@
 //! OS-backed credentials with recoverable reference swaps. Secret bytes never enter profile files.
 
 use super::{
-    package::{hash_bytes, read_json},
+    package::{hash_bytes, read_json, read_limited, write_bytes},
     query,
 };
 use anyhow::{Context, Result, ensure};
@@ -16,6 +16,8 @@ use zeroize::Zeroizing;
 
 const SERVICE: &str = "Nanobug.Plugin.V1";
 const INDEX_LIMIT: u64 = 512 * 1024;
+/// Vault account prefix stored with a portable profile so its path can change.
+const NAMESPACE_FILE: &str = "credential-namespace";
 pub(super) const SECRET_LIMIT: usize = 2048;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -75,13 +77,47 @@ fn read_cleanup<'de, D: serde::Deserializer<'de>>(
     })
 }
 
-/// Local references include the resolved profile path and the full installed identity namespace.
+/// Local references identify system vault entries within the profile's credential namespace.
 #[derive(Clone)]
 pub(super) struct Credentials(PathBuf);
 
 impl Credentials {
     pub(super) fn new(root: PathBuf) -> Self {
         Self(root)
+    }
+
+    /// Initialize `destination` with the vault namespace of its imported `source`, if any.
+    pub(super) fn initialize_namespace(destination: &Path, source: Option<&Path>) -> Result<()> {
+        let path = destination.join(NAMESPACE_FILE);
+        if !path.try_exists()? {
+            let namespace = if let Some(source) = source {
+                Self::new(source.to_path_buf()).namespace()?
+            } else {
+                let marker = tempfile::NamedTempFile::new_in(destination)?;
+                query::project_key(marker.path())
+            };
+            write_bytes(&path, namespace.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Read the portable vault namespace, or derive it from the path of an older profile.
+    fn namespace(&self) -> Result<String> {
+        match read_limited(&self.0.join(NAMESPACE_FILE), 64) {
+            Ok(bytes) => {
+                let namespace = String::from_utf8(bytes)?;
+                ensure!(valid_reference(&namespace), "Invalid credential namespace");
+                Ok(namespace)
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+            {
+                Ok(query::project_key(&query::resolve_prefix(&self.0)?))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(super) fn names(&self) -> Result<BTreeSet<String>> {
@@ -232,7 +268,7 @@ impl Credentials {
 
     fn entry(&self, reference: &str) -> Result<keyring::Entry> {
         ensure!(valid_reference(reference), "Invalid credential reference");
-        let profile = query::project_key(&query::resolve_prefix(&self.0)?);
+        let profile = self.namespace()?;
         let user = format!("{profile}-{reference}");
         #[cfg(windows)]
         {
@@ -650,6 +686,38 @@ mod tests {
                 let _ = self.0.delete(owner, None);
             }
         }
+    }
+
+    /// Import `source`'s references and verify that renaming the portable folder preserves vault access.
+    #[test]
+    #[ignore = "requires the operating system credential store and uses temporary entries"]
+    fn portable_profile_keeps_the_existing_system_credential() -> Result<()> {
+        let _vault = VAULT_TEST.lock().unwrap_or_else(|lock| lock.into_inner());
+        let fixture = tempfile::tempdir()?;
+        let source = fixture.path().join("legacy");
+        let destination = fixture.path().join("portable");
+        fs::create_dir(&destination)?;
+        let original = Credentials::new(source.clone());
+        let owner = Identity::new("Migration Fixture".into(), "fixture".into())?.namespace();
+        let _cleanup = Cleanup(&original, vec![owner.clone()]);
+        let value = "fixture-only-vault-value";
+        original.set(&owner, "login", value)?.confirmed()?;
+        Credentials::initialize_namespace(&destination, Some(&source))?;
+        crate::app_data::copy_missing_file(
+            &original.path(),
+            &destination.join("credentials.json"),
+        )?;
+
+        let moved = fixture.path().join("moved");
+        fs::rename(&destination, &moved)?;
+        let imported = Credentials::new(moved);
+        assert!(
+            imported
+                .get(&owner, "login")?
+                .is_some_and(|secret| *secret == value)
+        );
+        assert!(!fs::read_to_string(imported.path())?.contains(value));
+        Ok(())
     }
 
     #[test]

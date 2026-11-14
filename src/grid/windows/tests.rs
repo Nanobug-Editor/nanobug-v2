@@ -9,12 +9,7 @@ use std::{fs, path::Path};
 
 /// Select a manager entry by `path`, avoiding assumptions about filesystem enumeration order.
 fn select(manager: &mut ManagerWindow, path: &Path) {
-    manager.tree.selected = manager
-        .tree
-        .entries
-        .iter()
-        .position(|entry| entry.path == path)
-        .unwrap();
+    assert!(manager.select_path(path));
 }
 
 /// A cut retargets the open buffer; a subsequent text edit invalidates undo for that transfer.
@@ -42,9 +37,7 @@ fn manager_move_retargets_editor_and_edit_invalidates_transfer_undo() {
 
     let edit = editor.edit(|vim, register| vim.text("i!", register));
     assert_eq!(edit.changed_path.as_deref(), Some(moved.as_path()));
-    manager
-        .transfers
-        .invalidate(edit.changed_path.as_deref().unwrap());
+    manager.invalidate_history(edit.changed_path.as_deref().unwrap());
     let (changes, _) = manager.transfer("z", &root, &editor.dirty_paths());
     assert!(changes.is_empty());
     assert!(moved.exists());
@@ -91,5 +84,5 @@ fn manager_navigation_reports_the_selected_file_to_the_workspace() {
     };
     assert_eq!(path.file_name().unwrap(), "c.txt");
     manager.key("g", Some('g')).unwrap();
-    assert_eq!(manager.tree.selected, 0);
+    assert_eq!(manager.tree().selected, 0);
 }

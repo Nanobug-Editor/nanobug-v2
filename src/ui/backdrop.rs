@@ -1,10 +1,10 @@
-//! Rasterize the workspace layers once for the shortcut popup's frosted backdrop.
+//! Rasterize the workspace layers once for a popup's frosted backdrop.
 use crate::ui::icons::Icon;
 use gpui::{
-    Bounds, DevicePixels, ObjectFit, Pixels, PlatformTextSystem, Point, RenderGlyphParams,
+    Bounds, DevicePixels, ObjectFit, Path, Pixels, PlatformTextSystem, Point, RenderGlyphParams,
     RenderImage, Size, SvgRenderer, point, size,
 };
-use image::{GrayImage, Pixel, Rgba, RgbaImage, imageops};
+use image::{GrayImage, ImageBuffer, Luma, Pixel, Rgba, RgbaImage, imageops};
 use std::{collections::HashMap, sync::Arc};
 
 /// Blur radius in logical pixels.
@@ -13,6 +13,8 @@ const BLUR_SIGMA: f32 = 4.5;
 const MAX_RASTER_EDGE: f32 = 1280.;
 /// Opacity of the translucent wash using the shared window tint.
 const WASH_ALPHA: u8 = 54;
+/// Subpixel sample positions on both axes for each downsampled path pixel.
+const PATH_SAMPLES: [f32; 4] = [0.125, 0.375, 0.625, 0.875];
 
 /// Coverage bitmap and its offset from a text glyph's baseline.
 struct Mask {
@@ -89,6 +91,60 @@ impl<'a> BackdropRaster<'a> {
         }
     }
 
+    /// Blend the tessellated `path` into the raster in RGBA `color`, within the panel `clip`.
+    pub(crate) fn path(&mut self, path: &Path<Pixels>, clip: Bounds<Pixels>, color: u32) {
+        let visible = self.pixel_clip(clip);
+        let area = triangle_bounds(&[
+            path.bounds
+                .origin
+                .map(|value| f32::from(value) * self.scale),
+            path.bounds
+                .bottom_right()
+                .map(|value| f32::from(value) * self.scale),
+        ])
+        .intersect(&visible);
+        if area.is_empty() {
+            return;
+        }
+        let mut coverage = ImageBuffer::<Luma<u16>, Vec<u16>>::new(
+            area.size.width.0 as u32,
+            area.size.height.0 as u32,
+        );
+        // Combine samples across triangles before blending once so shared edges stay seamless.
+        for triangle in path.vertices.as_chunks::<3>().0 {
+            let triangle = triangle.each_ref().map(|vertex| {
+                vertex
+                    .xy_position
+                    .map(|value| f32::from(value) * self.scale)
+            });
+            let [a, b, c] = triangle;
+            let winding = edge(a, b, c);
+            if winding == 0. {
+                continue;
+            }
+            let winding = winding.signum();
+            let bounds = triangle_bounds(&triangle).intersect(&area);
+            for y in bounds.top().0..bounds.bottom().0 {
+                for x in bounds.left().0..bounds.right().0 {
+                    let pixel = coverage
+                        .get_pixel_mut((x - area.left().0) as u32, (y - area.top().0) as u32);
+                    pixel[0] |= triangle_samples(triangle, winding, x, y);
+                }
+            }
+        }
+        let mut source = color.to_be_bytes();
+        let opacity = u32::from(source[3]);
+        let samples = PATH_SAMPLES.len().pow(2) as u32;
+        for (x, y, pixel) in coverage.enumerate_pixels() {
+            if pixel[0] != 0 {
+                source[3] = ((opacity * pixel[0].count_ones() + samples / 2) / samples) as u8;
+                self.pixels
+                    .get_pixel_mut(x + area.left().0 as u32, y + area.top().0 as u32)
+                    .blend(&Rgba(source));
+            }
+        }
+    }
+
     /// Blend a triangular badge tip of RGBA `color` in `bounds`, pointing left when `points_left` is set.
     /// Only samples inside `clip` are written.
     pub(crate) fn chevron(
@@ -119,7 +175,7 @@ impl<'a> BackdropRaster<'a> {
         }
     }
 
-    /// Stamp a glyph at its baseline `at` in RGBA `color`, constrained by the pane's `clip`.
+    /// Stamp the glyph in `params` at baseline `at` in RGBA `color`, inside the pane's `clip`.
     pub(crate) fn glyph(
         &mut self,
         at: Point<Pixels>,
@@ -217,7 +273,43 @@ impl<'a> BackdropRaster<'a> {
     }
 }
 
-/// Blend a glyph `mask` into `pixels` at logical `at`, in RGBA `color`, inside raster `clip`.
+/// Round the bounds of nonempty `points` in raster space outward so thin strokes retain coverage.
+fn triangle_bounds(points: &[Point<f32>]) -> Bounds<DevicePixels> {
+    let mut top_left = points[0];
+    let mut bottom_right = points[0];
+    for p in &points[1..] {
+        top_left = point(top_left.x.min(p.x), top_left.y.min(p.y));
+        bottom_right = point(bottom_right.x.max(p.x), bottom_right.y.max(p.y));
+    }
+    Bounds::from_corners(
+        top_left.map(|value| DevicePixels(value.floor() as i32)),
+        bottom_right.map(|value| DevicePixels(value.ceil() as i32)),
+    )
+}
+
+/// Return the sample mask in raster pixel `(x, y)` covered by `triangle` with the given `winding`.
+fn triangle_samples([a, b, c]: [Point<f32>; 3], winding: f32, x: i32, y: i32) -> u16 {
+    let mut samples = 0;
+    for (row, dy) in PATH_SAMPLES.into_iter().enumerate() {
+        for (col, dx) in PATH_SAMPLES.into_iter().enumerate() {
+            let at = point(x as f32 + dx, y as f32 + dy);
+            if [edge(a, b, at), edge(b, c, at), edge(c, a, at)]
+                .into_iter()
+                .all(|distance| winding * distance >= 0.)
+            {
+                samples |= 1 << (row * PATH_SAMPLES.len() + col);
+            }
+        }
+    }
+    samples
+}
+
+/// Return the signed area of the triangle whose directed side is `a` to `b` and third point is `at`.
+fn edge(a: Point<f32>, b: Point<f32>, at: Point<f32>) -> f32 {
+    (b.x - a.x) * (at.y - a.y) - (b.y - a.y) * (at.x - a.x)
+}
+
+/// Blend a glyph `mask` at logical `at` in RGBA `color`, using `scale` to map into `pixels` and `clip`.
 fn stamp(
     pixels: &mut RgbaImage,
     scale: f32,
@@ -262,7 +354,32 @@ fn rounded_exterior(at: Point<f32>, popup: Bounds<Pixels>, radius: f32, scale: f
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::px;
+    use gpui::{PathBuilder, px};
+
+    /// Downsample tessellated outlines without seams or blending beyond the panel clip.
+    #[test]
+    fn backdrop_path_keeps_thin_strokes_and_respects_clip() {
+        let text = gpui::NoopTextSystem::new();
+        let mut raster = BackdropRaster::new(
+            size(px(30.), px(30.)),
+            &text,
+            SvgRenderer::new(Arc::new(())),
+        );
+        let mut builder = PathBuilder::stroke(px(2.));
+        builder.add_polygon(&[point(px(4.), px(8.)), point(px(20.), px(8.))], false);
+        let path = builder.build().unwrap();
+        let clip = Bounds::new(point(px(8.), px(0.)), size(px(8.), px(30.)));
+        raster.path(&path, clip, 0xffffffc0);
+
+        for y in [3, 4] {
+            assert_eq!(raster.pixels.get_pixel(3, y)[3], 0);
+            for x in 4..8 {
+                assert_eq!(raster.pixels.get_pixel(x, y)[3], 96);
+            }
+            assert_eq!(raster.pixels.get_pixel(8, y)[3], 0);
+        }
+        assert_eq!(raster.pixels.get_pixel(5, 2)[3], 0);
+    }
 
     /// The mask spreads ink, leaves the popup clear and covers the space outside its round corners.
     #[test]
@@ -278,7 +395,7 @@ mod tests {
             0xffffffff,
         );
         let popup = Bounds::new(point(px(28.), px(28.)), size(px(44.), px(44.)));
-        let image = raster.finish(popup, 12., crate::ui::theme::BACKGROUND);
+        let image = raster.finish(popup, 12., crate::ui::theme::Style::default().background());
         let pixels = image.as_bytes(0).unwrap();
         let alpha = |x: usize, y: usize| pixels[(y * 50 + x) * 4 + 3];
         assert!(alpha(11, 4) > WASH_ALPHA);

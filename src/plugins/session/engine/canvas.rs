@@ -285,8 +285,9 @@ impl Engine {
         }
         self.finish_canvas_preparation(&key, generation, ticket, frame, result, pending);
         if let Some((generation, frame)) = waiting
-            && self.wanted.contains_key(&key)
+            && self.lifecycle.wanted.contains_key(&key)
             && self
+                .lifecycle
                 .runtimes
                 .get(&key.namespace)
                 .is_some_and(|runtime| runtime.generation == generation && runtime.worker.is_some())
@@ -305,8 +306,9 @@ impl Engine {
         pending: Pending,
     ) {
         if pending.generation != generation
-            || !self.wanted.contains_key(key)
+            || !self.lifecycle.wanted.contains_key(key)
             || !self
+                .lifecycle
                 .runtimes
                 .get(&key.namespace)
                 .is_some_and(|runtime| runtime.generation == generation && runtime.worker.is_some())
@@ -428,15 +430,19 @@ impl Engine {
 
     /// The current live scene is the only source of plugin UI actions.
     pub(super) fn current_surface_revision(&self, key: &Key, revision: u64) -> Option<&Surface> {
-        if self.active != Some(key.instance.project) || !self.wanted.contains_key(key) {
+        if self.active != Some(key.instance.project) || !self.lifecycle.wanted.contains_key(key) {
             return None;
         }
         self.view.surfaces.get(key).filter(|surface| {
             surface.revision == revision
                 && self.frame_has_current_layout(key, &surface.frame)
-                && self.runtimes.get(&key.namespace).is_some_and(|runtime| {
-                    runtime.generation == surface.generation && runtime.worker.is_some()
-                })
+                && self
+                    .lifecycle
+                    .runtimes
+                    .get(&key.namespace)
+                    .is_some_and(|runtime| {
+                        runtime.generation == surface.generation && runtime.worker.is_some()
+                    })
         })
     }
 }

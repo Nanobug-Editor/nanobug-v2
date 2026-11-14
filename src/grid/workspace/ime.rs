@@ -4,30 +4,41 @@
 mod windows;
 
 use super::{Workspace, layout::Focus};
-use crate::ui::ime::Composition;
+use crate::{grid::windows::start::StartPage, ui::ime::Composition};
 use gpui::{
     Bounds, ClipboardItem, Context, EntityInputHandler, Pixels, Point, UTF16Selection, Window, px,
     size,
 };
-use nanobug::{animation::scroll::ScrollInput, vim::Mode};
+use nanobug::animation::scroll::ScrollInput;
 use std::ops::Range;
 
 impl Workspace {
-    /// End the composition of any surface that stopped accepting native text.
+    /// Clear preedit when the active surface stops accepting text and sync the system IME.
     pub(super) fn sync_text_input(&mut self, window: &Window, cx: &mut Context<Self>) {
         if !self.accepts_native_text() {
             self.plugins.composition.clear();
             if let Some(project) = self.projects.active_project_mut() {
-                project.editor.composition.clear();
+                project.editor.composition_mut().clear();
+            }
+            if let Some(page) = self.projects.start_mut()
+                && let Some(picker) = &mut page.picker
+            {
+                picker.composition.clear();
             }
             self.help.composition.clear();
+            if let Some(session) = &mut self.file_picker {
+                session.state.composition.clear();
+                if let Some(editor) = session.focused_editor_mut() {
+                    editor.composition_mut().clear();
+                }
+            }
             #[cfg(feature = "plugin-probe")]
             if let Some(probe) = &mut self.probe {
                 probe.composition.clear();
             }
         }
         #[cfg(windows)]
-        self.sync_native_ime(window, cx);
+        self.sync_native_ime(window, cx, false);
         #[cfg(not(windows))]
         let _ = (window, cx);
     }
@@ -47,15 +58,23 @@ impl Workspace {
         if self.help.is_open() {
             Some(&self.help.composition)
         } else if let Some(session) = &self.file_picker {
+            if let Some(editor) = session.focused_editor() {
+                return editor.vim().accepts_text().then_some(editor.composition());
+            }
             session
                 .state
                 .prompt
                 .as_ref()
                 .map(|_| &session.state.composition)
+        } else if let Some(page) = self.projects.start() {
+            page.picker
+                .as_ref()
+                .filter(|picker| picker.filter_focused())
+                .map(|picker| &picker.composition)
         } else {
             self.projects
                 .active_project()
-                .map(|project| &project.editor.composition)
+                .map(|project| project.editor.composition())
         }
     }
 
@@ -74,15 +93,29 @@ impl Workspace {
         if self.help.is_open() {
             Some(&mut self.help.composition)
         } else if let Some(session) = &mut self.file_picker {
+            if session.previewing_file() {
+                let editor = session.focused_editor_mut()?;
+                return editor
+                    .vim()
+                    .accepts_text()
+                    .then_some(editor.composition_mut());
+            }
             session
                 .state
                 .prompt
                 .as_ref()
                 .map(|_| &mut session.state.composition)
+        } else if self.projects.start().is_some() {
+            self.projects
+                .start_mut()?
+                .picker
+                .as_mut()
+                .filter(|picker| picker.filter_focused())
+                .map(|picker| &mut picker.composition)
         } else {
             self.projects
                 .active_project_mut()
-                .map(|project| &mut project.editor.composition)
+                .map(|project| project.editor.composition_mut())
         }
     }
 
@@ -101,13 +134,16 @@ impl Workspace {
             self.help.is_filtering()
         } else if let Some(session) = &self.file_picker {
             session.state.prompt.is_some()
+                || session
+                    .focused_editor()
+                    .is_some_and(|editor| editor.vim().accepts_text())
+        } else if let Some(page) = self.projects.start() {
+            page.picker
+                .as_ref()
+                .is_some_and(|picker| picker.filter_focused())
         } else {
             self.projects.active_project().is_some_and(|project| {
-                project.focus == Focus::Editor
-                    && matches!(
-                        project.editor.vim().mode,
-                        Mode::Insert | Mode::Command | Mode::Search
-                    )
+                project.focus == Focus::Editor && project.editor.vim().accepts_text()
             })
         }
     }
@@ -217,6 +253,17 @@ impl EntityInputHandler for Workspace {
     ) -> Option<Bounds<Pixels>> {
         if let Some(bounds) = self.canvas_input_caret_bounds() {
             return Some(bounds);
+        }
+        if !self.plugins.owns_input()
+            && self.file_picker.is_none()
+            && let (Some(page), Some(layout)) = (self.projects.start(), self.start_layout())
+        {
+            let metrics = StartPage::content_metrics(self.metrics);
+            let (caret, width) = page.caret(layout, metrics, &self.spacing);
+            return Some(Bounds::new(
+                caret.origin,
+                size(px(metrics.cw * width), px(metrics.lh)),
+            ));
         }
         let (x, y, width, _, _) = self.caret();
         Some(Bounds::new(

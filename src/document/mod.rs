@@ -1,6 +1,12 @@
 //! UTF-8 text, grapheme-safe coordinates, undo history and atomic file writes.
+mod folds;
+mod history;
+
 use crate::i18n;
 use anyhow::{Context, Result, bail};
+use folds::Folds;
+pub(crate) use folds::{FoldChange, FoldEdge, FoldLevel};
+use history::{History, Snapshot};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -24,15 +30,6 @@ pub fn display_width(text: &str, column: usize) -> usize {
     }) - column
 }
 
-/// One undo checkpoint, recorded once per insert session or normal-mode change.
-#[derive(Clone)]
-struct Snapshot {
-    /// Complete text before the change.
-    text: String,
-    /// Logical cursor byte offset before the change.
-    cursor: usize,
-}
-
 /// The only mutable owner of a file's text; drawing caches are derived from it.
 pub struct Document {
     /// Identity of this in-memory opening, even when the same path is opened again.
@@ -47,8 +44,8 @@ pub struct Document {
     pub starts: Vec<usize>,
     /// Incremented for every edit or undo, used to invalidate derived text layouts.
     pub revision: u64,
-    /// Document-row ranges currently hidden by the editor, excluding each fold's visible header.
-    hidden_rows: Vec<Range<usize>>,
+    /// Retained fold definitions and their visible line projection.
+    folds: Folds,
     /// Last successfully read or written content, for exact dirty detection.
     saved: String,
     /// Preserve CRLF when a CRLF file is saved.
@@ -57,10 +54,8 @@ pub struct Document {
     bom: bool,
     /// Only buffers created by a plugin edit plan carry an exact disk save guard.
     disk_guard: Option<([u8; 32], u64)>,
-    /// Undo checkpoints, bounded by count and approximate retained text size.
-    undo: Vec<Snapshot>,
-    /// Checkpoints available to redo.
-    redo: Vec<Snapshot>,
+    /// Bounded chronological history and the active undo/redo branch.
+    history: History,
 }
 
 impl Document {
@@ -74,13 +69,12 @@ impl Document {
             cursor: 0,
             starts: Vec::new(),
             revision: 0,
-            hidden_rows: Vec::new(),
+            folds: Folds::default(),
             saved: text.into(),
             crlf: false,
             bom: false,
             disk_guard: None,
-            undo: Vec::new(),
-            redo: Vec::new(),
+            history: History::default(),
         };
         doc.reindex();
         doc
@@ -149,96 +143,6 @@ impl Document {
         self.cursor = self.cursor.min(self.text.len());
     }
 
-    /// Close a fold with half-open hidden rows, preserving disjoint folds and their headers.
-    pub fn collapse_rows(&mut self, rows: Range<usize>) {
-        if rows.start == 0 || rows.start >= rows.end || rows.end > self.starts.len() {
-            return;
-        }
-        self.hidden_rows
-            .retain(|fold| fold.end <= rows.start || rows.end <= fold.start);
-        let index = self
-            .hidden_rows
-            .partition_point(|fold| fold.start < rows.start);
-        self.hidden_rows.insert(index, rows);
-    }
-
-    /// Clear all folds, for example when a language provider is disabled.
-    pub fn clear_hidden_rows(&mut self) {
-        self.hidden_rows.clear();
-    }
-
-    /// Expand the collapsed fold whose header is document row `row`.
-    pub fn open_fold_at(&mut self, row: usize) -> bool {
-        let before = self.hidden_rows.len();
-        self.hidden_rows.retain(|range| range.start != row + 1);
-        self.hidden_rows.len() != before
-    }
-
-    /// Expand any collapsed fold hiding document `row`.
-    pub fn reveal_row(&mut self, row: usize) -> bool {
-        let before = self.hidden_rows.len();
-        self.hidden_rows.retain(|range| !range.contains(&row));
-        self.hidden_rows.len() != before
-    }
-
-    /// Convert document row `row` to a display row, mapping hidden lines to their fold header.
-    pub fn display_row(&self, row: usize) -> usize {
-        let mut hidden = 0;
-        for range in &self.hidden_rows {
-            if row < range.start {
-                break;
-            }
-            if row < range.end {
-                return range.start - 1 - hidden;
-            }
-            hidden += range.len();
-        }
-        row - hidden
-    }
-
-    /// Convert a display `row` back to its visible document row.
-    pub fn document_row(&self, mut row: usize) -> usize {
-        for range in &self.hidden_rows {
-            if row < range.start {
-                break;
-            }
-            row = row.saturating_add(range.len());
-        }
-        row
-    }
-
-    /// Number of visible document rows after folds have been applied.
-    pub fn display_rows(&self) -> usize {
-        self.starts.len() - self.hidden_rows.iter().map(Range::len).sum::<usize>()
-    }
-
-    /// Whether a collapsed fold starts just below document `row`.
-    pub fn folded_at(&self, row: usize) -> bool {
-        self.hidden_rows.iter().any(|range| range.start == row + 1)
-    }
-
-    /// Keep folds on unaffected rows when changing the byte `range` to `text`.
-    fn shift_folds(&mut self, range: &Range<usize>, text: &str) {
-        if self.hidden_rows.is_empty() {
-            return;
-        }
-        let first = self.starts.partition_point(|&start| start <= range.start) - 1;
-        let last = self.starts.partition_point(|&start| start <= range.end) - 1;
-        let delta =
-            text.bytes().filter(|&byte| byte == b'\n').count() as isize - (last - first) as isize;
-        self.hidden_rows.retain_mut(|hidden| {
-            if hidden.end <= first {
-                return true;
-            }
-            if hidden.start.saturating_sub(1) <= last {
-                return false;
-            }
-            hidden.start = hidden.start.saturating_add_signed(delta);
-            hidden.end = hidden.end.saturating_add_signed(delta);
-            true
-        });
-    }
-
     /// Byte interval of `row`, excluding its line separator.
     pub fn line_range(&self, row: usize) -> Range<usize> {
         let start = *self.starts.get(row).unwrap_or(&self.text.len());
@@ -253,6 +157,19 @@ impl Document {
     /// Text of `row`, excluding its separator.
     pub fn line(&self, row: usize) -> &str {
         &self.text[self.line_range(row)]
+    }
+
+    /// Source offsets of the braces represented on the visible folded header at `row`.
+    pub fn folded_braces(&self, row: usize) -> Option<(usize, usize)> {
+        let end_row = self.folded_end_row(row)?;
+        let header = self.line(row).trim_end().strip_suffix('{')?;
+        let closing_line = self.line(end_row);
+        let closing = closing_line.trim_start();
+        closing.strip_prefix('}')?;
+        Some((
+            self.starts[row] + header.len(),
+            self.starts[end_row] + closing_line.len() - closing.len(),
+        ))
     }
 
     /// Resolve grapheme-aligned byte `offset` to a line number and a display column.
@@ -296,16 +213,9 @@ impl Document {
                 .map_or(0, str::len)
     }
 
-    /// Save a pre-change snapshot; redo is cleared only when an actual edit follows.
+    /// Save a pre-change snapshot and open a new branch for the following edit.
     pub fn checkpoint(&mut self) {
-        self.undo.push(Snapshot {
-            text: self.text.clone(),
-            cursor: self.cursor,
-        });
-        let mut bytes: usize = self.undo.iter().map(|s| s.text.len()).sum();
-        while self.undo.len() > 1 && (self.undo.len() > 128 || bytes > 16 * 1024 * 1024) {
-            bytes -= self.undo.remove(0).text.len();
-        }
+        self.history.checkpoint(&self.text, self.cursor);
     }
 
     /// Replace valid byte `range` with `text`; optionally start a new undo transaction.
@@ -316,7 +226,7 @@ impl Document {
         if checkpoint {
             self.checkpoint();
         }
-        self.redo.clear();
+        self.history.clear_redo();
         self.shift_folds(&range, text);
         self.text.replace_range(range.clone(), text);
         self.cursor = range.start + text.len();
@@ -326,23 +236,27 @@ impl Document {
 
     /// Restore a checkpoint from undo, or from redo when `redo` is true.
     pub fn undo(&mut self, redo: bool) {
-        let stack = if redo { &mut self.redo } else { &mut self.undo };
-        let mut restored = stack.pop();
-        while restored.as_ref().is_some_and(|s| s.text == self.text) {
-            restored = stack.pop();
+        if let Some(target) = self.history.branch(redo, &self.text) {
+            self.restore_history(target);
         }
-        let Some(snapshot) = restored else { return };
+    }
+
+    /// Restore the `count`th chronological state in the requested direction, across branches.
+    pub(crate) fn undo_chronological(&mut self, forward: bool, count: usize) {
+        if let Some(target) = self.history.chronological(forward, count) {
+            self.restore_history(target);
+        }
+    }
+
+    /// Restore the retained `target` while updating the text's derived geometry.
+    fn restore_history(&mut self, target: u64) {
         let current = Snapshot {
-            text: std::mem::take(&mut self.text),
+            text: self.text.clone(),
             cursor: self.cursor,
         };
-        if redo {
-            self.undo.push(current);
-        } else {
-            self.redo.push(current);
-        }
+        let snapshot = self.history.visit(target, current);
+        self.restore_folds(&snapshot.text);
         self.text = snapshot.text;
-        self.hidden_rows.clear();
         self.cursor = snapshot.cursor;
         self.revision += 1;
         self.reindex();

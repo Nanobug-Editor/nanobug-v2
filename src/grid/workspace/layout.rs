@@ -53,6 +53,50 @@ impl Focus {
     }
 }
 
+/// Split `available` cells between Explorer and the editor, clamping `manager` to their minima.
+fn split_sizes(available: usize, manager: usize, minimum: (usize, usize)) -> (usize, usize) {
+    let first = manager.clamp(
+        minimum.0,
+        available.saturating_sub(minimum.1).max(minimum.0),
+    );
+    (first, available - first)
+}
+
+/// Position Explorer and the editor inside `area`. `stacked` chooses the split axis,
+/// `editor_first` chooses the order, and the preferred sizes apply to Explorer on each axis.
+fn split_panes(
+    area: Rect,
+    stacked: bool,
+    editor_first: bool,
+    sidebar: usize,
+    manager_height: Option<usize>,
+) -> (Rect, Rect) {
+    let (manager, editor) = if stacked {
+        let available = area.h - 1;
+        let (manager, editor) =
+            split_sizes(available, manager_height.unwrap_or(available / 2), (4, 4));
+        (Rect { h: manager, ..area }, Rect { h: editor, ..area })
+    } else {
+        let (manager, editor) = split_sizes(area.w - 1, sidebar, (16, 29));
+        (Rect { w: manager, ..area }, Rect { w: editor, ..area })
+    };
+    let (first, mut second) = if editor_first {
+        (editor, manager)
+    } else {
+        (manager, editor)
+    };
+    if stacked {
+        second.y += first.h + 1;
+    } else {
+        second.x += first.w + 1;
+    }
+    if editor_first {
+        (second, first)
+    } else {
+        (first, second)
+    }
+}
+
 /// One selectable window inside the editor shell.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ShellWindow {
@@ -133,7 +177,7 @@ impl Workspace {
         self.metrics.at(0., 1.).y
     }
 
-    /// Resolve this window's current dimensions to the two panel rectangles.
+    /// Resolve `window` dimensions and the active project's split to the pane rectangles.
     pub(super) fn derive_layout(&self, window: &Window) -> Layout {
         let size = window.viewport_size();
         let visible_cols = ((f32::from(size.width) - 2. * f32::from(self.metrics.origin.x))
@@ -154,33 +198,39 @@ impl Workspace {
                 ..Layout::default()
             };
         };
-        let (sidebar, editor_x) = match (&project.manager, project.hidden_pane) {
-            (None, _) | (_, Some(Focus::Manager)) => (0, 0),
-            (_, Some(Focus::Editor)) => (cols, cols),
-            (Some(_), None) => {
-                let sidebar = project.sidebar.clamp(16, cols.saturating_sub(30).max(16));
-                (sidebar, sidebar + 1)
-            }
-        };
         let pane_height = rows - 1 - FOOTER_ROWS;
+        let area = Rect {
+            x: 0,
+            y: 1,
+            w: cols,
+            h: pane_height,
+        };
+        let (tree, editor) = match (&project.manager, project.hidden_pane) {
+            (None, _) | (_, Some(Focus::Manager)) => (Rect { w: 0, ..area }, area),
+            (_, Some(Focus::Editor)) => (
+                area,
+                Rect {
+                    x: cols,
+                    w: 0,
+                    ..area
+                },
+            ),
+            (Some(_), None) => split_panes(
+                area,
+                project.stacked,
+                project.editor_first,
+                project.sidebar,
+                project.manager_height,
+            ),
+        };
         Layout {
             cols,
             rows,
             visible_cols,
             visible_rows,
             footer_offset,
-            tree: Rect {
-                x: 0,
-                y: 1,
-                w: sidebar,
-                h: pane_height,
-            },
-            editor: Rect {
-                x: editor_x,
-                y: 1,
-                w: cols - editor_x,
-                h: pane_height,
-            },
+            tree,
+            editor,
         }
     }
 
@@ -221,6 +271,19 @@ impl Workspace {
             w: width,
             h: height,
         }
+    }
+
+    /// Place the footer's grid at its pixel-aligned offset from the last pane row.
+    pub(super) fn footer_bounds(&self) -> Bounds<Pixels> {
+        let mut bounds = Rect {
+            x: 0,
+            y: self.layout.rows - FOOTER_ROWS,
+            w: self.layout.cols,
+            h: FOOTER_ROWS,
+        }
+        .pixels(self.metrics);
+        bounds.origin.y += self.layout.footer_offset;
+        bounds
     }
 
     /// Return `target`'s grid rectangle, with zero width for a hidden pane.

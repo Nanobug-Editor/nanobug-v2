@@ -29,6 +29,8 @@ const MAX_UNPACKED: u64 = 256 * 1024 * 1024;
 pub(super) const MAX_FILE: u64 = 64 * 1024 * 1024;
 const MAX_MANIFEST: u64 = 256 * 1024;
 const MAX_INDEX: u64 = 16 * 1024 * 1024;
+/// Registry presence also marks that this installation has initialized its package store.
+const INSTALLED_INDEX: &str = "installed.json";
 const STAGING_DIRECTORY: &str = "package-staging";
 const STAGING_PREFIX: &str = "stage-";
 const STAGING_ID_LEN: usize = 10;
@@ -97,6 +99,9 @@ pub struct Module {
     /// Notify this module when a saved secret changes in its own installation.
     #[serde(default)]
     pub credential_events: bool,
+    /// Use the host's persistent rust-analyzer for Rust language queries and live diagnostics.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rust_analyzer: bool,
     #[serde(default)]
     pub provides: BTreeSet<Provider>,
     /// Document features apply to these extensions. An empty set matches any document.
@@ -125,6 +130,7 @@ pub enum Provider {
     Format,
     Complete,
     Diagnose,
+    Definition,
     /// Receive document changes and supply highlighting, folds and outline entries.
     Document,
 }
@@ -335,6 +341,17 @@ impl Manifest {
                     || module.wasm.is_some()
                         && self.permissions.contains(&Permission::ReadDocument),
                 "Document presentation requires a WASM module with document access"
+            );
+            ensure!(
+                !module.rust_analyzer
+                    || module.wasm.is_some()
+                        && module.document_extensions == BTreeSet::from(["rs".into()])
+                        && self.permissions.contains(&Permission::ReadDocument)
+                        && self.permissions.contains(&Permission::RunTool)
+                        && [Provider::Complete, Provider::Diagnose, Provider::Definition]
+                            .iter()
+                            .any(|provider| module.provides.contains(provider)),
+                "rust-analyzer requires a Rust language module with document and native tool access"
             );
             ensure!(
                 !module.settings_ui || module.interactive && module.wasm.is_some(),
@@ -603,33 +620,47 @@ impl Staging {
     }
 }
 
-/// One editor profile's atomic install registry and private content directories.
+/// An editor's installation registry, package files, and local plugin state.
 #[derive(Clone)]
 pub struct InstallStore {
+    /// Installation index, verified packages, and package locks live here.
     root: PathBuf,
+    /// Local settings, credential references, and other plugin state live here.
+    state_root: Arc<PathBuf>,
     compatibility: HostCompatibility,
 }
 
 impl InstallStore {
     /// Initialize the default compatibility policy without doing any disk I/O.
     pub fn new(root: PathBuf) -> Self {
-        Self {
-            root,
-            compatibility: HostCompatibility::current(false),
-        }
+        Self::with_compatibility(root, HostCompatibility::current(false))
     }
 
-    /// Explicit development/test profile with its own files and enabled proposals.
+    /// Use `root` for both installation and state, with the supplied `compatibility` policy.
     pub fn with_compatibility(root: PathBuf, compatibility: HostCompatibility) -> Self {
         Self {
+            state_root: Arc::new(root.clone()),
             root,
             compatibility,
         }
     }
 
+    /// Directory containing the installation index and verified packages.
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    /// Use `state_root` for plugin state while keeping packages in the current store.
+    pub(super) fn with_state_root(mut self, state_root: PathBuf) -> Self {
+        self.state_root = Arc::new(state_root);
+        self
+    }
+
+    /// Locate state data for the session, including references to the OS credential store.
+    pub(super) fn state_root(&self) -> &Path {
+        self.state_root.as_path()
+    }
+
     pub fn compatibility(&self) -> &HostCompatibility {
         &self.compatibility
     }
@@ -639,9 +670,69 @@ impl InstallStore {
         Ok(self.read_index()?.into_values().collect())
     }
 
+    /// Copy already approved releases from `previous` into this fresh installation once.
+    pub(super) fn import_installations(&self, previous: &Self) -> Result<()> {
+        let destination = self.root.join(INSTALLED_INDEX);
+        if destination.try_exists()? {
+            return Ok(());
+        }
+        let _target = self.lock_index()?;
+        if destination.try_exists()? {
+            return Ok(());
+        }
+        if !previous.root.join(INSTALLED_INDEX).try_exists()? {
+            return write_registry(&destination, &BTreeMap::<String, Installed>::new());
+        }
+        let _source = previous.lock_index()?;
+        let index = previous.read_index()?;
+        let mut imported = BTreeSet::new();
+        for record in index.values() {
+            for item in std::iter::once(record).chain(record.previous.as_deref()) {
+                let release = &item.release;
+                if imported.insert(&release.digest) {
+                    self.import_package(previous, release)?;
+                }
+            }
+        }
+        // Readers only see the index once every referenced package is present.
+        write_registry(&destination, &index)
+    }
+
+    /// Publish a verified package from `previous`, or check the `release` left by a partial import.
+    fn import_package(&self, previous: &Self, release: &Release) -> Result<()> {
+        let object = self.object_path(release)?;
+        if object.try_exists()? {
+            for path in release.files.keys() {
+                self.verified_asset(release, path)?;
+            }
+            return Ok(());
+        }
+        let packages = object.parent().expect("object parent");
+        fs::create_dir_all(packages)?;
+        ensure!(
+            packages.canonicalize()? == self.root.canonicalize()?.join("packages"),
+            "Plugin package directory escaped the store"
+        );
+        let staged = self.stage_locked()?;
+        for path in release.files.keys() {
+            let (source, expected) = previous.asset_location(release, path)?;
+            let bytes = read_limited(&source, MAX_FILE)?;
+            ensure!(
+                hash_bytes(&bytes) == expected,
+                "Plugin asset changed after installation"
+            );
+            let path = staged.path().join(path);
+            write_bytes(&path, &bytes)?;
+            #[cfg(unix)]
+            fs::set_permissions(path, source.metadata()?.permissions())?;
+        }
+        fs::rename(staged.path(), object)?;
+        Ok(())
+    }
+
     /// Read the index and reserve its active files in one transaction across editor instances.
     pub(super) fn list_leased(&self) -> Result<Vec<Installed>> {
-        if !self.root.join("installed.json").try_exists()? {
+        if !self.root.join(INSTALLED_INDEX).try_exists()? {
             return Ok(Vec::new());
         }
         let _index = self.lock_index()?;
@@ -656,7 +747,7 @@ impl InstallStore {
 
     /// Metadata for locally retained settings, credentials and drafts of removed plugins.
     pub(super) fn retained(&self) -> Result<BTreeMap<String, Release>> {
-        Ok(read_json(&self.root.join("retained.json"), MAX_INDEX)?.unwrap_or_default())
+        Ok(read_json(&self.state_root.join("retained.json"), MAX_INDEX)?.unwrap_or_default())
     }
 
     /// Change activation without mutating the installed package.
@@ -667,7 +758,7 @@ impl InstallStore {
             .get_mut(key)
             .context("Plugin is not installed")?
             .enabled = enabled;
-        write_registry(&self.root.join("installed.json"), &index)
+        write_registry(&self.root.join(INSTALLED_INDEX), &index)
     }
 
     /// Remove an installation from the index after its supervisor drains active calls.
@@ -675,10 +766,12 @@ impl InstallStore {
         let _lock = self.lock_index()?;
         let mut index = self.read_index()?;
         let removed = index.remove(key).context("Plugin is not installed")?;
+        // Retained metadata shares the state directory with the settings it describes.
+        let _retained = self.lock_retained()?;
         let mut retained = self.retained()?;
         retained.insert(key.to_owned(), removed.release.clone());
-        write_registry(&self.root.join("retained.json"), &retained)?;
-        write_registry(&self.root.join("installed.json"), &index)?;
+        write_registry(&self.state_root.join("retained.json"), &retained)?;
+        write_registry(&self.root.join(INSTALLED_INDEX), &index)?;
         for release in std::iter::once(&removed.release)
             .chain(removed.previous.as_deref().map(|record| &record.release))
         {
@@ -712,7 +805,7 @@ impl InstallStore {
             .context("No previous plugin release")?;
         self.compatibility.check(&previous.release.manifest)?;
         *current = *previous;
-        write_registry(&self.root.join("installed.json"), &index)
+        write_registry(&self.root.join(INSTALLED_INDEX), &index)
     }
 
     /// Confirm this exact candidate before allowing it to take over user operations.
@@ -727,14 +820,14 @@ impl InstallStore {
         );
         if current.pending_takeover {
             current.pending_takeover = false;
-            write_registry(&self.root.join("installed.json"), &index)?;
+            write_registry(&self.root.join(INSTALLED_INDEX), &index)?;
         }
         Ok(())
     }
 
     fn read_index(&self) -> Result<BTreeMap<String, Installed>> {
         let index: BTreeMap<String, Installed> =
-            read_json(&self.root.join("installed.json"), MAX_INDEX)?.unwrap_or_default();
+            read_json(&self.root.join(INSTALLED_INDEX), MAX_INDEX)?.unwrap_or_default();
         for (key, record) in &index {
             ensure!(
                 record.previous.as_ref().is_none_or(
@@ -867,6 +960,11 @@ impl InstallStore {
     /// Publish the directory and its lease together with respect to the cache collector.
     fn stage(&self) -> Result<Staging> {
         let _index = self.lock_index()?;
+        self.stage_locked()
+    }
+
+    /// Create a staging directory while the caller holds this store's install lock.
+    fn stage_locked(&self) -> Result<Staging> {
         let root = self.root.canonicalize()?.join(STAGING_DIRECTORY);
         fs::create_dir_all(&root)?;
         ensure!(
@@ -1061,7 +1159,7 @@ impl InstallStore {
         };
         index.insert(key, record.clone());
         if let Err(error) =
-            ready.and_then(|()| write_registry(&self.root.join("installed.json"), &index))
+            ready.and_then(|()| write_registry(&self.root.join(INSTALLED_INDEX), &index))
         {
             // Only this transaction's unpublished directory can be removed here.
             if created && let Err(cleanup) = self.remove_object(&record.release.digest) {
@@ -1127,9 +1225,9 @@ impl InstallStore {
 
     /// Create a private Wasmtime cache configuration outside extracted packages.
     pub(super) fn cache_config(&self) -> Result<PathBuf> {
-        let directory = self.root.join("compiled");
+        let directory = self.state_root.join("compiled");
         fs::create_dir_all(&directory)?;
-        let config = self.root.join("wasmtime-cache.toml");
+        let config = self.state_root.join("wasmtime-cache.toml");
         let cache = toml::Table::from_iter([(
             "directory".into(),
             toml::Value::String(directory.canonicalize()?.to_string_lossy().into_owned()),
@@ -1298,15 +1396,30 @@ impl InstallStore {
         Ok(lock)
     }
 
+    /// Synchronize retained metadata across sessions that use this state directory.
+    fn lock_retained(&self) -> Result<Option<File>> {
+        if self.state_root() == self.root() {
+            return Ok(None);
+        }
+        let lock = Self::open_registry_lock(self.state_root())?;
+        lock.lock()?;
+        Ok(Some(lock))
+    }
+
     /// Open the common install lock for either a background wait or a supervisor try-lock.
     fn open_index_lock(&self) -> Result<File> {
-        fs::create_dir_all(&self.root)?;
+        Self::open_registry_lock(&self.root)
+    }
+
+    /// Open the lock for `root`'s installation or retained metadata without modifying its contents.
+    fn open_registry_lock(root: &Path) -> Result<File> {
+        fs::create_dir_all(root)?;
         Ok(OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(self.root.join("installed.lock"))?)
+            .open(root.join("installed.lock"))?)
     }
 }
 

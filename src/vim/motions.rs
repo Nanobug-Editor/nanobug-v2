@@ -1,162 +1,708 @@
-//! Grapheme, word and line motions with a retained preferred column.
+//! Grapheme motions and logical viewport commands used by Normal, Visual and operators.
 
-use super::{Mode, Vim};
+use super::Vim;
+use crate::document::display_width;
+use unicode_segmentation::UnicodeSegmentation;
+
+/// Range semantics of a motion when used after an operator.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Kind {
+    /// The farther endpoint is excluded.
+    Exclusive,
+    /// Both endpoints are included.
+    Inclusive,
+    /// Every line intersecting the motion is included.
+    Line,
+}
+
+/// Destination and operator semantics computed for one motion.
+pub(super) struct Motion {
+    /// UTF-8 byte destination.
+    pub end: usize,
+    /// Shape of the resulting operator range.
+    pub kind: Kind,
+    /// Whether direct movement records its origin in the jumplist.
+    pub jump: bool,
+}
+
+impl Motion {
+    /// Construct a non-jumping motion to `end` with this `kind`.
+    pub fn new(end: usize, kind: Kind) -> Self {
+        Self {
+            end,
+            kind,
+            jump: false,
+        }
+    }
+}
+
+/// Latest f, F, t or T command and its literal target.
+pub(super) struct Find {
+    /// Find direction and whether the destination stops short.
+    pub key: char,
+    /// A single Unicode grapheme to find on the current line.
+    pub text: String,
+}
+
+/// Horizontal viewport placement requested by a modal command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HorizontalScroll {
+    /// Use this zero-based column as the left edge.
+    Position(usize),
+    /// Align the start of the caret's glyph to the left edge.
+    CursorLeft,
+    /// Align the end of the caret's glyph to the right edge.
+    CursorRight,
+}
 
 impl Vim {
-    /// Keep a normal-mode cursor on the final grapheme rather than the end-of-line insertion slot.
+    /// Keep command-mode carets on a character in a logical line.
     pub fn clamp_normal(&mut self) {
-        if self.mode == Mode::Insert {
+        if self.mode.is_insert() {
             return;
         }
-        let row = self.doc.location(self.doc.cursor).0;
+        let row = self
+            .doc
+            .location(self.doc.cursor)
+            .0
+            .min(self.line_count() - 1);
         let range = self.doc.line_range(row);
-        if self.doc.cursor >= range.end && range.end > range.start {
+        self.doc.cursor = self.doc.cursor.min(range.end);
+        if self.doc.cursor == range.end
+            && range.end > range.start
+            && !(self.mode.is_visual() && self.desired_column == Some(usize::MAX))
+        {
             self.doc.cursor = self.doc.previous(range.end);
         }
     }
 
-    /// Place the caret at grapheme boundary `offset` and start a new preferred column on the next vertical move.
+    /// Place the caret at byte `offset`, resetting the preferred display column.
     pub fn set_cursor(&mut self, offset: usize) {
-        self.doc.cursor = offset;
+        self.folded_closing_caret = None;
+        self.doc.cursor = self
+            .doc
+            .text
+            .floor_char_boundary(offset.min(self.doc.text.len()));
         self.desired_column = None;
         self.clamp_normal();
+        self.doc
+            .update_search_fold_row(self.doc.location(self.doc.cursor).0);
     }
 
-    /// Move the viewport-following caret to `row` while retaining its preferred display column.
+    /// Jump to a byte offset in the current document, preserving the source in the jumplist.
+    pub fn jump_to(&mut self, offset: usize) {
+        let previous = self.doc.cursor;
+        if self.doc.cursor != offset {
+            self.record_jump();
+        }
+        self.set_cursor(offset);
+        self.settle_fold_cursor(previous, self.doc.revision);
+    }
+
+    /// Move the viewport-following caret to `row` while retaining its preferred column.
     pub fn move_to_row(&mut self, row: usize) {
-        let (_, column) = self.doc.location(self.doc.cursor);
-        self.place_row(row, column);
+        let previous = self.doc.cursor;
+        self.folded_closing_caret = None;
+        self.doc.cursor = self.row_target(row);
+        self.clamp_normal();
+        self.settle_fold_cursor(previous, self.doc.revision);
+    }
+
+    /// Resolve a vertical `row` using the retained display column.
+    pub(super) fn row_target(&mut self, row: usize) -> usize {
+        let column = *self
+            .desired_column
+            .get_or_insert_with(|| self.doc.location(self.doc.cursor).1);
+        self.doc.offset(row.min(self.line_count() - 1), column)
+    }
+
+    /// Move to the resolved `motion`, recording jumps where appropriate.
+    pub(super) fn apply_motion(&mut self, motion: Motion) {
+        if motion.jump && self.doc.cursor != motion.end {
+            self.record_jump();
+        }
+        self.doc.cursor = motion.end;
+        self.folded_closing_caret = None;
         self.clamp_normal();
     }
 
-    /// Place the caret on `row`, taking its goal column from `column` on the first vertical move.
-    pub(super) fn place_row(&mut self, row: usize, column: usize) {
-        let desired = *self.desired_column.get_or_insert(column);
-        self.doc.cursor = self.doc.offset(row, desired);
+    /// Resolve an operator motion for `key` and `count` in document rows.
+    pub(super) fn motion(&mut self, key: &str, count: Option<usize>) -> Option<Motion> {
+        self.motion_with_rows(key, count, false)
     }
 
-    /// Move according to `key` and repeat count `n`; report whether the key is a supported motion.
-    pub(super) fn motion(&mut self, key: &str, n: usize) -> bool {
-        self.motion_with_rows(key, n, false)
+    /// Resolve `key` and `count` for cursor movement, skipping folded rows on vertical steps.
+    pub(super) fn cursor_motion(&mut self, key: &str, count: Option<usize>) -> Option<Motion> {
+        self.motion_with_rows(key, count, true)
     }
 
-    /// Resolve `key` and count `n`, optionally using the visible rows for cursor motion.
-    fn motion_with_rows(&mut self, key: &str, n: usize, visible: bool) -> bool {
-        let (row, col) = self.doc.location(self.doc.cursor);
-        let range = self.doc.line_range(row);
-        match key {
-            "h" | "Left" => {
+    /// Resolve `key` and its optional `count` using visible rows when requested.
+    fn motion_with_rows(
+        &mut self,
+        key: &str,
+        count: Option<usize>,
+        visible: bool,
+    ) -> Option<Motion> {
+        let n = count.unwrap_or(1);
+        let at = self.doc.cursor;
+        let row = self.doc.location(at).0;
+        let last = self.line_count() - 1;
+        let line = self.doc.line_range(row);
+        let mut kind = Kind::Exclusive;
+        let mut jump = false;
+        let end = match key {
+            "h" | "Left" | "Backspace" | "Ctrl+h" => {
+                let mut p = at;
                 for _ in 0..n {
-                    self.doc.cursor = self.doc.previous(self.doc.cursor).max(range.start);
+                    if p == line.start {
+                        break;
+                    }
+                    p = self.doc.previous(p);
                 }
+                p
             }
-            "l" | "Right" => {
+            "l" | "Right" | " " => {
+                let mut p = at;
                 for _ in 0..n {
-                    self.doc.cursor = self.doc.next(self.doc.cursor).min(range.end);
+                    if p == line.end {
+                        break;
+                    }
+                    p = self.doc.next(p).min(line.end);
                 }
+                p
             }
-            "j" | "Down" | "k" | "Up" => {
-                let row = if visible {
-                    self.doc.display_row(row)
+            "j" | "Down" | "Ctrl+j" | "k" | "Up" => {
+                let down = matches!(key, "j" | "Down" | "Ctrl+j");
+                let (first, limit) = if visible {
+                    (self.doc.display_row(row), self.doc.display_rows() - 1)
                 } else {
-                    row
+                    (row, last)
                 };
-                let target = if matches!(key, "j" | "Down") {
-                    row.saturating_add(n)
+                let target = if down {
+                    first.saturating_add(n).min(limit)
                 } else {
-                    row.saturating_sub(n)
+                    first.saturating_sub(n)
                 };
                 let target = if visible {
-                    self.doc
-                        .document_row(target.min(self.doc.display_rows() - 1))
+                    self.doc.document_row(target)
                 } else {
                     target
                 };
-                self.place_row(target, col);
-                return true;
-            }
-            "0" | "Home" => self.doc.cursor = range.start,
-            "^" => self.first_nonblank(),
-            "$" | "End" => self.doc.cursor = range.end,
-            "G" => self.doc.cursor = self.doc.offset(self.doc.starts.len() - 1, 0),
-            "w" => {
-                for _ in 0..n {
-                    self.doc.cursor = self.word_forward(self.doc.cursor);
+                if target == row {
+                    return None;
                 }
+                return Some(Motion::new(self.row_target(target), Kind::Line));
             }
-            "b" => {
-                for _ in 0..n {
-                    self.doc.cursor = self.word_backward(self.doc.cursor);
+            "0" | "Home" => line.start,
+            "^" => self.first_nonblank(row),
+            "$" | "End" => {
+                if n > 1 && row == last {
+                    return None;
                 }
-            }
-            "e" => {
-                for _ in 0..n {
-                    self.doc.cursor = self.word_end(self.doc.cursor);
+                let target = row.saturating_add(n - 1).min(last);
+                let end = self.doc.line_range(target);
+                self.desired_column = Some(usize::MAX);
+                if self.mode.is_insert() || self.mode.is_visual() || end.is_empty() {
+                    return Some(Motion::new(end.end, Kind::Exclusive));
                 }
+                return Some(Motion::new(self.doc.previous(end.end), Kind::Inclusive));
             }
-            _ => return false,
-        }
+            "g_" => {
+                kind = Kind::Inclusive;
+                let target = row.saturating_add(n - 1).min(last);
+                let range = self.doc.line_range(target);
+                let end = range.start + self.doc.text[range].trim_end_matches([' ', '\t']).len();
+                self.doc.previous(end).max(self.doc.starts[target])
+            }
+            "w" | "W" | "b" | "B" | "e" | "E" => {
+                let mut p = at;
+                let big = key.as_bytes()[0].is_ascii_uppercase();
+                for _ in 0..n {
+                    let next = match key {
+                        "w" | "W" => self.word_forward(p, big),
+                        "b" | "B" => self.word_backward(p, big),
+                        _ => {
+                            kind = Kind::Inclusive;
+                            self.word_end(p, big)
+                        }
+                    };
+                    if p == next {
+                        break;
+                    }
+                    p = next;
+                }
+                p
+            }
+            "G" | "gg" => {
+                let target =
+                    count.map_or(if key == "gg" { 0 } else { last }, |n| (n - 1).min(last));
+                return Some(self.line_jump(target));
+            }
+            "-" | "+" | "_" | "Enter" => {
+                kind = Kind::Line;
+                let target = match key {
+                    "-" => row.saturating_sub(n),
+                    "_" => row.saturating_add(n - 1).min(last),
+                    _ => row.saturating_add(n).min(last),
+                };
+                self.first_nonblank(target)
+            }
+            "|" => {
+                self.desired_column = Some(n - 1);
+                return Some(Motion::new(self.doc.offset(row, n - 1), Kind::Exclusive));
+            }
+            "%" if count.is_some() => {
+                if n > 100 {
+                    return None;
+                }
+                return Some(self.line_jump((self.line_count() * n).div_ceil(100) - 1));
+            }
+            "%" => {
+                kind = Kind::Inclusive;
+                jump = true;
+                let bracket = self.doc.text[at..line.end]
+                    .char_indices()
+                    .find(|(_, ch)| "()[]{}".contains(*ch))
+                    .map(|(i, _)| at + i)?;
+                self.paired(bracket)?
+            }
+            ";" | "," => return self.repeat_find(key == ",", n),
+            "(" | ")" => {
+                jump = true;
+                self.sentence_motion(key == "(", n)
+            }
+            "{" | "}" => {
+                jump = true;
+                self.paragraph_motion(key == "{", n)
+            }
+            "[m" | "]m" | "[M" | "]M" => {
+                jump = true;
+                self.method_motion(key.starts_with('['), key.ends_with('M'), n)?
+            }
+            "H" | "M" | "L" => {
+                let last = self.doc.display_rows() - 1;
+                let top = self.view.top.min(last);
+                let bottom = top.saturating_add(self.view.rows - 1).min(last);
+                let target = match key {
+                    "H" => top.saturating_add(n - 1),
+                    "L" => bottom.saturating_sub(n - 1),
+                    _ => top + (bottom - top) / 2,
+                };
+                let (first, last) = self.viewport_limits(top);
+                return Some(self.line_jump(self.doc.document_row(target.clamp(first, last))));
+            }
+            _ => return None,
+        };
         self.desired_column = None;
-        true
+        Some(Motion { end, kind, jump })
     }
 
-    /// Apply an ordinary cursor motion with folded rows skipped for vertical movement.
-    pub(super) fn cursor_motion(&mut self, key: &str, n: usize) {
-        self.motion_with_rows(key, n, true);
+    /// Build a linewise jump to `row` while retaining the preferred column.
+    fn line_jump(&mut self, row: usize) -> Motion {
+        Motion {
+            end: self.row_target(row),
+            kind: Kind::Line,
+            jump: true,
+        }
     }
 
-    /// Move to the first non-whitespace byte on the current line.
-    pub(super) fn first_nonblank(&mut self) {
-        let row = self.doc.location(self.doc.cursor).0;
-        self.doc.cursor =
-            self.doc.starts[row] + self.doc.line(row).len() - self.doc.line(row).trim_start().len();
+    /// Byte of the first nonblank character on `row`.
+    pub(super) fn first_nonblank(&self, row: usize) -> usize {
+        let line = self.doc.line(row);
+        self.doc.starts[row] + line.len() - line.trim_start_matches([' ', '\t']).len()
     }
 
-    /// Classify a grapheme at byte `at` as whitespace, word text, or punctuation.
-    pub(super) fn class(&self, at: usize) -> u8 {
+    /// Classify the grapheme at `at` as whitespace, keyword or punctuation.
+    pub(super) fn class(&self, at: usize, big: bool) -> u8 {
         match self.doc.text[at..].chars().next() {
             None => 0,
             Some(c) if c.is_whitespace() => 0,
-            Some(c) if c.is_alphanumeric() || c == '_' => 1,
+            Some(c) if big || c.is_alphanumeric() || c == '_' => 1,
             _ => 2,
         }
     }
 
-    /// Start of the next word after byte `at`, skipping whitespace.
-    pub(super) fn word_forward(&self, mut at: usize) -> usize {
-        let class = self.class(at);
-        while at < self.doc.text.len() && self.class(at) == class {
+    /// Beginning of the next word after `at`; a WORD only splits on whitespace.
+    pub(super) fn word_forward(&self, mut at: usize, big: bool) -> usize {
+        let class = self.class(at, big);
+        while at < self.doc.text.len() && self.class(at, big) == class {
             at = self.doc.next(at);
+            if self.empty_line_start(at) {
+                return at;
+            }
         }
-        while at < self.doc.text.len() && self.class(at) == 0 {
+        while at < self.doc.text.len() && self.class(at, big) == 0 {
             at = self.doc.next(at);
+            if self.empty_line_start(at) {
+                break;
+            }
         }
         at
     }
 
-    /// Start of the preceding word before byte `at`.
-    pub(super) fn word_backward(&self, at: usize) -> usize {
+    /// Beginning of the previous word before `at`.
+    pub(super) fn word_backward(&self, at: usize, big: bool) -> usize {
         let mut at = self.doc.previous(at);
-        while at > 0 && self.class(at) == 0 {
+        while at > 0 && self.class(at, big) == 0 && !self.empty_line_start(at) {
             at = self.doc.previous(at);
         }
-        let class = self.class(at);
-        while at > 0 && self.class(self.doc.previous(at)) == class {
+        let class = self.class(at, big);
+        while class != 0 && at > 0 && self.class(self.doc.previous(at), big) == class {
             at = self.doc.previous(at);
         }
         at
     }
 
-    /// Final grapheme of the next/current word after byte `at`.
-    pub(super) fn word_end(&self, at: usize) -> usize {
-        let mut at = self.doc.next(at);
-        while at < self.doc.text.len() && self.class(at) == 0 {
-            at = self.doc.next(at);
+    /// Final grapheme of the next or current word after `at`.
+    pub(super) fn word_end(&self, at: usize, big: bool) -> usize {
+        let mut end = self.doc.next(at);
+        while end < self.doc.text.len() && self.class(end, big) == 0 {
+            end = self.doc.next(end);
         }
-        let class = self.class(at);
-        while self.doc.next(at) < self.doc.text.len() && self.class(self.doc.next(at)) == class {
-            at = self.doc.next(at);
+        if end == self.doc.text.len() {
+            let line = self.doc.line_range(self.line_count() - 1);
+            return at.max(self.doc.previous(line.end).max(line.start));
         }
-        at
+        let class = self.class(end, big);
+        while self.doc.next(end) < self.doc.text.len()
+            && self.class(self.doc.next(end), big) == class
+        {
+            end = self.doc.next(end);
+        }
+        end
+    }
+
+    /// Whether `at` is an empty line that counts as a word boundary.
+    fn empty_line_start(&self, at: usize) -> bool {
+        self.doc.text.as_bytes().get(at) == Some(&b'\n')
+            && (at == 0 || self.doc.text.as_bytes()[at - 1] == b'\n')
+    }
+
+    /// Search for `text` with find command `key` and return the `count`-th match.
+    pub(super) fn find_motion(&mut self, key: char, text: &str, count: usize) -> Option<Motion> {
+        if text.graphemes(true).count() != 1 || text == "\n" {
+            return None;
+        }
+        let result = self.find_on_line(key, text, count, false);
+        self.last_find = Some(Find {
+            key,
+            text: text.into(),
+        });
+        result
+    }
+
+    /// Repeat the saved find, optionally in the `reverse` direction.
+    fn repeat_find(&self, reverse: bool, count: usize) -> Option<Motion> {
+        let find = self.last_find.as_ref()?;
+        let key = if reverse {
+            if find.key.is_ascii_uppercase() {
+                find.key.to_ascii_lowercase()
+            } else {
+                find.key.to_ascii_uppercase()
+            }
+        } else {
+            find.key
+        };
+        self.find_on_line(key, &find.text, count, true)
+    }
+
+    /// Scan the current line for a literal grapheme, honoring find/till inclusivity.
+    fn find_on_line(&self, key: char, text: &str, count: usize, repeat: bool) -> Option<Motion> {
+        let at = self.doc.cursor;
+        let range = self.doc.line_range(self.doc.location(at).0);
+        let backward = key.is_ascii_uppercase();
+        let till = matches!(key, 't' | 'T');
+        let target = |p| {
+            if !till {
+                p
+            } else if backward {
+                self.doc.next(p)
+            } else {
+                self.doc.previous(p)
+            }
+        };
+        let matched =
+            |(i, ch): &(usize, &str)| *ch == text && (!repeat || target(range.start + *i) != at);
+        let chars = self.doc.text[range.clone()].grapheme_indices(true);
+        let (byte, _) = if backward {
+            chars
+                .rev()
+                .filter(|(i, _)| range.start + *i < at)
+                .filter(matched)
+                .nth(count - 1)?
+        } else {
+            chars
+                .filter(|(i, _)| range.start + *i > at)
+                .filter(matched)
+                .nth(count - 1)?
+        };
+        Some(Motion::new(
+            target(range.start + byte),
+            if backward {
+                Kind::Exclusive
+            } else {
+                Kind::Inclusive
+            },
+        ))
+    }
+
+    /// Record the current cursor as the origin of a jump.
+    fn record_jump(&mut self) {
+        self.marks.insert('\'', self.doc.cursor);
+        self.marks.insert('`', self.doc.cursor);
+        self.jumps.truncate(self.jump_index);
+        if self.jumps.last() != Some(&self.doc.cursor) {
+            if self.jumps.len() == 100 {
+                self.jumps.remove(0);
+            }
+            self.jumps.push(self.doc.cursor);
+        }
+        self.jump_index = self.jumps.len();
+    }
+
+    /// Move through the buffer's jumplist by `count` entries.
+    pub(super) fn jump_history(&mut self, forward: bool, count: usize) {
+        if self.jumps.is_empty() {
+            return;
+        }
+        if self.jump_index == self.jumps.len() {
+            if forward {
+                return;
+            }
+            self.jumps.push(self.doc.cursor);
+        }
+        self.jump_index = if forward {
+            self.jump_index
+                .saturating_add(count)
+                .min(self.jumps.len() - 1)
+        } else {
+            self.jump_index.saturating_sub(count)
+        };
+        self.set_cursor(self.jumps[self.jump_index]);
+    }
+
+    /// Set the logical left offset and visible `columns` supplied by the viewport.
+    pub fn set_view_width(&mut self, left: usize, columns: usize) {
+        self.view.left = left;
+        self.view.columns = columns.max(1);
+        self.view.horizontal = None;
+    }
+
+    /// Consume the requested horizontal placement after the completed command.
+    pub fn take_horizontal_scroll(&mut self) -> Option<HorizontalScroll> {
+        self.view.horizontal.take()
+    }
+
+    /// Restrict `available` viewport rows to the last explicitly requested height.
+    pub fn view_height(&self, available: usize) -> usize {
+        self.view
+            .height_limit
+            .map_or(available, |rows| rows.min(available))
+    }
+
+    /// Use `rows` as the logical viewport height, bounded by the host's available area.
+    pub(super) fn resize_view_height(&mut self, rows: usize) {
+        self.view.height_limit = Some(rows.max(1).min(self.view.available_rows));
+        self.view.rows = self.view_height(self.view.available_rows);
+        self.view.half_page = self.view.half_page.map(|half| half.min(self.view.rows));
+    }
+
+    /// Scroll visible rows or columns for `key`, with a line or repeat `count` when supplied.
+    pub(super) fn scroll(&mut self, key: &str, count: Option<usize>) -> bool {
+        let height = self.view.rows;
+        let doc_row = self.doc.location(self.doc.cursor).0;
+        let row = self.doc.display_row(doc_row);
+        let last = self.doc.display_rows() - 1;
+        let top = self.view.top.min(last);
+        let full_top = self.doc.display_rows().saturating_sub(height);
+        let margin = self.scroll_margin();
+        let n = count.unwrap_or(1);
+        let (destination, caret) = match key {
+            "zz" | "zt" | "zb" | "zEnter" | "z." | "z-" | "z+" | "z^" => {
+                let last_line = self.line_count() - 1;
+                let caret = if let Some(n) = count {
+                    let target = n.saturating_sub(1).min(last_line);
+                    if target != doc_row {
+                        self.record_jump();
+                    }
+                    self.doc.display_row(target)
+                } else {
+                    let last = self.doc.display_row(last_line);
+                    match key {
+                        "z+" => top.saturating_add(height).min(last),
+                        "z^" => top.saturating_sub(1),
+                        _ => row,
+                    }
+                };
+                let last = self.doc.display_rows() - 1;
+                let bottom_offset = |at: usize| height - 1 - margin.min(last - at);
+                let caret = if key == "z^" && count.is_some() {
+                    caret.saturating_sub(bottom_offset(caret))
+                } else {
+                    caret
+                };
+                let offset = match key {
+                    "zt" | "zEnter" | "z+" => margin,
+                    "zb" | "z-" | "z^" => bottom_offset(caret),
+                    _ => (height - 1) / 2,
+                };
+                (caret.saturating_sub(offset), caret)
+            }
+            "zh" | "zl" | "zH" | "zL" | "zLeft" | "zRight" | "zs" | "ze" => {
+                self.scroll_columns(key, n);
+                return true;
+            }
+            "Ctrl+e" | "Ctrl+y" => {
+                let next = if key == "Ctrl+e" {
+                    top.saturating_add(n).min(last)
+                } else {
+                    top.saturating_sub(n)
+                };
+                let (first, last) = self.viewport_limits(next);
+                (next, row.clamp(first, last))
+            }
+            "Ctrl+u" | "Ctrl+d" => {
+                if let Some(n) = count {
+                    self.view.half_page = Some(n.min(height));
+                }
+                let amount = self.view.half_page.unwrap_or((height / 2).max(1));
+                if key == "Ctrl+d" {
+                    (
+                        top.saturating_add(amount).min(full_top.max(top)),
+                        row.saturating_add(amount),
+                    )
+                } else {
+                    (top.saturating_sub(amount), row.saturating_sub(amount))
+                }
+            }
+            "Ctrl+f" | "Ctrl+b" | "PageUp" | "PageDown" => {
+                let page = if height <= 2 { height } else { height - 2 };
+                let amount = n.saturating_mul(page);
+                if matches!(key, "Ctrl+f" | "PageDown") {
+                    let mut next = top;
+                    for _ in 0..n {
+                        next = if next >= full_top {
+                            last
+                        } else {
+                            next.saturating_add(page).min(last)
+                        };
+                        if next == last {
+                            break;
+                        }
+                    }
+                    (
+                        next,
+                        if next == top {
+                            row
+                        } else {
+                            self.viewport_limits(next).0
+                        },
+                    )
+                } else {
+                    let next = top.saturating_sub(amount);
+                    (
+                        next,
+                        if next == top {
+                            row
+                        } else {
+                            self.viewport_limits(next).1
+                        },
+                    )
+                }
+            }
+            _ => return false,
+        };
+        let caret = self
+            .doc
+            .document_row(caret.min(self.doc.display_rows() - 1));
+        if matches!(key, "zEnter" | "z." | "z-" | "z+" | "z^") {
+            self.set_cursor(self.first_nonblank(caret));
+        } else if caret != doc_row {
+            self.move_to_row(caret);
+        }
+        self.view.top = destination;
+        self.view.changed = true;
+        true
+    }
+
+    /// Handle a nowrap horizontal command `key`, repeated `count` cells or half pages.
+    fn scroll_columns(&mut self, key: &str, count: usize) {
+        let (row, column) = self.doc.location(self.doc.cursor);
+        let width = self.view.columns;
+        let cell_width = display_width(
+            &self.doc.text[self.doc.cursor
+                ..self
+                    .doc
+                    .next(self.doc.cursor)
+                    .min(self.doc.line_range(row).end)],
+            column,
+        )
+        .max(1);
+        let (left, placement) = match key {
+            "zs" | "ze" if self.doc.folded_at(row) => (0, HorizontalScroll::Position(0)),
+            "zs" => (column, HorizontalScroll::CursorLeft),
+            "ze" => (
+                (column + cell_width).saturating_sub(width),
+                HorizontalScroll::CursorRight,
+            ),
+            _ => {
+                let cells = if matches!(key, "zH" | "zL") {
+                    count.saturating_mul(width / 2)
+                } else {
+                    count
+                };
+                let left = if matches!(key, "zh" | "zH" | "zLeft") {
+                    self.view.left.saturating_sub(cells)
+                } else {
+                    self.view.left.saturating_add(cells)
+                };
+                if left != self.view.left {
+                    let end = left.saturating_add(width);
+                    if column < left {
+                        let at = self.doc.offset(row, left);
+                        let (_, start) = self.doc.location(at);
+                        self.set_cursor(if start < left {
+                            self.doc.next(at).min(self.doc.line_range(row).end)
+                        } else {
+                            at
+                        });
+                    } else if column >= end || column + cell_width > end {
+                        let at = self.doc.offset(row, end - 1);
+                        let (_, start) = self.doc.location(at);
+                        let next = self.doc.next(at).min(self.doc.line_range(row).end);
+                        let end_of_cell = start + display_width(&self.doc.text[at..next], start);
+                        self.set_cursor(if end_of_cell > end {
+                            self.doc.previous(at)
+                        } else {
+                            at
+                        });
+                    }
+                }
+                let left = left.min(self.doc.location(self.doc.cursor).1);
+                (left, HorizontalScroll::Position(left))
+            }
+        };
+        self.view.left = left;
+        self.view.horizontal = Some(placement);
+    }
+
+    /// Complete rows of padding requested at each scrollable screen edge.
+    fn scroll_margin(&self) -> usize {
+        3.min((self.view.rows - 1) / 2)
+    }
+
+    /// Legal interval of display rows when the viewport starts at `top`.
+    fn viewport_limits(&self, top: usize) -> (usize, usize) {
+        let last_row = self.doc.display_rows() - 1;
+        let bottom = top.saturating_add(self.view.rows - 1).min(last_row);
+        let margin = self.scroll_margin();
+        let first = if top == 0 { top } else { top + margin }.min(bottom);
+        let last = if bottom == last_row {
+            bottom
+        } else {
+            bottom - margin
+        }
+        .max(first);
+        (first, last)
     }
 }

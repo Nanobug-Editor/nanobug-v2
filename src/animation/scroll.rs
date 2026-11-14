@@ -20,6 +20,8 @@ pub enum ScrollInput {
     Reveal,
     /// Place the viewport at an explicit first cell, retaining the caret.
     Position(usize),
+    /// Place a viewport explicitly, allowing blank cells beyond its content.
+    PositionWithTail(usize),
     /// Scroll by a signed number of cells. Row scrolling can carry the caret along.
     Wheel(isize),
 }
@@ -39,6 +41,8 @@ pub struct GridScroll {
     caret_cell: Option<usize>,
     /// Whether the wheel controls this axis instead of caret navigation.
     wheeling: bool,
+    /// Explicit placement can leave empty space after the last row or column.
+    tail: bool,
 }
 
 impl GridScroll {
@@ -54,13 +58,19 @@ impl GridScroll {
         now: f64,
     ) -> (Option<usize>, f32) {
         let height = height.max(1);
-        let maximum = rows.saturating_sub(height);
+        let full_top = rows.saturating_sub(height);
+        let maximum = match input {
+            ScrollInput::PositionWithTail(top) => full_top.max(top.min(rows.saturating_sub(1))),
+            ScrollInput::Position(_) => full_top,
+            _ if self.tail => full_top.max(self.target.min(rows.saturating_sub(1))),
+            _ => full_top,
+        };
         let caret = caret.filter(|_| rows > 0).map(|row| row.min(rows - 1));
         let before = self.spring.value;
         let previous_target = self.target;
         let target = match input {
             ScrollInput::Advance => self.target,
-            ScrollInput::Position(top) => {
+            ScrollInput::Position(top) | ScrollInput::PositionWithTail(top) => {
                 self.wheeling = false;
                 top
             }
@@ -84,6 +94,7 @@ impl GridScroll {
             .map(|row| (row.saturating_sub(height - 1), row.min(maximum)));
         let target = limits.map_or(target, |(first, last)| target.clamp(first, last));
         self.request(target, maximum, now);
+        self.tail = self.target > full_top;
 
         if height == 1 && self.wheeling {
             self.spring.snap(self.target as f64);
@@ -117,12 +128,19 @@ impl GridScroll {
         now: f64,
     ) -> f32 {
         let width = width.max(1);
-        let maximum = columns.map_or(self.maximum, |columns| columns.saturating_sub(width));
+        let full_maximum = columns.map_or(self.maximum, |columns| columns.saturating_sub(width));
+        let maximum = match input {
+            ScrollInput::PositionWithTail(first) => full_maximum.max(first),
+            _ if self.tail && !matches!(input, ScrollInput::Position(_)) => {
+                full_maximum.max(self.target)
+            }
+            _ => full_maximum,
+        };
         let before = self.spring.value;
         let previous_target = self.target;
         let target = match input {
             ScrollInput::Advance => self.target,
-            ScrollInput::Position(first) => {
+            ScrollInput::Position(first) | ScrollInput::PositionWithTail(first) => {
                 self.wheeling = false;
                 first.min(maximum)
             }
@@ -150,6 +168,13 @@ impl GridScroll {
         });
         let target = limits.map_or(target, |(first, last)| target.clamp(first, last));
         self.request(target, maximum.max(target), now);
+        self.tail = match input {
+            ScrollInput::Position(_) => false,
+            ScrollInput::Reveal | ScrollInput::PositionWithTail(_) if columns.is_some() => {
+                self.target > full_maximum
+            }
+            _ => self.tail,
+        };
         let delta = (self.spring.value - before) as f32;
         self.keep_caret_visible(limits);
         self.limit_far_scroll(previous_target, width);

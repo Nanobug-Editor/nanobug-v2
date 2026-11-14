@@ -125,7 +125,7 @@ impl Engine {
         }
         let mut ready = Vec::new();
         for (namespace, slots) in &self.credential_events.slots {
-            let Some(runtime) = self.runtimes.get(namespace) else {
+            let Some(runtime) = self.lifecycle.runtimes.get(namespace) else {
                 continue;
             };
             for (instance, live) in &runtime.instances {
@@ -149,7 +149,7 @@ impl Engine {
                     namespace: namespace.clone(),
                     instance: instance.clone(),
                 };
-                if self.wanted.contains_key(&key) && !self.is_draining(instance.project) {
+                if self.lifecycle.wanted.contains_key(&key) && !self.is_draining(instance.project) {
                     ready.push((
                         key,
                         CredentialChange {
@@ -204,9 +204,14 @@ impl Engine {
             self.event(ResultEvent::Service(owner, generation, result));
         } else if private {
             self.finish_service(&owner.namespace);
-            let current = self.runtimes.get(&owner.namespace).is_some_and(|runtime| {
-                runtime.generation == generation && runtime.worker.is_some()
-            }) && self.wanted.contains_key(&owner)
+            let current = self
+                .lifecycle
+                .runtimes
+                .get(&owner.namespace)
+                .is_some_and(|runtime| {
+                    runtime.generation == generation && runtime.worker.is_some()
+                })
+                && self.lifecycle.wanted.contains_key(&owner)
                 && self.can_use_credential(&owner.namespace, &slot);
             if current {
                 self.invoke_with_kind(
@@ -239,7 +244,7 @@ impl Engine {
         rejected: bool,
     ) {
         if self.credential_revision(&key.namespace, &change.slot) != change.revision
-            || !self.wanted.contains_key(key)
+            || !self.lifecycle.wanted.contains_key(key)
         {
             return;
         }

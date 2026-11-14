@@ -51,9 +51,9 @@ impl Workspace {
         self.hovered_controls = None;
         self.resizing = false;
         if let Some(project) = self.projects.active_project_mut() {
-            project.editor.dragging = None;
+            project.editor.stop_drag();
             if let Some(manager) = &mut project.manager {
-                manager.click = None;
+                manager.clear_click();
             }
         }
         self.repaint([ScrollInput::Advance; 3], window, cx);
@@ -191,26 +191,30 @@ impl Workspace {
         true
     }
 
-    /// Apply `choice` if present and repaint `window` through `cx` with pane input restored.
-    fn finish_language_picker(
+    /// Apply and save a confirmed `choice`, then repaint `window` through `cx` with pane input restored.
+    pub(super) fn finish_language_picker(
         &mut self,
         choice: Option<Locale>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.language_selection = None;
-        if let Some(locale) = choice
-            && i18n::set_locale(locale)
-        {
-            // Status feedback is already formatted in the previous language.
-            if let Some(page) = self.projects.start_mut() {
-                page.status.clear();
-            }
-            for project in self.projects.iter_mut() {
-                project.status.clear();
-                for buffer in &mut project.editor.buffers {
-                    buffer.vim.message.clear();
+        if let Some(locale) = choice {
+            if i18n::set_locale(locale) {
+                // Status feedback is already formatted in the previous language.
+                if let Some(page) = self.projects.start_mut() {
+                    page.status.clear();
                 }
+                for project in self.projects.iter_mut() {
+                    project.status.clear();
+                    project.editor.clear_messages();
+                }
+            }
+            if let Err(error) = i18n::save_locale(locale) {
+                self.set_status(i18n::format(
+                    "language.save_failed",
+                    &[("error", &format_args!("{error:#}"))],
+                ));
             }
         }
         self.repaint([ScrollInput::Advance; 3], window, cx);

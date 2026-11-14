@@ -4,11 +4,11 @@ use super::{Workspace, projects::WorkspaceTabs};
 use crate::{
     grid::{
         mnemonic::Mnemonic,
-        render::{Frame, Rect},
+        render::{Frame, MessageLevel, Rect},
     },
     ui::{
         text::TextSpacing,
-        theme::{ACCENT, GOLD, MUTED, TEXT},
+        theme::{ACCENT, MUTED, TEXT},
     },
 };
 use gpui::{Context, KeyDownEvent, Modifiers, MouseDownEvent, Window};
@@ -107,8 +107,12 @@ fn click_choice(
 pub(super) enum CloseTarget {
     /// The editor pane in the selected project.
     Editor,
-    /// The selected project tab.
-    Project,
+    /// Close the active page's file label with this stable buffer identity.
+    Buffer(u64),
+    /// The selected tab, including start pages.
+    Tab,
+    /// All workspace tabs, replaced by a fresh start page.
+    AllTabs,
     /// The native window and all its projects.
     Quit,
 }
@@ -125,7 +129,7 @@ struct PendingBuffer {
 impl PendingBuffer {
     /// Read the document for this queued buffer in `projects`.
     fn document(self, projects: &WorkspaceTabs) -> &Document {
-        &projects.project(self.tab).editor.buffers[self.index]
+        &projects.project(self.tab).editor.buffers()[self.index]
             .vim
             .doc
     }
@@ -151,16 +155,29 @@ impl EditorClose {
         let active = projects
             .active_project()
             .map(|project| (projects.selected, project));
-        let others = projects
-            .indexed()
-            .filter(|(tab, _)| target == CloseTarget::Quit && *tab != projects.selected);
+        let others = projects.indexed().filter(|(tab, _)| {
+            matches!(target, CloseTarget::AllTabs | CloseTarget::Quit) && *tab != projects.selected
+        });
         let mut pending = VecDeque::new();
         for (tab, project) in active.into_iter().chain(others) {
             let editor = &project.editor;
-            let order = std::iter::once(editor.active)
-                .chain((0..editor.buffers.len()).filter(|&index| index != editor.active));
+            if let CloseTarget::Buffer(id) = target {
+                if let Some(index) = editor.buffer_index(id)
+                    && !editor.buffer_in_other_tabpage(id)
+                    && editor.buffers()[index].vim.doc.modified()
+                {
+                    pending.push_back(PendingBuffer { tab, index });
+                }
+                continue;
+            }
+            // Hiding a pane in a multi-page project retains its documents and all other views.
+            if target == CloseTarget::Editor && editor.tabpage_count() > 1 {
+                continue;
+            }
+            let order = std::iter::once(editor.active_index())
+                .chain((0..editor.buffers().len()).filter(|&index| index != editor.active_index()));
             pending.extend(order.filter_map(|index| {
-                editor.buffers[index]
+                editor.buffers()[index]
                     .vim
                     .doc
                     .modified()
@@ -226,11 +243,14 @@ impl EditorClose {
         if !self.pending.is_empty() {
             return false;
         }
-        for buffer in self.discarded.drain(..) {
-            projects
-                .project_mut(buffer.tab)
-                .editor
-                .discard(buffer.index);
+        // The buffer close itself removes the draft after confirmation.
+        if !matches!(self.target, CloseTarget::Buffer(_)) {
+            for buffer in self.discarded.drain(..) {
+                projects
+                    .project_mut(buffer.tab)
+                    .editor
+                    .discard(buffer.index);
+            }
         }
         true
     }
@@ -247,7 +267,7 @@ fn save_buffer(
         if projects.ordered().any(|project| {
             project
                 .editor
-                .buffers
+                .buffers()
                 .iter()
                 .any(|buffer| buffer.vim.doc.path.as_ref() == Some(&path))
         }) {
@@ -257,7 +277,7 @@ fn save_buffer(
     let save_as = path.is_some();
     projects.save_buffer(buffer.tab, buffer.index, path)?;
     if save_as && let Some(manager) = &mut projects.project_mut(buffer.tab).manager {
-        let _ = manager.tree.refresh();
+        let _ = manager.refresh();
     }
     Ok(())
 }
@@ -284,6 +304,7 @@ impl Workspace {
             return false;
         };
         self.editor_close = Some(close);
+        self.remove_recent_project = None;
         self.help.close();
         self.language_selection = None;
         self.prefix = None;
@@ -291,10 +312,10 @@ impl Workspace {
         self.hovered_controls = None;
         if let Some(project) = self.projects.active_project_mut() {
             if let Some(manager) = &mut project.manager {
-                manager.paste_timer = None;
+                manager.cancel_pending_undo();
             }
-            project.editor.dragging = None;
-            project.editor.composition.clear();
+            project.editor.stop_drag();
+            project.editor.composition_mut().clear();
         }
         true
     }
@@ -325,10 +346,18 @@ impl Workspace {
         let spacing = &self.spacing;
         let slot = 2..area.w - 2;
         let mut frame = Frame::new(area.w, area.h);
-        frame.border(i18n::text("editor_close.title"), true, false, spacing);
-        if close.target != CloseTarget::Editor {
+        let title = i18n::text("editor_close.title");
+        let details_row = if close.error.is_some() {
+            frame.message_border(MessageLevel::Error, spacing);
+            frame.label(1, slot.clone(), title, TEXT, spacing);
+            2
+        } else {
+            frame.border(title, true, false, spacing);
+            1
+        };
+        if !matches!(close.target, CloseTarget::Editor | CloseTarget::Buffer(_)) {
             frame.label(
-                1,
+                details_row,
                 slot.clone(),
                 &spacing.ellipsize(&project.name(), slot.len()),
                 MUTED,
@@ -336,18 +365,19 @@ impl Workspace {
             );
         }
         frame.label(
-            2,
+            details_row + 1,
             slot.clone(),
             &spacing.ellipsize(&filename, slot.len()),
             TEXT,
             spacing,
         );
         if let Some(error) = &close.error {
+            let (_, error_text) = MessageLevel::Error.colors();
             frame.label(
-                3,
+                details_row + 2,
                 slot.clone(),
                 &spacing.ellipsize(error, slot.len()),
-                GOLD,
+                error_text,
                 spacing,
             );
         }
@@ -409,6 +439,11 @@ impl Workspace {
         {
             self.resolve_editor_close(choice, None, window, cx);
         }
+    }
+
+    /// Cancel the pending close in `window` through `cx`, retaining unconfirmed edits.
+    pub(super) fn cancel_editor_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.choose_editor_close(Choice::Cancel, window, cx);
     }
 
     /// Select a path in `window` through `cx` and resume `choice` only if a path is supplied.

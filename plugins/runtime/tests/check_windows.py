@@ -302,7 +302,13 @@ def smoke(folder, await_focus=0, pinyin=False, grid=False, caret=False, draft_cr
     project.mkdir(exist_ok=True)
     (project / "README.md").write_text("ordinary editor fixture\n", encoding="utf-8")
     kind = "grid" if grid else "panel"
-    archive = folder / f"workspace-{kind}.zip"
+    bundles = project / "bundles"
+    bundles.mkdir(exist_ok=True)
+    archive = bundles / ("\u4f60.ZIP" if pinyin else f"workspace-{kind}.ZIP")
+    archive.with_suffix(".txt").write_text("not an archive\n", encoding="utf-8")
+    if pinyin:
+        # This sorts first so installing the Chinese archive requires the Pinyin filter.
+        (bundles / "first.ZIP").write_text("not an archive\n", encoding="utf-8")
     demo = ROOT / "plugins/sdk/examples"
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
         output.write(demo / "detect.js", "detect.js")
@@ -381,17 +387,28 @@ def smoke(folder, await_focus=0, pinyin=False, grid=False, caret=False, draft_cr
         native.key(hwnd, 0x1B)
         wait_event(trace, "manager_input", lambda value: not value["prompt"] and value["search_bytes"] == 0)
         native.key(hwnd, 0x33)
+        tab = wait_event(trace, "manager_input", lambda value: value["open"] and value["page"] == 2)
         native.key(hwnd, 0x0D)
+        picker = wait_event(trace, "manager_input", lambda value: not value["open"], after=tab["at_us"])
+        native.key(hwnd, 0x1B)
+        restored = wait_event(trace, "manager_input", lambda value: value["open"] and value["page"] == 2,
+                              after=picker["at_us"])
+        native.key(hwnd, 0x0D)
+        picker = wait_event(trace, "manager_input", lambda value: not value["open"], after=restored["at_us"])
+        time.sleep(0.2)  # Let the picker read the fixture project before entering its only directory.
+        native.key(hwnd, 0x0D)
+        time.sleep(0.2)
         if pinyin:
-            prompt = wait_event(trace, "manager_input", lambda value: value["prompt"] and value["page"] == 2)
-            cancelled = cancel_prompt(compose(False, after=prompt["at_us"]), 0x0D)
-            wait_event(trace, "manager_input", lambda value: value["prompt"] and value["page"] == 2,
-                       after=cancelled["at_us"])
-        native.text(hwnd, str(archive))
+            native.key(hwnd, 0x46)  # f opens the file browser's native filter.
+            native.key(hwnd, 0x4E)
+            native.key(hwnd, 0x49)
+            native.key(hwnd, 0x20)  # Commit 你 with Microsoft Pinyin.
+            native.key(hwnd, 0x0D)  # Apply the filter. The next Enter selects the file.
         native.key(hwnd, 0x0D)
-        wait_event(trace, "session_update", lambda value: value["review"])
+        review = wait_event(trace, "session_update", lambda value: value["review"], after=picker["at_us"])
         native.key(hwnd, 0x0D)
-        installed = wait_event(trace, "session_update", lambda value: value["installed"] == 1 and value["surfaces"] == 1)
+        installed = wait_event(trace, "session_update", lambda value: value["installed"] == 1 and value["surfaces"] == 1,
+                               after=review["at_us"])
         native.key(hwnd, 0x31)
         native.key(hwnd, 0xBF)
         search = wait_event(trace, "manager_input", lambda value: value["prompt"] and value["page"] == 0,

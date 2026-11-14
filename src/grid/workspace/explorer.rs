@@ -51,7 +51,7 @@ impl Workspace {
                         .active()
                         .manager
                         .as_ref()?
-                        .tree
+                        .tree()
                         .selected
                         .saturating_sub(inset),
                 ));
@@ -75,8 +75,11 @@ impl Workspace {
                 self.prefix = Some(PendingPrefix::Manager(prefix));
                 if prefix == 'z' {
                     let delay = cx.background_executor().timer(Duration::from_millis(350));
-                    self.projects.active_mut().manager.as_mut()?.paste_timer =
-                        Some(cx.spawn_in(window, async move |weak, cx| {
+                    self.projects
+                        .active_mut()
+                        .manager
+                        .as_mut()?
+                        .schedule_undo(cx.spawn_in(window, async move |weak, cx| {
                             delay.await;
                             let _ = cx.update(|window, cx| {
                                 let _ = weak.update(cx, |workspace, cx| {

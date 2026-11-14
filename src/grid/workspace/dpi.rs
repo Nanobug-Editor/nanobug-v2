@@ -53,7 +53,7 @@ impl Workspace {
         }
         self.display_scale = scale;
         self.last_cursor_space = None;
-        self.help.invalidate_backdrop();
+        self.popup_backdrop.invalidate();
         self.refresh_grid_appearance(window, cx, true);
         true
     }
@@ -76,7 +76,7 @@ impl Workspace {
             cx.set_global(updated);
         }
         if current != updated || layout_changed {
-            self.help.invalidate_backdrop();
+            self.popup_backdrop.invalidate();
             self.invalidate_plugin_appearance();
             if layout_changed {
                 self.last_cursor_space = None;
@@ -85,6 +85,7 @@ impl Workspace {
             if layout_changed {
                 self.sync(window, cx);
             } else {
+                self.refresh_panels(cx);
                 self.update_cursor(window, cx);
                 cx.notify();
             }

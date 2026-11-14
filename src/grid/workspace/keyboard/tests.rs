@@ -15,7 +15,15 @@ fn shell_shortcut(
         Some(focus),
         mode,
         hidden_pane,
-        true,
+        (false, false),
+        LeaderAvailability {
+            manager: true,
+            help: true,
+            close_only: false,
+            choosing_file: false,
+            grid_window: true,
+            tabs: true,
+        },
         prefix,
         &key,
         normal_character(&key).as_deref(),
@@ -46,9 +54,9 @@ fn normal_window_keys_focus_the_directional_pane() {
     }
 }
 
-/// The default leader is plain Space, with e opening Explorer in Normal mode.
+/// The default leader is plain Space, with e toggling Explorer from command surfaces.
 #[test]
-fn explorer_open_requires_the_normal_mode_leader() {
+fn explorer_toggle_requires_the_normal_mode_leader() {
     let command =
         |mode, prefix, key| shell_shortcut(Focus::Editor, mode, Some(Focus::Manager), prefix, key);
     let leader = Some(PendingPrefix::Leader(LeaderPrefix::ROOT));
@@ -58,7 +66,7 @@ fn explorer_open_requires_the_normal_mode_leader() {
     );
     assert_eq!(
         command(Mode::Normal, leader, "e"),
-        Some(ShellShortcut::Select(Focus::Manager))
+        Some(ShellShortcut::ToggleManager)
     );
     assert_eq!(command(Mode::Normal, None, "e"), None);
     assert_eq!(
@@ -68,23 +76,28 @@ fn explorer_open_requires_the_normal_mode_leader() {
     for key in ["ctrl-space", "shift-space"] {
         assert_eq!(command(Mode::Normal, None, key), None);
     }
-    for key in ["ctrl-e", "shift-e"] {
+    for key in ["ctrl-e", "ctrl-shift-e"] {
         assert_eq!(command(Mode::Normal, leader, key), None);
     }
     for mode in [
         Mode::Insert,
         Mode::Visual,
         Mode::VisualLine,
+        Mode::VisualBlock,
         Mode::Command,
         Mode::Search,
     ] {
-        assert_eq!(command(mode, None, "space"), None);
+        assert_eq!(
+            command(mode, None, "space"),
+            matches!(mode, Mode::Visual | Mode::VisualLine | Mode::VisualBlock)
+                .then_some(ShellShortcut::AwaitLeader(LeaderPrefix::ROOT))
+        );
         assert_eq!(command(mode, leader, "e"), None);
         assert_eq!(command(mode, None, "ctrl-h"), None);
     }
     assert_eq!(
         shell_shortcut(Focus::Manager, Mode::Insert, None, leader, "e"),
-        Some(ShellShortcut::Select(Focus::Manager))
+        Some(ShellShortcut::ToggleManager)
     );
 }
 
@@ -113,7 +126,7 @@ fn plugin_manager_requires_space_then_shift_p_outside_text_input() {
 #[test]
 fn leader_language_picker_requires_uppercase_l() {
     let leader = Some(PendingPrefix::Leader(LeaderPrefix::ROOT));
-    let subgroup = Some(PendingPrefix::Leader(LeaderPrefix("q")));
+    let subgroup = Some(PendingPrefix::Leader(LeaderPrefix("p")));
     for (focus, mode) in [
         (Focus::Editor, Mode::Normal),
         (Focus::Manager, Mode::Insert),
@@ -148,7 +161,15 @@ fn leader_letter_case_requires_shift() {
             Some(Focus::Editor),
             Mode::Normal,
             None,
-            true,
+            (false, false),
+            LeaderAvailability {
+                manager: true,
+                help: true,
+                close_only: false,
+                choosing_file: false,
+                grid_window: true,
+                tabs: true,
+            },
             leader,
             &key,
             normal_character(&key).as_deref(),
@@ -159,58 +180,129 @@ fn leader_letter_case_requires_shift() {
         resolve("l", "l", true),
         Some(ShellShortcut::OpenLanguagePicker)
     );
-    assert_eq!(
-        resolve("e", "E", false),
-        Some(ShellShortcut::Select(Focus::Manager))
-    );
-    assert_eq!(resolve("e", "e", true), None);
+    assert_eq!(resolve("e", "E", false), Some(ShellShortcut::ToggleManager));
+    assert_eq!(resolve("e", "e", true), Some(ShellShortcut::OpenFilePicker));
 }
 
-/// Both panes route q to the close group only after the leader has started.
+/// Question mark opens help only after the root leader and on a surface with help.
 #[test]
-fn leader_quit_resolves_only_the_project_close_sequences() {
+fn question_mark_requires_the_leader_and_a_help_target() {
     let leader = Some(PendingPrefix::Leader(LeaderPrefix::ROOT));
-    let quit = Some(PendingPrefix::Leader(LeaderPrefix("q")));
+    for focus in [Focus::Editor, Focus::Manager] {
+        for key in ["?", "shift-/"] {
+            assert_eq!(shell_shortcut(focus, Mode::Normal, None, None, key), None);
+            assert_eq!(
+                shell_shortcut(focus, Mode::Normal, None, leader, key),
+                Some(ShellShortcut::OpenHelp)
+            );
+        }
+    }
+    assert_eq!(
+        shell_shortcut(Focus::Editor, Mode::Insert, None, leader, "shift-/"),
+        None
+    );
+
+    let key = Keystroke::parse("shift-/").unwrap();
+    for (help, expected) in [(false, None), (true, Some(ShellShortcut::OpenHelp))] {
+        assert_eq!(
+            ShellShortcut::resolve(
+                None,
+                Mode::Normal,
+                None,
+                (false, false),
+                LeaderAvailability {
+                    manager: false,
+                    help,
+                    close_only: false,
+                    choosing_file: false,
+                    grid_window: help,
+                    tabs: true,
+                },
+                leader,
+                &key,
+                normal_character(&key).as_deref(),
+            ),
+            expected
+        );
+    }
+}
+
+/// Both panes route q, x and X to separate close scopes after the leader.
+#[test]
+fn leader_close_resolves_grid_and_tab_actions() {
+    let leader = Some(PendingPrefix::Leader(LeaderPrefix::ROOT));
     for (focus, mode) in [
         (Focus::Editor, Mode::Normal),
+        (Focus::Editor, Mode::Visual),
+        (Focus::Editor, Mode::VisualLine),
+        (Focus::Editor, Mode::VisualBlock),
         (Focus::Manager, Mode::Insert),
     ] {
         let command = |prefix, key| shell_shortcut(focus, mode, None, prefix, key);
+        assert_eq!(command(None, "x"), None);
         assert_eq!(command(None, "q"), None);
+        assert_eq!(command(leader, "q"), Some(ShellShortcut::CloseFocused));
         assert_eq!(command(leader, "a"), None);
         assert_eq!(
-            command(leader, "q"),
-            Some(ShellShortcut::AwaitLeader(LeaderPrefix("q")))
+            command(leader, "x"),
+            Some(ShellShortcut::CloseTabs(CloseTarget::Tab))
         );
         assert_eq!(
-            command(quit, "q"),
-            Some(ShellShortcut::Close(CloseTarget::Project))
+            command(leader, "shift-x"),
+            Some(ShellShortcut::CloseTabs(CloseTarget::AllTabs))
         );
-        assert_eq!(
-            command(quit, "a"),
-            Some(ShellShortcut::Close(CloseTarget::Quit))
-        );
-        for key in ["ctrl-q", "shift-a", "e"] {
-            assert_eq!(command(quit, key), None);
-        }
+        assert_eq!(command(leader, "ctrl-x"), None);
         assert_eq!(command(None, "escape"), None);
-        for prefix in [leader, quit] {
-            assert_eq!(command(prefix, "escape"), Some(ShellShortcut::CancelLeader));
-        }
+        assert_eq!(command(leader, "escape"), Some(ShellShortcut::CancelLeader));
     }
     for mode in [Mode::Insert, Mode::Command, Mode::Search] {
-        for (prefix, key) in [(leader, "q"), (quit, "q"), (quit, "a")] {
-            assert_eq!(shell_shortcut(Focus::Editor, mode, None, prefix, key), None);
+        for key in ["q", "x", "shift-x"] {
+            assert_eq!(shell_shortcut(Focus::Editor, mode, None, leader, key), None);
         }
     }
 }
 
-/// The project group can add a start page and the quit group works on every command surface.
+/// A grouped popup exposes one close action and cannot close the workspace underneath it.
 #[test]
-fn project_and_quit_groups_resolve_in_panes_and_on_the_start_page() {
+fn popup_leader_only_closes_the_popup() {
+    let availability = LeaderAvailability {
+        manager: true,
+        help: true,
+        close_only: true,
+        choosing_file: false,
+        grid_window: true,
+        tabs: false,
+    };
+    let command = |key| {
+        let key = Keystroke::parse(key).unwrap();
+        ShellShortcut::resolve(
+            None,
+            Mode::Normal,
+            None,
+            (false, false),
+            availability,
+            Some(PendingPrefix::Leader(LeaderPrefix::ROOT)),
+            &key,
+            normal_character(&key).as_deref(),
+        )
+    };
+    assert_eq!(command("q"), Some(ShellShortcut::CloseFocused));
+    assert_eq!(command("x"), None);
+    assert_eq!(command("shift-x"), None);
+    assert_eq!(
+        LeaderPrefix::ROOT
+            .bindings(availability)
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>(),
+        ["q"]
+    );
+}
+
+/// Start pages offer close-all through the leader, while panes also offer q and x.
+#[test]
+fn project_and_close_actions_resolve_in_panes_and_on_the_start_page() {
     let root = Some(PendingPrefix::Leader(LeaderPrefix::ROOT));
     let project = Some(PendingPrefix::Leader(LeaderPrefix("p")));
-    let quit = Some(PendingPrefix::Leader(LeaderPrefix("q")));
     for focus in [Some(Focus::Editor), Some(Focus::Manager), None] {
         let command = |prefix, key| {
             let key = Keystroke::parse(key).unwrap();
@@ -218,7 +310,15 @@ fn project_and_quit_groups_resolve_in_panes_and_on_the_start_page() {
                 focus,
                 Mode::Normal,
                 None,
-                focus.is_some(),
+                (false, false),
+                LeaderAvailability {
+                    manager: focus.is_some(),
+                    help: focus.is_some(),
+                    close_only: false,
+                    choosing_file: false,
+                    grid_window: focus.is_some(),
+                    tabs: true,
+                },
                 prefix,
                 &key,
                 normal_character(&key).as_deref(),
@@ -231,16 +331,21 @@ fn project_and_quit_groups_resolve_in_panes_and_on_the_start_page() {
         assert_eq!(command(project, "a"), Some(ShellShortcut::OpenStart));
         assert_eq!(command(project, "q"), None);
         assert_eq!(
+            command(root, "shift-e"),
+            Some(ShellShortcut::OpenFilePicker)
+        );
+        assert_eq!(command(root, "f"), None);
+        assert_eq!(
             command(root, "q"),
-            Some(ShellShortcut::AwaitLeader(LeaderPrefix("q")))
+            focus.map(|_| ShellShortcut::CloseFocused)
         );
         assert_eq!(
-            command(quit, "a"),
-            Some(ShellShortcut::Close(CloseTarget::Quit))
+            command(root, "x"),
+            focus.map(|_| ShellShortcut::CloseTabs(CloseTarget::Tab))
         );
         assert_eq!(
-            command(quit, "q"),
-            focus.map(|_| ShellShortcut::Close(CloseTarget::Project))
+            command(root, "shift-x"),
+            Some(ShellShortcut::CloseTabs(CloseTarget::AllTabs))
         );
     }
 }
@@ -248,13 +353,22 @@ fn project_and_quit_groups_resolve_in_panes_and_on_the_start_page() {
 /// An editor-only tab shares file and close shortcuts without offering Explorer.
 #[test]
 fn standalone_editor_omits_explorer_bindings() {
+    let availability = LeaderAvailability {
+        manager: false,
+        help: true,
+        close_only: false,
+        choosing_file: false,
+        grid_window: true,
+        tabs: true,
+    };
     let command = |prefix, key| {
         let key = Keystroke::parse(key).unwrap();
         ShellShortcut::resolve(
             Some(Focus::Editor),
             Mode::Normal,
             None,
-            false,
+            (false, false),
+            availability,
             prefix,
             &key,
             normal_character(&key).as_deref(),
@@ -263,14 +377,19 @@ fn standalone_editor_omits_explorer_bindings() {
     let leader = Some(PendingPrefix::Leader(LeaderPrefix::ROOT));
     assert_eq!(command(leader, "e"), None);
     assert_eq!(command(None, "ctrl-h"), Some(ShellShortcut::Stay));
-    assert_eq!(command(leader, "f"), Some(ShellShortcut::OpenFilePicker));
     assert_eq!(
-        command(Some(PendingPrefix::Leader(LeaderPrefix("q"))), "q"),
-        Some(ShellShortcut::Close(CloseTarget::Project)),
+        command(leader, "shift-e"),
+        Some(ShellShortcut::OpenFilePicker)
+    );
+    assert_eq!(command(None, "shift-e"), None);
+    assert_eq!(command(leader, "q"), Some(ShellShortcut::CloseFocused));
+    assert_eq!(
+        command(leader, "x"),
+        Some(ShellShortcut::CloseTabs(CloseTarget::Tab))
     );
     assert!(
         !LeaderPrefix::ROOT
-            .bindings(true, false)
+            .bindings(availability)
             .any(|(key, _)| key == "e")
     );
 }
@@ -280,7 +399,7 @@ fn standalone_editor_omits_explorer_bindings() {
 fn backspace_returns_to_the_parent_leader_group() {
     let command = |prefix| shell_shortcut(Focus::Editor, Mode::Normal, None, prefix, "backspace");
     assert_eq!(
-        command(Some(PendingPrefix::Leader(LeaderPrefix("q")))),
+        command(Some(PendingPrefix::Leader(LeaderPrefix("p")))),
         Some(ShellShortcut::AwaitLeader(LeaderPrefix::ROOT))
     );
     assert_eq!(
@@ -290,25 +409,20 @@ fn backspace_returns_to_the_parent_leader_group() {
     assert_eq!(command(None), None);
 }
 
-/// Each pane recognizes only its own close gesture and leaves plain Escape to Vim.
+/// The editor's close gesture leaves plain Escape and macro keys to the modal editor.
 #[test]
-fn pane_close_keys_are_window_specific() {
-    for (binding, manager, editor) in [
-        ("q", true, false),
-        ("alt-escape", false, true),
-        ("escape", false, false),
-        ("shift-x", false, false),
-        ("shift-q", false, false),
-        ("ctrl-q", false, false),
-        ("ctrl-alt-escape", false, false),
-        ("alt-shift-escape", false, false),
+fn editor_close_keys_leave_normal_commands_to_vim() {
+    for (binding, editor) in [
+        ("q", false),
+        ("alt-escape", true),
+        ("escape", false),
+        ("shift-x", false),
+        ("shift-q", false),
+        ("ctrl-q", false),
+        ("ctrl-alt-escape", false),
+        ("alt-shift-escape", false),
     ] {
         let key = Keystroke::parse(binding).unwrap();
-        assert_eq!(
-            ManagerWindow::matches_close_key(normal_character(&key).as_deref()),
-            manager,
-            "Explorer: {binding}"
-        );
         assert_eq!(EditorWindow::matches_close_key(&key), editor, "{binding}");
     }
 }

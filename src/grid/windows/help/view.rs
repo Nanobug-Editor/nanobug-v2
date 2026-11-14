@@ -6,24 +6,19 @@ use super::{
 };
 use crate::{
     grid::{
-        render::{Frame, LabelStyle, Metrics, Rect},
+        render::{CursorCell, Frame, Metrics, PromptRow, Rect, SEARCH_ICON},
         windows::WindowFrame,
     },
     ui::{
-        icons::Icon,
         text::{TextSpacing, UNITS_PER_COLUMN},
         theme::{ACCENT, GOLD, MUTED, SELECTION, TEXT},
     },
 };
 
-use gpui::{Bounds, Pixels, point, px, size};
+use gpui::{AnyElement, Bounds, Pixels, point, px, size};
 use nanobug::i18n;
 use std::ops::Range;
 
-/// Distance from the character border's centerline to the rounded cutout, in logical pixels.
-pub(super) const HELP_BORDER_GAP: f32 = 12.;
-/// Radius of the shortcut popup's outer corners, in logical pixels.
-pub(super) const HELP_CORNER_RADIUS: f32 = 14.;
 /// One grid row per horizontal border.
 const BORDER_ROWS: usize = 2;
 /// Lower the content to give the title space above the first full-height selection.
@@ -32,86 +27,6 @@ const CONTENT_OFFSET_Y: f32 = 4.;
 const SEARCH_OFFSET_Y: f32 = 2.;
 /// First text column after the search icon.
 const SEARCH_TEXT_COLUMN: usize = 2;
-/// Magnifying glass drawn in the filter status row.
-const SEARCH_ICON: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/assets/icons/search.svg"
-));
-/// Apply filter with Enter.
-const SEARCH_APPLY: SearchButton = SearchButton {
-    prefix: &[
-        ("[", LabelStyle::Text),
-        ("✓", LabelStyle::Symbol),
-        (" ", LabelStyle::Text),
-    ],
-    key: "Enter",
-};
-/// Cancel filter input with Escape.
-const SEARCH_CANCEL: SearchButton = SearchButton {
-    prefix: &[("[✕ ", LabelStyle::Text)],
-    key: "Esc",
-};
-
-/// One bracketed text button with an underlined key name.
-struct SearchButton {
-    /// Styled spans for the opening bracket, action symbol and separating space.
-    prefix: &'static [(&'static str, LabelStyle)],
-    /// Visible keyboard key name.
-    key: &'static str,
-}
-
-impl SearchButton {
-    /// Return the button width including its closing bracket using `spacing`.
-    fn columns(&self, spacing: &TextSpacing) -> usize {
-        let prefix: usize = self
-            .prefix
-            .iter()
-            .map(|(text, _)| spacing.columns(text))
-            .sum();
-        prefix + spacing.columns(self.key) + 1
-    }
-
-    /// Draw this button in `color` at `slot` on the search `frame`, using measured `spacing`.
-    fn draw(&self, frame: &mut Frame, slot: Range<usize>, color: u32, spacing: &TextSpacing) {
-        let mut start = slot.start;
-        for &(text, style) in self.prefix {
-            start = frame.styled_label(0, start..slot.end, text, color, spacing, style);
-        }
-        let end = frame.styled_label(
-            0,
-            start..slot.end,
-            self.key,
-            color,
-            spacing,
-            LabelStyle::Key,
-        );
-        frame.label(0, end..slot.end, "]", color, spacing);
-    }
-}
-
-/// Search fields in columns relative to the single search row.
-struct SearchSlots {
-    /// Query after the magnifying glass, with room for the caret.
-    query: Range<usize>,
-    /// Apply button at the right of the query.
-    apply: Range<usize>,
-    /// Cancel button after Apply.
-    cancel: Range<usize>,
-}
-
-impl SearchSlots {
-    /// Fit the two buttons at the right of `width` columns using measured `spacing`.
-    fn new(width: usize, spacing: &TextSpacing) -> Self {
-        let cancel_start = width.saturating_sub(SEARCH_CANCEL.columns(spacing));
-        let apply_end = cancel_start.saturating_sub(1);
-        let apply_start = apply_end.saturating_sub(SEARCH_APPLY.columns(spacing));
-        Self {
-            query: SEARCH_TEXT_COLUMN..apply_start.saturating_sub(2).max(SEARCH_TEXT_COLUMN),
-            apply: apply_start..apply_end,
-            cancel: cancel_start..width,
-        }
-    }
-}
 
 /// Independently retained parts of the shortcut popup.
 pub(in crate::grid) struct HelpFrames {
@@ -125,14 +40,71 @@ pub(in crate::grid) struct HelpFrames {
     pub search: Option<Frame>,
 }
 
+impl HelpList {
+    /// Fit the localized titles and separator into `slot` using their measured `spacing`.
+    fn title_parts(
+        &self,
+        slot: Range<usize>,
+        spacing: &TextSpacing,
+    ) -> [(&'static str, Range<usize>); 3] {
+        let mut start = slot.start;
+        [self.window_title(), " | ", i18n::text("help.global_title")].map(|text| {
+            let available = (slot.end - start) * UNITS_PER_COLUMN;
+            let width = spacing
+                .fitting_cells(text, available)
+                .last()
+                .map_or(0, |cell| cell.end.div_ceil(UNITS_PER_COLUMN));
+            let part = start..start + width;
+            start = part.end;
+            (text, part)
+        })
+    }
+
+    /// Place each tab's click target in `area` using the same `metrics` and `spacing` as the title.
+    /// Reserve the close button when `controls_hovered` is set.
+    pub(in crate::grid) fn tab_targets(
+        &self,
+        area: Rect,
+        metrics: Metrics,
+        spacing: &TextSpacing,
+        controls_hovered: bool,
+    ) -> [(Scope, Bounds<Pixels>); 2] {
+        let controls = if controls_hovered {
+            area.corner_controls(false)
+        } else {
+            None
+        };
+        let [(_, window), _, (_, global)] =
+            self.title_parts(area.border_title_columns(controls.as_ref()), spacing);
+        [(Scope::Window, window), (Scope::Global, global)].map(|(scope, slot)| {
+            let bounds = Rect {
+                x: area.x + slot.start,
+                y: area.y,
+                w: slot.len(),
+                h: 1,
+            }
+            .pixels(metrics);
+            (scope, bounds)
+        })
+    }
+}
+
 impl HelpWindow {
     /// Center the popup in `cols` by `rows` at the same size in browsing and search.
     pub(in crate::grid) fn layout(&self, cols: usize, rows: usize) -> Rect {
         let Some(list) = &self.list else {
             return Rect::default();
         };
-        let w = cols.saturating_sub(4).min(74);
-        let h = rows.saturating_sub(4).min(list.capacity() + BORDER_ROWS);
+        let (width, height) = if self.keyboard.is_some() {
+            (
+                super::keyboard::KEYBOARD_COLUMNS,
+                super::keyboard::KEYBOARD_BODY_ROWS,
+            )
+        } else {
+            (74, list.capacity())
+        };
+        let w = cols.saturating_sub(4).min(width);
+        let h = rows.saturating_sub(4).min(height + BORDER_ROWS);
         Rect {
             x: (cols - w) / 2,
             y: (rows - h) / 2,
@@ -183,8 +155,8 @@ impl HelpWindow {
         spacing: &TextSpacing,
     ) -> [Bounds<Pixels>; 2] {
         let bounds = Self::search_bounds(area, metrics);
-        let slots = SearchSlots::new(Self::search_area(area).w, spacing);
-        [slots.apply, slots.cancel].map(|slot| {
+        let slots = PromptRow::new(SEARCH_TEXT_COLUMN, Self::search_area(area).w, spacing);
+        slots.buttons.map(|slot| {
             Bounds::new(
                 bounds.origin + point(px(slot.start as f32 * metrics.cw), px(0.)),
                 size(px(slot.len() as f32 * metrics.cw), bounds.size.height),
@@ -192,43 +164,42 @@ impl HelpWindow {
         })
     }
 
-    /// Build the border, split title, scrollable list and optional search row for `context`.
+    /// Paint the keycaps and example outline when the editor shortcut tab is visible.
+    pub(in crate::grid) fn keyboard_element(
+        &self,
+        area: Rect,
+        metrics: Metrics,
+    ) -> Option<AnyElement> {
+        self.keyboard
+            .as_ref()
+            .filter(|_| self.keyboard_visible())
+            .map(|keyboard| keyboard.element(self.body(area), Self::content_metrics(metrics)))
+    }
+
+    /// Locate the first binding character when the keyboard tab is visible in `area`.
+    pub(in crate::grid) fn keyboard_caret(
+        &self,
+        area: Rect,
+        metrics: Metrics,
+    ) -> Option<CursorCell> {
+        if !self.keyboard_visible() {
+            return None;
+        }
+        super::keyboard::Keyboard::caret(self.body(area), Self::content_metrics(metrics))
+    }
+
+    /// Build the border, title and example text or scrollable list for `context`.
     pub(in crate::grid) fn frames(&self, context: WindowFrame<'_>) -> Option<HelpFrames> {
         let list = self.list.as_ref()?;
         let area = context.area;
         let body = self.body(area);
         let spacing = context.spacing;
-        let first = list.scroll.first_cell();
-        let mut rows = Frame::viewport(body.w, body.h + 1, first);
-        if list.len() == 0 {
-            rows.label(
-                0,
-                1..body.w.saturating_sub(1),
-                i18n::text("help.no_matches"),
-                MUTED,
-                spacing,
-            );
-        }
-        for (row, (key, description)) in list.rows.iter().skip(first).take(body.h + 1).enumerate() {
-            let selected = first + row == list.selected;
-            if selected {
-                rows.tint(row, 0, body.w, SELECTION);
-            }
-            rows.label(
-                row,
-                1..21,
-                key,
-                if selected { ACCENT } else { GOLD },
-                spacing,
-            );
-            rows.label(
-                row,
-                22..body.w.saturating_sub(1),
-                description,
-                if selected { ACCENT } else { TEXT },
-                spacing,
-            );
-        }
+        let rows =
+            if let Some(keyboard) = self.keyboard.as_ref().filter(|_| self.keyboard_visible()) {
+                keyboard.frame(body, spacing)
+            } else {
+                list_frame(list, body, spacing)
+            };
 
         let mut chrome = Frame::new(area.w, area.h);
         let mut dim_title = Frame::new(area.w, 1);
@@ -238,20 +209,20 @@ impl HelpWindow {
             context.controls_hovered,
             false,
             |frame, slot, color| {
-                let mut start = slot.start;
-                for (text, selected) in [
-                    (list.window_title(), !global),
-                    (" | ", false),
-                    (i18n::text("help.global_title"), global),
-                ] {
+                let mut end = slot.start;
+                for ((text, part), selected) in list
+                    .title_parts(slot, spacing)
+                    .into_iter()
+                    .zip([!global, false, global])
+                {
                     let title = if selected {
                         &mut *frame
                     } else {
                         &mut dim_title
                     };
-                    start = title.label(0, start..slot.end, text, color, spacing);
+                    end = title.label(0, part, text, color, spacing);
                 }
-                start
+                end
             },
         );
         Some(HelpFrames {
@@ -267,23 +238,22 @@ impl HelpWindow {
     /// Build the search row inside `area` for `list` using measured `spacing`.
     fn search_frame(&self, area: Rect, list: &HelpList, spacing: &TextSpacing) -> Frame {
         let bar = Self::search_area(area);
-        let slots = SearchSlots::new(bar.w, spacing);
+        let slots = PromptRow::new(SEARCH_TEXT_COLUMN, bar.w, spacing);
         let mut frame = Frame::new(bar.w, 1);
-        let query = self.filter_text(list, slots.query.len(), spacing);
-        frame.icon(0, 0, Icon::new(SEARCH_ICON, 1.));
+        let query = self.filter_text(list, slots.input.len(), spacing);
+        frame.icon(0, 0, SEARCH_ICON);
         if query.is_empty() {
             frame.label(
                 0,
-                slots.query,
+                slots.input.clone(),
                 i18n::text("help.filter_placeholder"),
                 MUTED,
                 spacing,
             );
         } else {
-            frame.label(0, slots.query, &query, TEXT, spacing);
+            frame.label(0, slots.input.clone(), &query, TEXT, spacing);
         }
-        SEARCH_APPLY.draw(&mut frame, slots.apply, ACCENT, spacing);
-        SEARCH_CANCEL.draw(&mut frame, slots.cancel, TEXT, spacing);
+        slots.draw_buttons(&mut frame, 0, spacing);
         frame
     }
 
@@ -296,7 +266,7 @@ impl HelpWindow {
     ) -> Option<(f32, f32)> {
         let list = self.list.as_ref().filter(|list| list.is_filtering())?;
         let bar = Self::search_area(area);
-        let query = SearchSlots::new(bar.w, spacing).query;
+        let query = PromptRow::new(SEARCH_TEXT_COLUMN, bar.w, spacing).input;
         let text = self.filter_text(list, query.len(), spacing);
         let units = spacing.cells(&text).last().map_or(0, |cell| cell.end);
         let column = query.start as f32 + units as f32 / UNITS_PER_COLUMN as f32;
@@ -323,12 +293,38 @@ impl HelpWindow {
     }
 }
 
-/// Return the backdrop cutout bounds with an even gap around the character border inside `grid`.
-/// `metrics` locates the centerline in the first and last rows and columns.
-pub(in crate::grid) fn help_outline(grid: Bounds<Pixels>, metrics: Metrics) -> Bounds<Pixels> {
-    let padding = point(
-        px(HELP_BORDER_GAP - metrics.cw * 0.5),
-        px(HELP_BORDER_GAP - metrics.lh * 0.5),
-    );
-    Bounds::from_corners(grid.origin - padding, grid.bottom_right() + padding)
+/// Draw the retained rows of `list` inside `body` with measured `spacing`.
+fn list_frame(list: &HelpList, body: Rect, spacing: &TextSpacing) -> Frame {
+    let first = list.scroll.first_cell();
+    let mut rows = Frame::viewport(body.w, body.h + 1, first);
+    if list.len() == 0 {
+        rows.label(
+            0,
+            1..body.w.saturating_sub(1),
+            i18n::text("help.no_matches"),
+            MUTED,
+            spacing,
+        );
+    }
+    for (row, (key, description)) in list.rows.iter().skip(first).take(body.h + 1).enumerate() {
+        let selected = first + row == list.selected;
+        if selected {
+            rows.tint(row, 0, body.w, SELECTION);
+        }
+        rows.label(
+            row,
+            1..21,
+            key,
+            if selected { ACCENT } else { GOLD },
+            spacing,
+        );
+        rows.label(
+            row,
+            22..body.w.saturating_sub(1),
+            description,
+            if selected { ACCENT } else { TEXT },
+            spacing,
+        );
+    }
+    rows
 }

@@ -2,6 +2,40 @@
 
 use super::*;
 
+/// Split panes preserve their outer bounds and smallest usable size when moved or resized.
+#[test]
+fn split_panes_fit_the_retained_grid() {
+    let area = Rect {
+        x: 0,
+        y: 1,
+        w: 60,
+        h: 14,
+    };
+    for editor_first in [false, true] {
+        let (manager, editor) = split_panes(area, false, editor_first, usize::MAX, None);
+        assert_eq!((manager.w, editor.w), (30, 29));
+        assert_eq!(manager.y, editor.y);
+        let (first, last) = if editor_first {
+            (editor, manager)
+        } else {
+            (manager, editor)
+        };
+        assert_eq!(first.x + first.w + 1, last.x);
+        assert_eq!(last.x + last.w, area.w);
+
+        let (manager, editor) = split_panes(area, true, editor_first, 28, Some(0));
+        assert_eq!((manager.h, editor.h), (4, 9));
+        assert_eq!(manager.x, editor.x);
+        let (first, last) = if editor_first {
+            (editor, manager)
+        } else {
+            (manager, editor)
+        };
+        assert_eq!(first.y + first.h + 1, last.y);
+        assert_eq!(last.y + last.h, area.y + area.h);
+    }
+}
+
 /// Whole pane rows leave clearance above the footer while it stays aligned to the outer inset.
 #[test]
 fn footer_keeps_clearance_across_window_heights() {

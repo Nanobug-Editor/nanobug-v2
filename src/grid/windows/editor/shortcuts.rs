@@ -7,7 +7,7 @@ use super::super::{
 
 /// Bindings specific to the editor, grouped by operation and input mode.
 pub(in crate::grid) const SHORTCUTS: &[Shortcut] = &[
-    (Fixed("Alt+Esc"), "editor_shortcuts.close"),
+    (Fixed("<leader>q / Alt+Esc"), "editor_shortcuts.close"),
     (Localized("keys.editor_move"), "editor_shortcuts.move"),
     (
         Localized("keys.editor_scroll_horizontal"),
@@ -16,7 +16,10 @@ pub(in crate::grid) const SHORTCUTS: &[Shortcut] = &[
     (Fixed("w b e  0 ^ $"), "editor_shortcuts.word_motion"),
     (Fixed("Home / End"), "editor_shortcuts.line_edges"),
     (Fixed("gg / G / 3G"), "editor_shortcuts.line_jump"),
+    (Fixed("gd / :definition"), "editor_shortcuts.definition"),
     (Fixed("PageUp / PageDown"), "editor_shortcuts.page"),
+    (Fixed("z"), "editor_shortcuts.z_commands"),
+    (Fixed("Enter"), "editor_shortcuts.normal_enter"),
     (Fixed("i a I A o O"), "editor_shortcuts.insert"),
     (Fixed("Esc / Ctrl+["), "editor_shortcuts.normal"),
     (

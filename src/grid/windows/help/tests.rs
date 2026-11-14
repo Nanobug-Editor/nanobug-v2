@@ -3,14 +3,20 @@
 use super::{
     HelpCommand,
     list::{HelpList, Scope},
-    view::{HELP_BORDER_GAP, help_outline},
 };
-use crate::grid::render::Metrics;
-use gpui::{Bounds, KeyDownEvent, Keystroke, point, px, size};
+use crate::{
+    grid::{
+        render::{Metrics, Rect},
+        windows::file_picker,
+    },
+    ui::text::TextSpacing,
+};
+use gpui::{FontId, KeyDownEvent, Keystroke, NoopTextSystem, point, px};
 use nanobug::{
     animation::scroll::ScrollInput,
     i18n::{self, Locale},
 };
+use std::sync::Arc;
 
 /// A search term present in the save/open and refresh descriptions of the current locale.
 fn file_query() -> &'static str {
@@ -52,9 +58,24 @@ fn switch_scopes_and_filter_descriptions_from_the_keyboard() {
     assert_eq!(list.window_title(), title);
     assert!(list.scope() == Scope::Window);
     assert!(!list.rows.iter().any(|(key, _)| *key == "F5"));
-    press(&mut list, "l", 10, 0.);
+    for key in ["l", "right", "ctrl-shift-l", "ctrl-alt-right"] {
+        assert!(matches!(press(&mut list, key, 10, 0.), HelpCommand::Ignore));
+        assert!(list.scope() == Scope::Window);
+    }
+    press(&mut list, "ctrl-l", 10, 0.);
     assert!(list.scope() == Scope::Global);
     assert!(list.rows.iter().any(|(key, _)| *key == "F5"));
+    for key in ["h", "left"] {
+        assert!(matches!(press(&mut list, key, 10, 0.), HelpCommand::Ignore));
+        assert!(list.scope() == Scope::Global);
+    }
+    for (key, scope) in [("ctrl-left", Scope::Window), ("ctrl-right", Scope::Global)] {
+        assert!(matches!(
+            press(&mut list, key, 10, 0.),
+            HelpCommand::Update(_)
+        ));
+        assert!(list.scope() == scope);
+    }
 
     press(&mut list, "/", 10, 0.);
     assert!(list.is_filtering());
@@ -70,9 +91,22 @@ fn switch_scopes_and_filter_descriptions_from_the_keyboard() {
         list.rows
             .contains(&("F5", i18n::text("global_shortcuts.refresh")))
     );
+    press(&mut list, "ctrl-h", 10, 0.);
+    assert!(list.is_filtering());
+    assert_eq!(list.query, file_query());
+    assert!(
+        list.rows
+            .contains(&("l / Enter", i18n::text("manager_shortcuts.open")))
+    );
+    press(&mut list, "ctrl-right", 10, 0.);
+    assert!(list.is_filtering());
+    assert!(
+        list.rows
+            .contains(&("F5", i18n::text("global_shortcuts.refresh")))
+    );
     press(&mut list, "enter", 10, 0.);
     assert!(!list.is_filtering());
-    press(&mut list, "h", 10, 0.);
+    press(&mut list, "ctrl-h", 10, 0.);
     assert!(
         list.rows
             .contains(&("l / Enter", i18n::text("manager_shortcuts.open")))
@@ -90,7 +124,41 @@ fn switch_scopes_and_filter_descriptions_from_the_keyboard() {
     ));
 }
 
-/// Help closes on a single q or Escape while browsing; the filter handles those keys locally.
+/// The localized titles remain separate click targets when the close button is visible.
+#[test]
+fn help_tab_targets_follow_localized_title_widths() {
+    let metrics = Metrics {
+        cw: 10.,
+        lh: 21.,
+        font_size: 16.,
+        origin: point(px(14.), px(9.)),
+    };
+    let spacing = TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 10.);
+    let area = Rect {
+        x: 2,
+        y: 2,
+        w: 56,
+        h: 16,
+    };
+    let list = HelpList::for_window(file_picker::SHORTCUTS, "picker.help_title", true);
+    let [(left_scope, left), (right_scope, right)] =
+        list.tab_targets(area, metrics, &spacing, true);
+    assert!(left_scope == Scope::Window && right_scope == Scope::Global);
+    assert_eq!(left.top(), area.pixels(metrics).top());
+    assert_eq!(
+        left.size.width,
+        px(spacing.columns(list.window_title()) as f32 * metrics.cw)
+    );
+    assert_eq!(right.left() - left.right(), px(3. * metrics.cw));
+    assert_eq!(
+        right.size.width,
+        px(spacing.columns(i18n::text("help.global_title")) as f32 * metrics.cw)
+    );
+    let close = area.corner_controls(false).unwrap().close.pixels(metrics);
+    assert!(right.right() < close.left());
+}
+
+/// Escape closes browsing help, while the filter handles Escape and printable text locally.
 #[test]
 fn help_close_keys_respect_filter_input() {
     let mut list = HelpList::new(true, true);
@@ -98,23 +166,25 @@ fn help_close_keys_respect_filter_input() {
         press(&mut list, "shift-x", 10, 0.),
         HelpCommand::Ignore
     ));
-    assert!(matches!(press(&mut list, "q", 10, 0.), HelpCommand::Close));
+    assert!(matches!(press(&mut list, "q", 10, 0.), HelpCommand::Ignore));
     assert!(matches!(
         press(&mut list, "escape", 10, 0.),
         HelpCommand::Close
     ));
-    let held_q = KeyDownEvent {
-        keystroke: Keystroke::parse("q").unwrap(),
+    let held_escape = KeyDownEvent {
+        keystroke: Keystroke::parse("escape").unwrap(),
         is_held: true,
         prefer_character_input: false,
     };
     assert!(matches!(
-        list.key(&held_q, 10, 0., false),
+        list.key(&held_escape, 10, 0., false),
         HelpCommand::Ignore
     ));
 
     press(&mut list, "/", 10, 0.);
-    assert!(matches!(press(&mut list, "q", 10, 0.), HelpCommand::Text));
+    for key in ["q", "x", "space"] {
+        assert!(matches!(press(&mut list, key, 10, 0.), HelpCommand::Text));
+    }
     assert!(matches!(
         press(&mut list, "escape", 10, 0.),
         HelpCommand::FinishFilter { cancel: true }
@@ -174,9 +244,7 @@ fn normal_jumps_are_available_without_editor_modes() {
         press(&mut list, key, 10, 0.);
     }
     assert_eq!(list.selected, 2);
-    for key in [
-        "ctrl-h", "ctrl-l", "ctrl-j", "ctrl-k", "i", "v", "shift-v", ":", "d", "x",
-    ] {
+    for key in ["ctrl-j", "ctrl-k", "i", "v", "shift-v", ":", "d", "x"] {
         assert!(matches!(press(&mut list, key, 10, 0.), HelpCommand::Ignore));
     }
     assert!(list.scope() == Scope::Window);
@@ -211,33 +279,4 @@ fn counted_motion_reveals_the_selection_with_editor_margins() {
     }
     assert_eq!(list.selected, 5);
     assert_eq!(list.scroll.target() + 3, list.selected);
-}
-
-/// The visible character edges are equally inset despite unequal cell dimensions.
-#[test]
-fn help_outline_is_even_around_the_character_border() {
-    let metrics = Metrics {
-        cw: 10.,
-        lh: 21.,
-        font_size: 16.,
-        origin: point(px(0.), px(0.)),
-    };
-    let grid = Bounds::new(point(px(100.), px(50.)), size(px(640.), px(462.)));
-    let outline = help_outline(grid, metrics);
-    assert_eq!(
-        grid.left() + px(metrics.cw / 2.) - outline.left(),
-        px(HELP_BORDER_GAP)
-    );
-    assert_eq!(
-        outline.right() - (grid.right() - px(metrics.cw / 2.)),
-        px(HELP_BORDER_GAP)
-    );
-    assert_eq!(
-        grid.top() + px(metrics.lh / 2.) - outline.top(),
-        px(HELP_BORDER_GAP)
-    );
-    assert_eq!(
-        outline.bottom() - (grid.bottom() - px(metrics.lh / 2.)),
-        px(HELP_BORDER_GAP)
-    );
 }

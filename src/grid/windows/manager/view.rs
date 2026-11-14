@@ -6,14 +6,11 @@ use crate::{
         render::{Frame, Rect},
         windows::WindowFrame,
     },
-    ui::theme::{ACCENT, BACKGROUND, GOLD, SELECTION, TEXT},
+    ui::theme::{ACCENT, ACTIVE_FILE, GOLD, SELECTION, Style, TEXT, ThemeComponent},
 };
 use gpui::rgba;
 use nanobug::i18n;
 use std::path::Path;
-
-/// Faint mint row background for the file shown in the editor window.
-const ACTIVE_FILE_TINT: u32 = (ACCENT << 8) | 0x24;
 
 /// File-manager frames and the optional cross-pane filename preview.
 pub(in crate::grid) struct ManagerFrames {
@@ -26,7 +23,7 @@ pub(in crate::grid) struct ManagerFrames {
 }
 
 impl ManagerWindow {
-    /// Return the file rows inside `area`, excluding the title, root path and character border.
+    /// Return the file rows inside `area`, excluding the title, root path and pane border.
     pub(in crate::grid) fn body(area: Rect) -> Rect {
         Rect {
             x: area.x + 1,
@@ -46,12 +43,13 @@ impl ManagerWindow {
         (Self::indent_column(depth + 1) + 2).min(Self::body(area).w.saturating_sub(5))
     }
 
-    /// Build frames for `context` within `cols`, highlighting the editor's `active_file`.
+    /// Build the pane in `context`, highlighting `active_file`, and use `appearance` for any name preview within `cols`.
     pub(in crate::grid) fn frames(
         &self,
         context: WindowFrame<'_>,
         cols: usize,
         active_file: Option<&Path>,
+        appearance: Style,
     ) -> ManagerFrames {
         let project_name = self
             .tree
@@ -61,7 +59,15 @@ impl ManagerWindow {
             .to_string_lossy();
         let modal_open = context.modal_open;
         let selection_tint = context.selection_tint();
+        let tree_rect = Self::body(context.area);
+        let tree_appearance = appearance.for_component(ThemeComponent::ExplorerTree);
         let mut tree = Frame::new(context.area.w, context.area.h);
+        tree.set_theme_component(ThemeComponent::Explorer);
+        tree.exclude_theme_background(Rect {
+            x: tree_rect.x - context.area.x,
+            y: tree_rect.y - context.area.y,
+            ..tree_rect
+        });
         context.border(&mut tree, i18n::text("manager.title"));
         let root_icon_column = Self::indent_column(0) + 1;
         let root_name_column = root_icon_column + 2;
@@ -77,9 +83,9 @@ impl ManagerWindow {
             GOLD,
             context.spacing,
         );
-        let tree_rect = Self::body(context.area);
         let first = self.scroll.first_cell();
         let mut tree_body = Frame::viewport(tree_rect.w, tree_rect.h + 1, first);
+        tree_body.set_theme_component(ThemeComponent::ExplorerTree);
         let mut tree_name_preview = None;
         let tree_focused = context.selected;
         for (i, entry) in self
@@ -97,7 +103,7 @@ impl ManagerWindow {
             if selected {
                 tree_body.tint(y, 0, tree_rect.w, selection_tint);
             } else if !modal_open && !entry.directory && active_file == Some(entry.path.as_path()) {
-                tree_body.tint(y, 0, tree_rect.w, ACTIVE_FILE_TINT);
+                tree_body.tint(y, 0, tree_rect.w, ACTIVE_FILE);
             }
             if self.tree.marked.contains(&entry.path) {
                 tree_body.text(0, y, "●", GOLD, 1);
@@ -133,8 +139,14 @@ impl ManagerWindow {
                 let expanded = context.spacing.ellipsize(&name, available);
                 let width = (context.spacing.columns(&expanded) + 1).min(available);
                 let mut frame = Frame::new(width, 1);
+                frame.set_theme_component(ThemeComponent::ExplorerTree);
+                frame.hide_theme_background();
                 // The extension masks editor text while the label starts on the tree row.
-                let extension_bg = rgba(BACKGROUND | 0xff).blend(rgba(SELECTION));
+                let base = rgba(appearance.panel());
+                let base = tree_appearance
+                    .component_background()
+                    .map_or(base, |background| base.blend(rgba(background)));
+                let extension_bg = base.blend(rgba(tree_appearance.tint(SELECTION)));
                 frame.tint(0, tree_rect.w - x, width, u32::from(extension_bg));
                 frame.label(0, 0..width, &expanded, color, context.spacing);
                 tree_name_preview = Some((

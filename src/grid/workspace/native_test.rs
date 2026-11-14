@@ -18,6 +18,8 @@ pub(super) fn run_async(
 ) -> Result<()> {
     use gpui::Platform;
 
+    let settings_dir = tempfile::tempdir()?;
+    let settings_path = settings_dir.path().join("settings.toml");
     let platform = Rc::new(gpui_windows::WindowsPlatform::new(false)?);
     let glyphs = platform.text_system();
     glyphs.add_fonts(vec![
@@ -53,6 +55,7 @@ pub(super) fn run_async(
                     let mut workspace = Workspace::new(
                         super::projects::WorkspaceTabs::new(vec![project]),
                         glyphs,
+                        Default::default(),
                         window,
                         cx,
                         options,
@@ -60,6 +63,7 @@ pub(super) fn run_async(
                         #[cfg(feature = "plugin-probe")]
                         None,
                     );
+                    workspace.appearance_settings_path = Some(settings_path);
                     initialize(&mut workspace);
                     workspace
                 })

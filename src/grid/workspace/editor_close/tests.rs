@@ -14,6 +14,24 @@ fn edit_active(projects: &mut WorkspaceTabs) {
     });
 }
 
+/// Closing one label retains the shared draft, while its last label asks about that draft alone.
+#[test]
+fn shared_buffer_close_only_confirms_the_last_label() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut projects = WorkspaceTabs::new(vec![directory.path().to_path_buf()]);
+    edit_active(&mut projects);
+    let buffer = projects.active().editor.buffer().id;
+    projects.active_mut().open_page(None, 0.).unwrap();
+    assert!(EditorClose::new(&projects, CloseTarget::Buffer(buffer)).is_none());
+    assert!(projects.active_mut().editor.remove_buffer_tab(buffer, 0.));
+    assert!(projects.active_mut().select_page(0, 0.));
+    let mut close = EditorClose::new(&projects, CloseTarget::Buffer(buffer)).unwrap();
+    assert_eq!(close.pending.len(), 1);
+    assert!(close.resolve(Choice::Discard, None, &mut projects));
+    assert!(projects.active_mut().editor.remove_buffer_tab(buffer, 0.));
+    assert!(projects.active().editor.buffer_index(buffer).is_none());
+}
+
 /// Match `key` against the current locale's captions, accounting for repeats and `multiple` files.
 fn press(key: &str, is_held: bool, multiple: bool) -> Option<Choice> {
     key_choice(
@@ -135,7 +153,7 @@ fn closing_multiple_buffers_saves_and_discards_only_the_chosen_files() {
     );
     assert!(!close.resolve(Choice::Discard, None, &mut projects));
     assert!(close.resolve(Choice::Cancel, None, &mut projects));
-    assert_eq!(projects.active().editor.buffers[0].vim.doc.text, "!first");
+    assert_eq!(projects.active().editor.buffers()[0].vim.doc.text, "!first");
     assert_eq!(projects.active().editor.vim().doc.text, "!second\n");
     assert_eq!(fs::read_to_string(&first).unwrap(), "first");
     assert_eq!(fs::read(&second).unwrap(), original);
@@ -202,7 +220,7 @@ fn untitled_close_can_save_as_without_overwriting_an_open_buffer() {
     let mut close = EditorClose::new(&projects, CloseTarget::Editor).unwrap();
     assert!(!close.resolve(Choice::Save, Some(existing.clone()), &mut projects));
     assert_eq!(fs::read_to_string(&existing).unwrap(), "existing");
-    assert!(projects.active().editor.buffers[0].vim.doc.path.is_none());
+    assert!(projects.active().editor.buffers()[0].vim.doc.path.is_none());
     assert!(close.resolve(Choice::Save, Some(new.clone()), &mut projects));
     assert_eq!(fs::read_to_string(&new).unwrap(), "!");
     assert!(!projects.active().editor.modified());
@@ -222,13 +240,13 @@ fn quitting_from_start_prompts_for_inactive_projects_and_defers_discards() {
     edit_active(&mut tabs);
     assert!(tabs.select(1));
     edit_active(&mut tabs);
-    let project_close = EditorClose::new(&tabs, CloseTarget::Project).unwrap();
+    let project_close = EditorClose::new(&tabs, CloseTarget::Tab).unwrap();
     assert_eq!(project_close.pending, [PendingBuffer { tab: 1, index: 0 }]);
     let start = tabs.add_start();
     assert!(tabs.select(start));
-    assert!(EditorClose::new(&tabs, CloseTarget::Project).is_none());
+    assert!(EditorClose::new(&tabs, CloseTarget::Tab).is_none());
 
-    let mut close = EditorClose::new(&tabs, CloseTarget::Quit).unwrap();
+    let mut close = EditorClose::new(&tabs, CloseTarget::AllTabs).unwrap();
     assert_eq!(
         close
             .pending
@@ -245,7 +263,7 @@ fn quitting_from_start_prompts_for_inactive_projects_and_defers_discards() {
     );
     assert_eq!(tabs.selected, start);
 
-    let mut close = EditorClose::new(&tabs, CloseTarget::Quit).unwrap();
+    let mut close = EditorClose::new(&tabs, CloseTarget::AllTabs).unwrap();
     assert!(!close.resolve(Choice::Discard, None, &mut tabs));
     assert!(close.resolve(Choice::Save, None, &mut tabs));
     assert_eq!(
@@ -273,7 +291,7 @@ fn save_all_resumes_after_naming_an_untitled_buffer() {
         edit_active(&mut tabs);
     }
 
-    let mut close = EditorClose::new(&tabs, CloseTarget::Project).unwrap();
+    let mut close = EditorClose::new(&tabs, CloseTarget::Tab).unwrap();
     assert!(!close.resolve(Choice::SaveAll, None, &mut tabs));
     assert!(close.picking_path);
     assert_eq!(close.pending[0], PendingBuffer { tab: 0, index: 0 });

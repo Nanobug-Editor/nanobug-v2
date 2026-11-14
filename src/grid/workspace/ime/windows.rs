@@ -16,17 +16,19 @@ use windows_sys::Win32::{
 };
 
 impl Workspace {
-    /// Sync the IME for `window` on `cx`'s GUI thread without waiting for GPUI's next paint.
+    /// Sync the IME for `window` on `cx`'s GUI thread before the next key.
+    /// `cancel_preedit` also cancels composition when switching between two text inputs.
     pub(in crate::grid::workspace) fn sync_native_ime(
         &mut self,
         window: &Window,
         cx: &mut Context<Self>,
+        cancel_preedit: bool,
     ) {
         let enabled = self.accepts_native_text();
         let Some(hwnd) = window_hwnd(window) else {
             return;
         };
-        if ime_attached(hwnd) == enabled {
+        if ime_attached(hwnd) == enabled && !cancel_preedit {
             return;
         }
 
@@ -43,7 +45,7 @@ impl Workspace {
                         workspace.read(cx).accepts_native_text(),
                     ))
                 }) {
-                    set_ime_attached(hwnd, enabled);
+                    set_ime_attached(hwnd, enabled, cancel_preedit);
                 }
             })
             .detach();
@@ -92,14 +94,15 @@ fn ime_attached(hwnd: HWND) -> bool {
     true
 }
 
-/// On the GUI thread, restore `hwnd`'s default context when `enabled` or detach it for commands.
-fn set_ime_attached(hwnd: HWND, enabled: bool) {
+/// Restore `hwnd`'s context when `enabled` or detach it for commands on the GUI thread.
+/// `cancel_preedit` cancels composition even when the next surface accepts text.
+fn set_ime_attached(hwnd: HWND, enabled: bool, cancel_preedit: bool) {
     let context = unsafe { ImmGetContext(hwnd) };
     let attached = !context.is_null();
     if attached {
         unsafe {
             // The default context belongs to the thread. Cancel only this window's composition.
-            if !enabled && GetFocus() == hwnd {
+            if (!enabled || cancel_preedit) && GetFocus() == hwnd {
                 ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
             }
             ImmReleaseContext(hwnd, context);

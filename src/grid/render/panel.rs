@@ -1,14 +1,13 @@
 //! Retained row shaping, glyph painting, cursor text and backdrop stamping.
 
-use super::{Frame, FrameRow, LabelStyle, Metrics};
+use super::{Frame, FrameRow, LabelStyle, Metrics, ThemeBackground, exposed_regions};
 use crate::{
     ui::icons::IconCache,
     ui::{
         backdrop::BackdropRaster,
         text::{UNITS_PER_COLUMN, chinese_base},
         theme::{
-            ACCENT, CURSOR_TEXT, GRID_CHINESE_FONT, GRID_RULE_FONT_FAMILY, GridFont, Style,
-            TREE_GUIDE, style,
+            ACCENT, GRID_CHINESE_FONT, GRID_RULE_FONT_FAMILY, GridFont, Style, TREE_GUIDE, style,
         },
     },
 };
@@ -152,9 +151,9 @@ pub struct CursorText {
 }
 
 impl CursorText {
-    /// Paint the covered character in the theme's cursor text color with byte `alpha` in `window`.
-    pub fn paint(&self, alpha: u32, window: &mut Window) {
-        let color = rgba((CURSOR_TEXT << 8) | alpha).into();
+    /// Paint the covered character in RGB `ink` with byte `alpha` in `window`.
+    pub fn paint(&self, ink: u32, alpha: u32, window: &mut Window) {
+        let color = rgba((ink << 8) | alpha).into();
         for &(font, glyph, origin) in &self.glyphs {
             let _ = window.paint_glyph(origin, font, glyph, self.font_size, color);
         }
@@ -196,7 +195,10 @@ impl Panel {
     }
     /// Set the `frame` and notify through `cx`, reshaping rows whose cells changed.
     pub fn set(&mut self, frame: Frame, cx: &mut Context<Self>) {
-        if self.data.borrow_mut().set_frame(frame) {
+        let next_style = frame.theme_style(style(cx));
+        let mut data = self.data.borrow_mut();
+        let changed = data.set_frame(frame);
+        if data.set_style(next_style) || changed {
             cx.notify();
         }
     }
@@ -205,6 +207,7 @@ impl Panel {
     pub fn set_appearance(&mut self, metrics: Metrics, cx: &mut Context<Self>) {
         let style = style(cx);
         let mut data = self.data.borrow_mut();
+        let style = data.frame.theme_style(style);
         if data.metrics != metrics || data.style != style {
             data.metrics = metrics;
             data.style = style;
@@ -228,17 +231,29 @@ impl Panel {
     }
 
     /// Stamp this panel at `bounds` into `raster` within its viewport `clip`.
-    /// `window` supplies the same shaped rows used by the sharp canvas.
+    /// `window` supplies the text system and `cx` supplies the current window palette.
     pub(crate) fn stamp_backdrop(
         &self,
         bounds: Bounds<Pixels>,
         clip: Bounds<Pixels>,
         raster: &mut BackdropRaster<'_>,
         window: &Window,
+        cx: &App,
     ) {
         let mut data = self.data.borrow_mut();
+        let scoped = data.frame.theme_style(style(cx));
+        data.set_style(scoped);
         data.prepare(window);
         let metrics = data.metrics;
+        data.paint_theme_background(bounds, |area, color| {
+            raster.fill(area.intersect(&clip), color)
+        });
+        for outline in &data.frame.outlines {
+            if let Some(path) = outline.path(bounds.origin, metrics) {
+                let color = (data.style.foreground(outline.color) << 8) | 0xff;
+                raster.path(&path, clip, color);
+            }
+        }
         for (row, prepared) in data.cache.iter().enumerate() {
             let Some(prepared) = prepared else { continue };
             let y = bounds.origin.y + px(row as f32 * metrics.lh);
@@ -340,6 +355,16 @@ impl Panel {
 }
 
 impl PanelData {
+    /// Invalidate the prepared rows when their resolved `style` changes.
+    fn set_style(&mut self, style: Style) -> bool {
+        if self.style == style {
+            return false;
+        }
+        self.style = style;
+        self.cache.iter_mut().for_each(|row| *row = None);
+        true
+    }
+
     /// Replace the derived `frame`, preserving prepared layouts for unchanged visible rows.
     /// Return whether the panel needs repainting.
     fn set_frame(&mut self, frame: Frame) -> bool {
@@ -431,7 +456,7 @@ impl PanelData {
     }
 
     /// Shape `row` at `origin` spacing units using `metrics` and `text_system`, appending to `runs`.
-    /// `label` selects any font or decoration override for the label.
+    /// The label selects its font, opacity or decoration. The theme supplies the colors.
     fn shape_runs(
         row: &FrameRow,
         origin: isize,
@@ -442,7 +467,6 @@ impl PanelData {
         runs: &mut Vec<Run>,
     ) {
         let cells = &row.cells;
-        let opacity = if label == LabelStyle::Dimmed { 0.5 } else { 1. };
         let mut col = 0;
         while col < cells.len() {
             if cells[col].text.is_empty() {
@@ -451,12 +475,19 @@ impl PanelData {
             }
             let start = col;
             let color = cells[col].fg;
+            let dimmed = cells[col].dimmed;
+            let opacity = if dimmed || label == LabelStyle::Dimmed {
+                0.5
+            } else {
+                1.
+            };
             let width = cells[col].text.width().max(1);
             let units = row.x(col + width) - row.x(col);
             let face = GridFace::for_cell(&cells[col].text);
             let mut text = String::new();
             while col < cells.len()
                 && cells[col].fg == color
+                && cells[col].dimmed == dimmed
                 && !cells[col].text.is_empty()
                 && cells[col].text.width().max(1) == width
                 && row.x(col + width) - row.x(col) == units
@@ -564,9 +595,44 @@ impl PanelData {
         (width.is_finite() && width > 0.).then_some(width)
     }
 
+    /// Fill the scoped background in `bounds`, leaving child panels to draw their own material.
+    /// `fill` receives the nonoverlapping rectangles and the resolved RGBA color.
+    fn paint_theme_background(
+        &self,
+        bounds: Bounds<Pixels>,
+        mut fill: impl FnMut(Bounds<Pixels>, u32),
+    ) {
+        let Some(color) = self.style.component_background() else {
+            return;
+        };
+        match self.frame.theme_background {
+            ThemeBackground::Hidden => {}
+            ThemeBackground::Full => fill(bounds, color),
+            ThemeBackground::Excluding(interior) => {
+                let interior = interior.pixels(Metrics {
+                    origin: bounds.origin,
+                    ..self.metrics
+                });
+                for area in exposed_regions(bounds, interior) {
+                    if !area.is_empty() {
+                        fill(area, color);
+                    }
+                }
+            }
+        }
+    }
+
     /// Paint rows at `bounds` in `window` using `cx`.
     fn paint(&self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            self.paint_theme_background(bounds, |area, color| {
+                window.paint_quad(fill(area, rgba(color)));
+            });
+            for outline in &self.frame.outlines {
+                if let Some(path) = outline.path(bounds.origin, self.metrics) {
+                    window.paint_path(path, rgb(self.style.foreground(outline.color)));
+                }
+            }
             for (i, row) in self.cache.iter().enumerate() {
                 let Some(row) = row else { continue };
                 let y = bounds.origin.y + px(i as f32 * self.metrics.lh);
@@ -715,12 +781,9 @@ fn paint_glyph_run(
 impl Render for Panel {
     /// Draw this panel with a single retained canvas and cached row layouts.
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let style = style(cx);
         let mut data = self.data.borrow_mut();
-        if data.style != style {
-            data.style = style;
-            data.cache.iter_mut().for_each(|row| *row = None);
-        }
+        let scoped = data.frame.theme_style(style(cx));
+        data.set_style(scoped);
         drop(data);
         let prepare = self.data.clone();
         let paint = self.data.clone();

@@ -1,12 +1,14 @@
-//! Read-only continuations and revision-bound document presentation.
+//! Awaited language services and revision-bound document presentation.
 
 use super::{Answer, Call, CallKind, Engine, Key, ResultEvent, Version};
-use crate::plugins::{package::Provider, query};
+use crate::plugins::{package::Provider, query, tools};
+use anyhow::{Context, ensure};
 use nanobug_plugin_sdk::{
-    Permission, PluginEvent, Service, ServiceResult,
+    DocumentSnapshot, Permission, PluginEvent, Service, ServiceResult,
     language::{ByteRange, DocumentFeatures},
 };
 use std::{
+    path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
@@ -18,6 +20,8 @@ pub(super) struct Pending {
     version: Version,
     deadline: Instant,
     reply: Option<Answer>,
+    kind: CallKind,
+    format_path: Option<PathBuf>,
     /// Reject callbacks if the active file was renamed without a text edit.
     document_path: Option<std::path::PathBuf>,
     /// Prepared project settings used by the first half of the call.
@@ -40,6 +44,8 @@ impl Pending {
             version: call.version,
             deadline: call.deadline,
             reply: call.reply,
+            kind: call.kind,
+            format_path: call.format_path,
             token,
             document_path: None,
             settings_revision,
@@ -55,7 +61,7 @@ impl Pending {
 }
 
 impl Engine {
-    /// Queue a bounded read-only service; its reply returns to the original invocation.
+    /// Queue a bounded service whose reply returns to the original invocation.
     pub(super) fn begin_language_service(
         &mut self,
         mut pending: Pending,
@@ -66,6 +72,7 @@ impl Engine {
         let namespace = key.namespace.clone();
         let document = self.active_document(key).cloned();
         if self
+            .requests
             .service_pending
             .get(&namespace)
             .copied()
@@ -73,7 +80,7 @@ impl Engine {
             >= super::MAX_RUNTIME_CALLS
         {
             let retry = pending.reply.is_none();
-            pending.fail("Plugin read queue is busy");
+            pending.fail("Plugin service queue is busy");
             return !retry;
         }
         pending.document_path = document.as_ref().and_then(|doc| doc.path.clone());
@@ -127,17 +134,89 @@ impl Engine {
                     ));
                 })
             }
+            Service::Rustfmt => {
+                let (root, path, document) = match self.rustfmt_source(&pending, document) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        pending.fail(&error.to_string());
+                        return true;
+                    }
+                };
+                let closed =
+                    Arc::clone(self.project_flags.entry(key.instance.project).or_default());
+                self.tool_io.submit(move || {
+                    let result = tools::format_rust(&root, &path, &document, deadline, &closed);
+                    let _ = finish.send(ResultEvent::LanguageService(
+                        pending,
+                        result
+                            .map(serde_json::Value::String)
+                            .map_err(|error| error.to_string()),
+                    ));
+                })
+            }
             _ => {
                 pending.fail("Unsupported awaited service");
                 return true;
             }
         };
         if submitted {
-            *self.service_pending.entry(namespace).or_default() += 1;
+            *self.requests.service_pending.entry(namespace).or_default() += 1;
         } else if let Some(reply) = notify_failure {
-            let _ = reply.try_send(Err("Plugin read queue is busy".into()));
+            let _ = reply.try_send(Err("Plugin service queue is busy".into()));
         }
         submitted
+    }
+
+    /// Authorize only a format-kind invocation for the exact active Rust document it was given.
+    fn rustfmt_source(
+        &self,
+        pending: &Pending,
+        document: Option<Arc<DocumentSnapshot>>,
+    ) -> anyhow::Result<(PathBuf, PathBuf, Arc<DocumentSnapshot>)> {
+        let key = &pending.key;
+        let document = document.context("Open a Rust file to format it")?;
+        let path = pending
+            .format_path
+            .as_deref()
+            .or(document.path.as_deref())
+            .context("Open a Rust file to format it")?;
+        ensure!(
+            pending.kind == CallKind::Format
+                && pending.reply.is_some()
+                && pending.version == Some((document.opening, document.revision))
+                && Path::extension(path).is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+                && self.lifecycle.wanted.get(key).is_some_and(|module| {
+                    module.provides.contains(&Provider::Format)
+                        && module.accepts_document(Some(path))
+                }),
+            "rustfmt requires an active Rust format request"
+        );
+        let record = self
+            .records
+            .get(&key.namespace)
+            .context("Plugin is unavailable")?;
+        ensure!(
+            record.enabled
+                && [
+                    Permission::ReadDocument,
+                    Permission::EditDocument,
+                    Permission::RunTool
+                ]
+                .iter()
+                .all(|permission| record.grants.contains(permission)),
+            "rustfmt requires document editing and native tool permissions"
+        );
+        let project = self
+            .projects
+            .get(&key.instance.project)
+            .context("Project was closed")?;
+        ensure!(
+            self.project_execution
+                .get(&query::project_key(&project.root))
+                == Some(&true),
+            "Project execution is blocked. Choose Allow project execution in Modules."
+        );
+        Ok((project.root.clone(), path.to_owned(), document))
     }
 
     /// Drop late or replaced replies before invoking the same guest with the service data.
@@ -153,10 +232,11 @@ impl Engine {
         let settings_changed =
             pending.settings_revision != self.config.settings_revision(key.instance.project);
         if now >= pending.deadline
-            || self.busy(&key.namespace)
-            || !self.wanted.contains_key(key)
+            || self.installation.busy(&key.namespace)
+            || !self.lifecycle.wanted.contains_key(key)
             || settings_changed
             || !self
+                .lifecycle
                 .runtimes
                 .get(&key.namespace)
                 .is_some_and(|runtime| runtime.generation == pending.generation)
@@ -166,6 +246,7 @@ impl Engine {
             if settings_changed
                 && pending.reply.is_none()
                 && let Some(live) = self
+                    .lifecycle
                     .runtimes
                     .get_mut(&key.namespace)
                     .and_then(|runtime| runtime.instances.get_mut(&key.instance))
@@ -192,6 +273,7 @@ impl Engine {
             None,
         ) && reply.is_none()
             && let Some(live) = self
+                .lifecycle
                 .runtimes
                 .get_mut(&key_namespace)
                 .and_then(|runtime| runtime.instances.get_mut(&instance))
@@ -212,7 +294,7 @@ impl Engine {
             return;
         };
         if (doc.opening, doc.revision) != version
-            || !self.wanted[key].accepts_document(doc.path.as_deref())
+            || !self.lifecycle.wanted[key].accepts_document(doc.path.as_deref())
         {
             return;
         }
@@ -263,27 +345,32 @@ impl Engine {
         self.view
             .document_presentations
             .retain(|key, presentation| {
-                self.wanted
+                self.lifecycle
+                    .wanted
                     .get(key)
                     .is_some_and(|module| module.provides.contains(&Provider::Document))
                     && self
                         .records
                         .get(&key.namespace)
                         .is_some_and(|record| record.grants.contains(&Permission::ReadDocument))
-                    && self.runtimes.get(&key.namespace).is_some_and(|runtime| {
-                        runtime.generation == presentation.generation
-                            && runtime.worker.is_some()
-                            && runtime.instances.get(&key.instance).is_some_and(|live| {
-                                live.settings_error.is_none() && live.failure.is_none()
-                            })
-                    })
+                    && self
+                        .lifecycle
+                        .runtimes
+                        .get(&key.namespace)
+                        .is_some_and(|runtime| {
+                            runtime.generation == presentation.generation
+                                && runtime.worker.is_some()
+                                && runtime.instances.get(&key.instance).is_some_and(|live| {
+                                    live.settings_error.is_none() && live.failure.is_none()
+                                })
+                        })
                     && self
                         .projects
                         .get(&key.instance.project)
                         .and_then(|project| project.document.as_ref())
                         .is_some_and(|doc| {
                             (doc.opening, doc.revision) == presentation.version
-                                && self.wanted[key].accepts_document(doc.path.as_deref())
+                                && self.lifecycle.wanted[key].accepts_document(doc.path.as_deref())
                         })
             });
         self.changed |= self.view.document_presentations.len() != before;

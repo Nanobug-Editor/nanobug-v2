@@ -28,6 +28,7 @@ fn keyboard_icons_use_visible_path_heights() {
 
     let svg = SvgRenderer::new(Arc::new(()));
     for (key, target_height) in [
+        (KeyIcon::SPACE, 8.),
         (KeyIcon::ESC, 9.),
         (KeyIcon::BACKSPACE, 12.),
         (KeyIcon::ENTER, 12.),
@@ -83,7 +84,7 @@ fn measured_chinese_keeps_glyph_and_selection_positions_when_panned() {
     });
     let mut frame = Frame::new(8, 1);
     frame.viewport_line(0, spacing.cells("A中文汉，B"), 2..10, 0, |byte| {
-        (TEXT, if byte == "A中".len() { SELECTION } else { 0 })
+        (TEXT, if byte == "A中".len() { SELECTION } else { 0 }, false)
     });
     assert_eq!(
         frame.rows[0].column_at(UNITS_PER_COLUMN as isize / 2),
@@ -111,9 +112,10 @@ fn measured_chinese_keeps_glyph_and_selection_positions_when_panned() {
     for (x, expected) in positions.into_iter().zip(expected) {
         assert!((f32::from(x) - expected).abs() < 0.001);
     }
-    let [(x, width, SELECTION)] = row.backgrounds.as_slice() else {
+    let [(x, width, tint)] = row.backgrounds.as_slice() else {
         panic!("expected the middle Han character to be selected");
     };
+    assert_eq!(*tint, Style::default().tint(SELECTION));
     assert!((f32::from(*x) - 3.2).abs() < 0.001);
     assert!((f32::from(*width) - 9.6).abs() < 0.001);
     let first = data
@@ -123,6 +125,38 @@ fn measured_chinese_keeps_glyph_and_selection_positions_when_panned() {
         .glyph_width(0, 2, &text_system, glyphs.as_ref())
         .unwrap();
     assert!((first - second).abs() < 0.01);
+}
+
+/// Partially scrolled text keeps the dimmed and full-opacity runs in separate positions.
+#[test]
+fn viewport_dims_only_the_marked_glyph_run() {
+    let glyphs = Arc::new(gpui::NoopTextSystem::new());
+    let text_system = WindowTextSystem::new(Arc::new(gpui::TextSystem::new(glyphs.clone())));
+    let metrics = Metrics {
+        cw: 9.,
+        lh: 21.,
+        font_size: GRID_FONT_SIZE,
+        origin: point(px(0.), px(0.)),
+    };
+    let spacing = TextSpacing::new(glyphs, FontId(0), metrics.font_size, metrics.cw);
+    let panel = Panel::new(metrics);
+    let mut frame = Frame::new(5, 1);
+    // Give both parts the same foreground so the run boundary must come from opacity.
+    frame.viewport_line(0, spacing.cells("x{ ... }"), 3..8, 0, |byte| {
+        (0xffffff, CURRENT, (3..6).contains(&byte))
+    });
+    let mut data = panel.data.borrow_mut();
+    data.set_frame(frame);
+    let [dots, brace] = data.prepare_row(0, &text_system).unwrap().runs.as_slice() else {
+        panic!("expected separate runs for the dots and closing brace");
+    };
+    assert_eq!(dots.line.text.as_ref(), "...");
+    assert_eq!(dots.color, 0xffffff);
+    assert_eq!(dots.opacity, 0.5);
+    assert_eq!(brace.line.text.as_ref(), " }");
+    assert_eq!(brace.opacity, 1.);
+    assert_eq!(dots.x, px(0.));
+    assert_eq!(brace.x, px(27.));
 }
 
 /// Selection recolors names without changing the glyph coordinates used to paint them.
@@ -156,7 +190,7 @@ fn tree_names_keep_glyph_positions_when_selected() {
             .label_runs
             .iter()
             .flat_map(|run| {
-                assert_eq!(run.color, color);
+                assert_eq!(run.color, Style::default().foreground(color));
                 run.line
                     .runs
                     .iter()
@@ -184,20 +218,9 @@ fn shell_labels_use_measured_widths_with_fixed_anchors() {
     let spacing = TextSpacing::new(glyphs, FontId(0), metrics.font_size, metrics.cw);
     let mut frame = Frame::new(25, 3);
     frame.border("中文.txt", true, true, &spacing);
-    assert!(
-        frame.rows[0].cells[2..11]
-            .iter()
-            .all(|cell| cell.text == " ")
-    );
-    assert_eq!(frame.rows[0].cells[11].text, "─");
-    assert_eq!(frame.rows[0].cells[16].text, "─");
+    assert_eq!(frame.outlines.len(), 1);
+    assert_eq!(frame.outlines[0].top.as_slice(), &[2..11, 17..23]);
     assert_eq!(frame.rows[0].cells[18].text, "?");
-    assert!(
-        frame.rows[0].cells[20..23]
-            .iter()
-            .all(|cell| cell.text == " ")
-    );
-    assert_eq!(frame.rows[0].cells[23].text, "─");
     assert_eq!(frame.label(1, 1..4, "中文X", TEXT, &spacing), 4);
     assert_eq!(frame.right_label(1, 24, "余 UTF-8", GOLD, &spacing), 16);
     assert_eq!(

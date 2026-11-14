@@ -201,8 +201,15 @@ pub enum PluginEvent {
     },
     Format {
         selection: Option<[usize; 2]>,
+        /// Destination when formatting during a save to a different path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
     },
     Complete {
+        offset: usize,
+    },
+    /// Find definitions of the symbol at the active document's UTF-8 byte offset.
+    Definition {
         offset: usize,
     },
     Diagnose,
@@ -251,6 +258,9 @@ pub struct Output {
     /// The host retains the saved values and lets the user retry or correct them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settings_error: Option<String>,
+    /// Report a formatting failure so the host can discard the edits and continue a pending save.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format_error: Option<String>,
     /// Set only after a ReadCredential service reply to report rejected authentication.
     /// The host displays a fixed message and keeps the currently saved credential.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -264,6 +274,9 @@ pub struct Output {
     /// Labeled replacements for completions that consume an existing prefix.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub completion_items: Vec<language::Completion>,
+    /// Host-populated definition locations, with LSP line and UTF-16 column coordinates.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub definitions: Vec<language::Definition>,
     pub diagnostics: Vec<Diagnostic>,
     /// Presentation data for the document revision supplied with this call.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -273,7 +286,7 @@ pub struct Output {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canvas_delta: Option<canvas::Delta>,
     pub services: Vec<ServiceRequest>,
-    /// Finish the current invocation with the reply to its single read-only service.
+    /// Finish the current invocation with the reply to its single awaited service.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub await_service: bool,
     pub service_value: Option<Value>,
@@ -315,6 +328,9 @@ pub enum Service {
     ReadProjectAncestors {
         names: Vec<String>,
     },
+    /// Format the active Rust snapshot with the project's native rustfmt, returning a UTF-8 string.
+    /// Available during an awaited Format invocation with native execution granted for this project.
+    Rustfmt,
     MeasureText {
         lines: Vec<canvas::MeasureText>,
     },
@@ -352,6 +368,7 @@ impl std::fmt::Debug for Service {
             Self::QuerySyntax { .. } => "QuerySyntax",
             Self::ReadProjectText { .. } => "ReadProjectText",
             Self::ReadProjectAncestors { .. } => "ReadProjectAncestors",
+            Self::Rustfmt => "Rustfmt",
             Self::MeasureText { .. } => "MeasureText",
             Self::StageSettings { .. } => "StageSettings",
             Self::RunTool { .. } => "RunTool",

@@ -1,9 +1,15 @@
 //! Route the launcher and recent-project picker to workspace actions.
 
-use super::Workspace;
-use crate::grid::windows::{
-    manager::{Entry, Explorer},
-    start::{ProjectPicker, ProjectPickerAction, StartAction, StartHit, StartLayout, StartPage},
+use super::{Workspace, editor_close::CloseTarget};
+use crate::grid::{
+    render::Rect,
+    windows::{
+        manager::{Entry, Explorer},
+        start::{
+            ProjectPicker, ProjectPickerAction, RemoveProject, StartAction, StartHit, StartLayout,
+            StartPage,
+        },
+    },
 };
 use gpui::{Context, KeyDownEvent, MouseDownEvent, Pixels, Point, Task, Window};
 use nanobug::i18n;
@@ -99,10 +105,11 @@ impl Workspace {
         });
     }
 
-    /// Handle a non-leader launcher `event` in `window` through `cx`.
+    /// Handle a non-leader launcher `event` and its ASCII `character` in `window` through `cx`.
     pub(super) fn start_page_key(
         &mut self,
         event: &KeyDownEvent,
+        character: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -117,7 +124,7 @@ impl Workspace {
         let action = if key.key == "enter" {
             Some(page.selected_action())
         } else {
-            StartAction::from_key(&key.key)
+            character.and_then(StartAction::from_key)
         };
         if !event.is_held
             && let Some(action) = action
@@ -137,17 +144,17 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Apply the picker action for `event` in `window`, updating the view through `cx`.
-    /// `character` is the printable ASCII key resolved before native text translation.
+    /// Apply the picker action for `event` in `window` through `cx`, returning whether it consumed the key.
+    /// `character` is the printable ASCII command resolved before native text translation.
     pub(super) fn project_picker_key(
         &mut self,
         event: &KeyDownEvent,
         character: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let Some(StartLayout::Projects(layout)) = self.start_layout() else {
-            return;
+            return true;
         };
         let page = self
             .projects
@@ -158,12 +165,97 @@ impl Workspace {
             ProjectPickerAction::Update => {}
             ProjectPickerAction::Open => {
                 self.open_selected_project(window, cx);
-                return;
+                return true;
+            }
+            ProjectPickerAction::ConfirmRemove => {
+                self.remove_recent_project = picker.selected_root().map(|root| RemoveProject {
+                    root: root.to_path_buf(),
+                });
             }
             ProjectPickerAction::Close => page.picker = None,
-            ProjectPickerAction::Ignore => return,
+            ProjectPickerAction::Text => return false,
+            ProjectPickerAction::Ignore => return true,
         }
         page.status.clear();
+        self.sync(window, cx);
+        true
+    }
+
+    /// Return the bounds of an active recent-project confirmation in workspace cells.
+    pub(super) fn remove_recent_project_area(&self) -> Option<Rect> {
+        self.remove_recent_project
+            .as_ref()
+            .map(|prompt| prompt.area(self.layout.cols, self.layout.rows))
+    }
+
+    /// Paint the current recent-project confirmation into the shared popup panel through `cx`.
+    pub(super) fn refresh_remove_recent_project(&self, cx: &mut Context<Self>) {
+        if let (Some(prompt), Some(area)) = (
+            &self.remove_recent_project,
+            self.remove_recent_project_area(),
+        ) {
+            let frame = prompt.frame(area, &self.spacing);
+            self.popup_panel
+                .update(cx, |panel, cx| panel.set(frame, cx));
+        }
+    }
+
+    /// Consume `event` while the recent-project confirmation owns input in `window` through `cx`.
+    pub(super) fn remove_recent_project_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.remove_recent_project.is_none() {
+            return false;
+        }
+        if let Some(confirm) = RemoveProject::key_choice(event) {
+            self.held_close_key = Some(event.keystroke.key.clone());
+            self.finish_remove_recent_project(confirm, window, cx);
+        }
+        true
+    }
+
+    /// Use `event` to answer the confirmation in `window` through `cx` and consume clicks behind it.
+    pub(super) fn press_remove_recent_project(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(area) = self.remove_recent_project_area() else {
+            return false;
+        };
+        if event.click_count == 1
+            && let Some(confirm) =
+                RemoveProject::click_choice(area, self.metrics.cell(event.position), &self.spacing)
+        {
+            self.finish_remove_recent_project(confirm, window, cx);
+        }
+        true
+    }
+
+    /// If `confirm` is true, persist the removal, then restore picker focus in `window` through `cx`.
+    fn finish_remove_recent_project(
+        &mut self,
+        confirm: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(prompt) = self.remove_recent_project.take() else {
+            return;
+        };
+        if confirm {
+            match self.recent_projects.remove(&prompt.root) {
+                Ok(()) => self
+                    .projects
+                    .refresh_project_pickers(&self.recent_projects.roots),
+                Err(error) => {
+                    self.set_status(i18n::format("start.remove_failed", &[("error", &error)]))
+                }
+            }
+        }
         self.sync(window, cx);
     }
 
@@ -189,7 +281,7 @@ impl Workspace {
                     .as_mut()
                     .expect("visible project picker")
                     .focus_filter();
-                self.update_cursor(window, cx);
+                self.sync(window, cx);
             }
             (StartLayout::Projects(layout), Some(StartHit::Project(index)), count @ (1 | 2)) => {
                 let picker = page.picker.as_mut().expect("visible project picker");
@@ -265,18 +357,12 @@ impl Workspace {
                 self.recent_projects.refresh();
                 page.picker = Some(Box::new(ProjectPicker::new(&self.recent_projects.roots)));
             }
-            StartAction::Directory | StartAction::File => {
+            StartAction::Open => {
                 self.open_file_picker(window, cx);
                 return;
             }
             StartAction::Config => self.set_status(i18n::text("start.config_unavailable").into()),
-            StartAction::Quit => {
-                if !self.projects.close_start() {
-                    window.remove_window();
-                    return;
-                }
-                self.reset_tab_view(window, cx);
-            }
+            StartAction::Quit => self.request_close(CloseTarget::Tab, window, cx),
         }
         self.sync(window, cx);
     }

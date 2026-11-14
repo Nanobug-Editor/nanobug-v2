@@ -65,6 +65,14 @@ pub struct Completion {
     pub edit: Edit,
 }
 
+/// A symbol declaration in a named file, using LSP's zero-based UTF-16 position.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Definition {
+    pub path: std::path::PathBuf,
+    pub line: u32,
+    pub character: u32,
+}
+
 /// One named Tree-sitter capture in the supplied snapshot.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Capture {

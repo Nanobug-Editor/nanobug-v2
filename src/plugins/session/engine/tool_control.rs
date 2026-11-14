@@ -160,7 +160,7 @@ impl Engine {
 
     fn close_work_pending(&self, project: Option<u64>) -> bool {
         self.has_native_writes(project, None)
-            || self.runtimes.iter().any(|(namespace, runtime)| {
+            || self.lifecycle.runtimes.iter().any(|(namespace, runtime)| {
                 self.records.get(namespace).is_some_and(|record| {
                     record.grants.contains(&Permission::RunTool)
                         && record
@@ -214,7 +214,9 @@ impl Engine {
 
     fn tool_source(&mut self, key: &Key, tool: &str, user_event: bool) -> Result<Source> {
         ensure!(
-            user_event && !self.busy(&key.namespace) && self.wanted.contains_key(key),
+            user_event
+                && !self.installation.busy(&key.namespace)
+                && self.lifecycle.wanted.contains_key(key),
             "Native tools require an explicit command for a permitted module"
         );
         let record = Arc::clone(
@@ -299,7 +301,7 @@ impl Engine {
                 .executable()
                 .and_then(|executable| {
                     let result = tools::execute(Run {
-                        profile: source.store.root().to_path_buf(),
+                        profile: source.store.state_root().to_path_buf(),
                         namespace: owner.namespace.clone(),
                         tool,
                         project: source.project,
@@ -319,7 +321,11 @@ impl Engine {
             ));
         }) {
             *self.tool_writes.entry(key.clone()).or_default() += 1;
-            *self.service_pending.entry(key.namespace).or_default() += 1;
+            *self
+                .requests
+                .service_pending
+                .entry(key.namespace)
+                .or_default() += 1;
         } else {
             self.tool_reply(
                 key,
@@ -382,6 +388,7 @@ impl Engine {
         tool: String,
     ) {
         *self
+            .requests
             .service_pending
             .entry(key.namespace.clone())
             .or_default() += 1;
@@ -405,7 +412,9 @@ impl Engine {
                 self.background_is_authorized(key, job),
                 "Background tool is no longer permitted"
             );
-            let (status, result) = if !self.wanted.contains_key(key) || self.busy(&key.namespace) {
+            let (status, result) = if !self.lifecycle.wanted.contains_key(key)
+                || self.installation.busy(&key.namespace)
+            {
                 (
                     BackgroundToolStatus::idle(BackgroundToolPhase::Suspended),
                     None,
@@ -434,6 +443,7 @@ impl Engine {
             self.log(&key.namespace, error);
         }
         *self
+            .requests
             .service_pending
             .entry(key.namespace.clone())
             .or_default() += 1;
@@ -468,7 +478,9 @@ impl Engine {
 
     pub(super) fn retry_background_tool(&mut self, key: Key, tool: String) {
         let address = (key, tool);
-        if !self.wanted.contains_key(&address.0) || self.busy(&address.0.namespace) {
+        if !self.lifecycle.wanted.contains_key(&address.0)
+            || self.installation.busy(&address.0.namespace)
+        {
             self.message("Background tool is not available for retry");
             return;
         }
@@ -485,7 +497,9 @@ impl Engine {
             if !self.background_is_authorized(&key, &job) {
                 continue;
             }
-            let status = if !self.wanted.contains_key(&key) || self.busy(&key.namespace) {
+            let status = if !self.lifecycle.wanted.contains_key(&key)
+                || self.installation.busy(&key.namespace)
+            {
                 job.suspend();
                 BackgroundToolStatus::idle(BackgroundToolPhase::Suspended)
             } else {
@@ -555,6 +569,7 @@ impl Engine {
             }) {
                 job.launching = Some((id, cancelled));
                 *self
+                    .requests
                     .service_pending
                     .entry(key.namespace.clone())
                     .or_default() += 1;
@@ -586,10 +601,10 @@ impl Engine {
         id: u64,
         result: Result<BackgroundProcess>,
     ) {
-        if let Some(count) = self.service_pending.get_mut(&key.namespace) {
+        if let Some(count) = self.requests.service_pending.get_mut(&key.namespace) {
             *count -= 1;
             if *count == 0 {
-                self.service_pending.remove(&key.namespace);
+                self.requests.service_pending.remove(&key.namespace);
             }
         }
         let Some(job) = self.backgrounds.get_mut(&(key.clone(), tool.clone())) else {
@@ -625,7 +640,7 @@ impl Engine {
         }
         let id = self.next();
         let owner = namespace.clone();
-        let profile = self.store.root().to_path_buf();
+        let profile = self.store.state_root().to_path_buf();
         let finish = self.finish.clone();
         if self.tool_io.submit(move || {
             let result = super::OperationsReview {

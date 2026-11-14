@@ -1,6 +1,7 @@
 //! Lazily expanded filesystem tree with persistent path-based marks.
-use super::{EntryIcon, transfer::STASH_PREFIX};
+use super::EntryIcon;
 use anyhow::Result;
+use nanobug::filesystem::{DirectoryOptions, read_directory};
 use std::{
     collections::HashSet,
     fs,
@@ -55,19 +56,24 @@ impl Explorer {
 
     /// Read the immediate children of `root` in the same order as a new Explorer.
     pub(in crate::grid) fn preview(root: PathBuf) -> Result<Vec<Entry>> {
-        Self::directory_preview(root, false)
+        Self::directory_preview(root, false, &|_| true)
     }
 
-    /// Read one directory for the picker, treating links to directories as navigable rows.
-    pub(in crate::grid) fn preview_with_directory_links(root: PathBuf) -> Result<Vec<Entry>> {
-        Self::directory_preview(root, true)
-    }
-
-    /// Read immediate children of `root`, with optional directory-link classification.
-    fn directory_preview(root: PathBuf, follow_directory_links: bool) -> Result<Vec<Entry>> {
+    /// Read `root` with optional `follow_directory_links` and the `include_file` predicate.
+    fn directory_preview(
+        root: PathBuf,
+        follow_directory_links: bool,
+        include_file: &impl Fn(&Path) -> bool,
+    ) -> Result<Vec<Entry>> {
         let tree = Self::empty(root);
         let mut entries = Vec::new();
-        tree.walk(&tree.root, 0, &mut entries, follow_directory_links)?;
+        tree.walk(
+            &tree.root,
+            0,
+            &mut entries,
+            follow_directory_links,
+            include_file,
+        )?;
         Ok(entries)
     }
 
@@ -86,7 +92,7 @@ impl Explorer {
     pub fn refresh(&mut self) -> Result<()> {
         let selected = self.entries.get(self.selected).map(|e| e.path.clone());
         let mut entries = Vec::new();
-        self.walk(&self.root, 0, &mut entries, false)?;
+        self.walk(&self.root, 0, &mut entries, false, &|_| true)?;
         self.entries = entries;
         self.selected = selected
             .and_then(|p| self.entries.iter().position(|e| e.path == p))
@@ -114,45 +120,29 @@ impl Explorer {
         }
     }
 
-    /// Append children of `directory` at `depth` to `output`, optionally classifying directory links.
+    /// Append children of `directory` at `depth` to `output`, applying `include_file` before sorting.
+    /// `follow_directory_links` treats links to directories as navigable entries.
     fn walk(
         &self,
         directory: &Path,
         depth: usize,
         output: &mut Vec<Entry>,
         follow_directory_links: bool,
+        include_file: &impl Fn(&Path) -> bool,
     ) -> Result<()> {
         if depth > 32 || output.len() >= 10_000 {
             return Ok(());
         }
-        let mut children: Vec<_> = fs::read_dir(directory)?
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                directory != self.root
-                    || !entry
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with(STASH_PREFIX)
-            })
-            .filter_map(|e| {
-                let kind = e.file_type().ok()?;
-                let path = e.path();
-                let directory =
-                    kind.is_dir() || follow_directory_links && kind.is_symlink() && path.is_dir();
-                Some((path, directory))
-            })
-            .collect();
-        children.sort_by_key(|(p, dir)| {
-            (
-                !dir,
-                p.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_lowercase(),
-            )
-        });
+        let children = read_directory(
+            directory,
+            DirectoryOptions {
+                follow_directory_links,
+                hide_transfer_staging: directory == self.root,
+            },
+            include_file,
+        )?;
         let mut branch_start = output.len();
-        for (path, directory) in children {
+        for nanobug::filesystem::DirectoryEntry { path, directory } in children {
             if output.len() >= 10_000 {
                 break;
             }
@@ -169,7 +159,13 @@ impl Explorer {
                 continuing_branches: 0,
             });
             if open {
-                let _ = self.walk(&path, depth + 1, output, follow_directory_links);
+                let _ = self.walk(
+                    &path,
+                    depth + 1,
+                    output,
+                    follow_directory_links,
+                    include_file,
+                );
             }
         }
         Ok(())

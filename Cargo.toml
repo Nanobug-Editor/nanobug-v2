@@ -3,7 +3,7 @@ name = "nanobug"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Native character-grid editor with an embedded Neovim core"
+description = "Native character-grid editor with Vim-style modal editing"
 
 [features]
 plugin-probe = ["dep:nanobug-probe-wire"]
@@ -25,14 +25,18 @@ zeroize = "1"
 open = { version = "5.4.5", features = ["shellexecute-on-windows"] }
 unicode-script = "0.5"
 unicode-segmentation = "1.12"
+spellbook = "0.4.2"
 unicode-width = "0.2"
+url = "2.5.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 semver = { version = "1", features = ["serde"] }
 sha2 = "0.10.9"
 tempfile = "3.27.0"
 toml = "0.8.23"
+toml_edit = "0.22.27"
 trash = "5.3.0"
+regex = "1"
 nanobug-plugin-sdk = { path = "plugins/sdk" }
 zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
@@ -44,6 +48,7 @@ gpui_windows = { package = "gpui-pre-windows", version = "=0.3.10", default-feat
 keyring-core = "=1.0.1"
 raw-window-handle = "0.6.2"
 windows-sys = { version = "0.61.2", features = [
+    "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
     "Win32_Security",
     "Win32_System_JobObjects",
@@ -52,6 +57,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_LibraryLoader",
     "Win32_UI_Input_Ime",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

@@ -1,0 +1,49 @@
+# Nanobug 深色主题。保存后重启 Nanobug 应用改动。
+# 六位色值使用 #RRGGBB。八位色值使用 #RRGGBBAA，末两位为不透明度。
+
+text = "#c8d3f5" # 界面正文和没有语法高亮的代码文字
+muted = "#8a9eb3" # 次要文字、非当前行行号和未聚焦窗格边框
+accent = "#9df0d4" # 聚焦窗格边框、选中条目的文字和命令行输入文字
+gold = "#f2d09b" # 快捷键、当前行行号、文件树标记和输入法预编辑文字
+warning_border = "#976437" # 警告提示框边框
+warning_text = "#ffba69" # 警告标题和提示文字、行号栏诊断标记及底栏诊断信息
+error_border = "#97475b" # 错误提示框边框
+error_text = "#f27583" # 错误标题和提示文字
+background = "#0b1624d6" # 主窗口和弹窗底色，也提供插件面板的不透明底色
+cursor_fill = "#9df0d4" # 光标本体和动画、当前项目标签底色
+cursor_text = "#0b1624" # 光标盖住的字符、当前项目标签和底栏部分徽章的文字
+selection = "#65baa558" # 编辑区可视选区和列表选中行的底色
+current = "#85bcd522" # 光标所在行及其行号栏底色，也用于弹窗打开时的部分底层选区
+tree_guide = "#4f627aff" # 文件树中表示父子层级的连接线
+active_file = "#9df0d424" # 文件树中当前编辑文件所在行的底色
+preedit = "#c9a3f251" # 输入法尚未上屏的组合文字底色
+footer_blue = "#89adf4ff" # 底栏行列号、普通模式和文件管理器徽章底色
+footer_details = "#3b4564ff" # 底栏文件编码和阅读进度百分比徽章底色
+footer_visual = "#c4a7f4ff" # 底栏可视、可视行和可视块模式徽章底色
+footer_insert = "#9df0d4ff" # 底栏插入和替换模式徽章底色
+shadow = "#00000070" # 网格文字阴影
+plugin_error = "#ff899aff" # 提供给插件使用的错误色
+syntax_keyword = "#c4a7f4" # 语法高亮的关键字文字
+syntax_type = "#89c8f2" # 语法高亮的类型文字
+syntax_function = "#97b8ff" # 语法高亮的函数名
+syntax_string = "#a9d69b" # 语法高亮的字符串文字
+syntax_constant = "#e9ab8c" # 语法高亮的常量和同类字面量
+syntax_comment = "#8a9eb3" # 语法高亮的注释文字
+syntax_attribute = "#f2d09b" # 语法高亮的属性和注解文字
+
+# 组件自定义示例。取消相应表头与字段的注释即可启用。
+# 未填写的字段依次沿用父级组件、上方主题配色和内置默认值。
+# [components.editor]
+# background = "#111c2aff" # 编辑区底色
+#
+# [components.editor.gutter]
+# background = "#162334ff" # 行号栏底色
+#
+# [components.explorer]
+# background = "#111c2aff" # 文件管理器底色
+#
+# [components.explorer.tree]
+# tree_guide = "#647c99ff" # 文件树的层级连接线
+#
+# [components.footer]
+# background = "#111c2aff" # 底部状态栏底色

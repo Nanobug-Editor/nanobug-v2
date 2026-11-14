@@ -2,12 +2,13 @@
 
 use crate::{
     grid::{
-        render::{Frame, Rect},
+        render::{Frame, LabelStyle, OutlineStyle, Rect, SHORTCUT_SEPARATOR, shortcut_hint},
         windows::manager::Entry,
     },
     ui::{
         icons::Icon,
-        text::TextSpacing,
+        ime::Composition,
+        text::{TextSpacing, UNITS_PER_COLUMN},
         theme::{ACCENT, GOLD, MUTED, SELECTION, TEXT},
     },
 };
@@ -19,6 +20,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Vertical offsets of the filter, separator and first project row.
 const QUERY_ROW: usize = 1;
@@ -41,7 +43,7 @@ pub(super) type PreviewRows<'a> = Option<Result<&'a [Entry], &'a str>>;
 /// Two adjacent panes sharing a title row and bottom margin.
 #[derive(Clone, Copy)]
 pub(in crate::grid) struct ProjectLayout {
-    /// Complete picker bounds in the start-page grid.
+    /// Bounds of the bordered panes in the start-page grid.
     pub(super) area: Rect,
     /// Width of the left pane, including both border columns.
     left: usize,
@@ -62,7 +64,30 @@ impl ProjectLayout {
         }
     }
 
-    /// Number of project rows below the filter and above the feedback line.
+    /// Painted bounds including the hint row below the panes.
+    pub(super) fn frame_area(self) -> Rect {
+        Rect {
+            h: self.area.h + 1,
+            ..self.area
+        }
+    }
+
+    /// Absolute start-grid bounds of the project list and directory preview.
+    pub(in crate::grid) fn pane_areas(self) -> [Rect; 2] {
+        [
+            Rect {
+                w: self.left,
+                ..self.area
+            },
+            Rect {
+                x: self.area.x + self.left,
+                w: self.area.w - self.left,
+                ..self.area
+            },
+        ]
+    }
+
+    /// Number of project rows between the filter and the status line.
     pub(in crate::grid) fn project_rows(self) -> usize {
         self.area.h - PROJECT_TOP - 2
     }
@@ -102,6 +127,10 @@ pub(in crate::grid) enum ProjectPickerAction {
     Update,
     /// Open the selected project.
     Open,
+    /// Ask whether to remove the selected project from history.
+    ConfirmRemove,
+    /// Let the native text handler process a key for the filter.
+    Text,
     /// Return to the launcher.
     Close,
     /// Leave the view as it is.
@@ -114,8 +143,10 @@ pub(in crate::grid) struct ProjectPicker {
     projects: Vec<ProjectChoice>,
     /// Indices of the projects satisfying the query, in history order.
     matches: Vec<usize>,
-    /// Current ASCII filter input.
+    /// Committed filter text.
     query: String,
+    /// Native preedit drawn after the committed filter text.
+    pub(in crate::grid) composition: Composition,
     /// Whether printable keys edit the query and the cursor belongs to the filter.
     filter_focused: bool,
     /// Decimal repeat count for the next `j` or `k` in the list.
@@ -161,6 +192,7 @@ impl ProjectPicker {
             matches: (0..projects.len()).collect(),
             projects,
             query: String::new(),
+            composition: Composition::default(),
             filter_focused: true,
             count: 0,
             selected: 0,
@@ -169,24 +201,50 @@ impl ProjectPicker {
         }
     }
 
+    /// Load the latest `roots`, keeping the filter and selecting a nearby row if its project is gone.
+    pub(in crate::grid) fn refresh_history(&mut self, roots: &[PathBuf]) {
+        let mut refreshed = Self::new(roots);
+        refreshed.query = std::mem::take(&mut self.query);
+        refreshed.filter_focused = self.filter_focused;
+        refreshed.refilter();
+        let previous = self.selected_root();
+        refreshed.selected = refreshed
+            .matches
+            .iter()
+            .position(|&index| Some(refreshed.projects[index].root.as_path()) == previous)
+            .unwrap_or(self.selected.min(refreshed.matches.len().saturating_sub(1)));
+        refreshed.first = self.first;
+        if refreshed.selected_root() == previous {
+            refreshed.preview_first = self.preview_first;
+        }
+        *self = refreshed;
+    }
+
     /// Return the selected index in the filtered list, if a project matches.
     pub(in crate::grid) fn selected(&self) -> Option<usize> {
         (self.selected < self.matches.len()).then_some(self.selected)
     }
 
     /// Whether the filter owns the cursor and accepts text.
-    pub(super) fn filter_focused(&self) -> bool {
+    pub(in crate::grid) fn filter_focused(&self) -> bool {
         self.filter_focused
     }
 
-    /// Return the current caret's column and row relative to `layout`.
-    pub(super) fn caret(&self, layout: ProjectLayout) -> (usize, usize) {
+    /// Measure the caret's column with `spacing` and return its row relative to `layout`.
+    pub(super) fn caret(&self, layout: ProjectLayout, spacing: &TextSpacing) -> (f32, usize) {
         if self.filter_focused() {
-            let (query, _) = self.filter_row(layout.left);
-            (QUERY_COLUMN + query.len(), QUERY_ROW)
+            let (query, _) = self.filter_row(layout.left, spacing);
+            let units = spacing.cells(&query).last().map_or(0, |cell| cell.end);
+            (
+                QUERY_COLUMN as f32 + units as f32 / UNITS_PER_COLUMN as f32,
+                QUERY_ROW,
+            )
         } else {
             let first = self.visible(layout.project_rows()).start;
-            (PROJECT_CURSOR_COLUMN, PROJECT_TOP + self.selected - first)
+            (
+                PROJECT_CURSOR_COLUMN as f32,
+                PROJECT_TOP + self.selected - first,
+            )
         }
     }
 
@@ -199,6 +257,7 @@ impl ProjectPicker {
     /// Focus the list while keeping the current query and selection.
     pub(in crate::grid) fn focus_list(&mut self) {
         self.filter_focused = false;
+        self.composition.clear();
         self.count = 0;
     }
 
@@ -210,14 +269,17 @@ impl ProjectPicker {
         character: Option<&str>,
         rows: usize,
     ) -> ProjectPickerAction {
-        use ProjectPickerAction::{Close, Ignore, Open, Update};
+        use ProjectPickerAction::{Close, ConfirmRemove, Ignore, Open, Text, Update};
 
         let key = &event.keystroke;
         let raw = key.key.as_str();
         let modifiers = key.modifiers;
+        if self.filter_focused && !self.composition.is_empty() {
+            return Text;
+        }
         if modifiers.alt || modifiers.platform || modifiers.function {
             self.count = 0;
-            return Ignore;
+            return if self.filter_focused { Text } else { Ignore };
         }
         // Held keys must not close the picker or type a slash after switching modes.
         if event.is_held && (matches!(raw, "escape" | "enter") || character == Some("/")) {
@@ -244,10 +306,13 @@ impl ProjectPicker {
             (false, "escape") if self.filter_focused => self.focus_list(),
             (false, "escape") => return Close,
             _ => match (self.filter_focused, character) {
-                (true, Some(text)) => self.append(text),
+                (true, _) => return Text,
                 (false, Some("j")) => self.move_selection(count, rows),
                 (false, Some("k")) => self.move_selection(-count, rows),
                 (false, Some("/")) => self.focus_filter(),
+                (false, Some("d")) if !event.is_held && self.selected().is_some() => {
+                    return ConfirmRemove;
+                }
                 _ => return Ignore,
             },
         }
@@ -266,28 +331,29 @@ impl ProjectPicker {
             .map(|&index| &self.projects[index])
     }
 
-    /// Append printable ASCII `text` and recompute the filtered list.
-    fn append(&mut self, text: &str) {
-        self.query.push_str(text);
+    /// Append committed single-line `text` and recompute the filtered list.
+    pub(in crate::grid) fn commit_filter(&mut self, text: &str) {
+        self.query
+            .extend(text.chars().filter(|ch| !ch.is_control()));
         self.refilter();
     }
 
-    /// Remove the last character from the filter or clear it when `all` is true.
+    /// Remove the last grapheme from the filter or clear it when `all` is true.
     fn erase(&mut self, all: bool) {
         if self.query.is_empty() {
             return;
         }
         if all {
             self.query.clear();
-        } else {
-            self.query.pop();
+        } else if let Some((start, _)) = self.query.grapheme_indices(true).next_back() {
+            self.query.truncate(start);
         }
         self.refilter();
     }
 
     /// Recompute the matches and select the first row.
     fn refilter(&mut self) {
-        let query = self.query.trim().to_ascii_lowercase();
+        let query = self.query.trim().to_lowercase();
         self.matches = self
             .projects
             .iter()
@@ -349,7 +415,8 @@ impl ProjectPicker {
         range.contains(&index).then_some(index)
     }
 
-    /// Draw the picker at `layout`, using the selected `preview` and any feedback.
+    /// Draw the picker at `layout`, with the selected `preview`, action `status` or
+    /// `history_error` and a hint below the panes, measured with `spacing`.
     pub(super) fn frame(
         &self,
         layout: ProjectLayout,
@@ -360,7 +427,7 @@ impl ProjectPicker {
     ) -> Frame {
         let Rect { w, h, .. } = layout.area;
         let right = layout.left;
-        let mut frame = Frame::new(w, h);
+        let mut frame = Frame::new(w, layout.frame_area().h);
         pane_border(
             &mut frame,
             0..layout.left,
@@ -425,30 +492,79 @@ impl ProjectPicker {
             GOLD,
             spacing,
         );
+        if status.is_empty() {
+            let slot = 2..w - 2;
+            let shortcuts = self.shortcut_text(slot.len(), spacing);
+            frame.styled_label(h, slot, &shortcuts, TEXT, spacing, LabelStyle::Dimmed);
+        }
         if self.selected().is_some() {
             self.draw_preview(&mut frame, layout, preview, spacing);
         }
         frame
     }
 
-    /// Fit the ASCII query and match count into the left pane of `width` columns.
-    /// Keep a column after the visible query for the animated caret.
-    fn filter_row(&self, width: usize) -> (&str, String) {
+    /// Format complete shortcuts for the current focus and selection within `columns`, measured by `spacing`.
+    fn shortcut_text(&self, columns: usize, spacing: &TextSpacing) -> String {
+        let focus_hints: &[(&str, &str)] = if self.filter_focused() {
+            &[("start.browse_projects", "Esc")]
+        } else {
+            &[("start.continue_filter", "/"), ("picker.hint_back", "Esc")]
+        };
+        let selection_hints: &[(&str, &str)] = match (self.selected(), self.filter_focused()) {
+            (None, _) => &[],
+            (Some(_), true) => &[("picker.hint_move", "↑/↓"), ("picker.hint_open", "Enter")],
+            (Some(_), false) => &[
+                ("picker.hint_move", "j/k"),
+                ("picker.hint_open", "Enter"),
+                ("start.hint_remove_entry", "d"),
+            ],
+        };
+        let mut text = String::new();
+        let mut remaining = columns;
+        for &(action, key) in focus_hints.iter().chain(selection_hints) {
+            let separator = if text.is_empty() {
+                ""
+            } else {
+                SHORTCUT_SEPARATOR
+            };
+            let label = shortcut_hint(i18n::text(action), key);
+            let width = spacing.columns(separator) + spacing.columns(&label);
+            if width > remaining {
+                break;
+            }
+            text.push_str(separator);
+            text.push_str(&label);
+            remaining -= width;
+        }
+        text
+    }
+
+    /// Fit the query, preedit and count in `width` columns measured by `spacing`.
+    /// Keep one column after the visible text for the caret.
+    fn filter_row(&self, width: usize, spacing: &TextSpacing) -> (String, String) {
         let count = format!("{}/{}", self.matches.len(), self.projects.len());
-        let available = width.saturating_sub(QUERY_COLUMN + count.len() + 4);
-        let skip = self.query.len().saturating_sub(available);
-        (&self.query[skip..], count)
+        let available = width.saturating_sub(QUERY_COLUMN + count.len() + 4) * UNITS_PER_COLUMN;
+        let mut query = format!("{}{}", self.query, self.composition.text);
+        let units = spacing.cells(&query).last().map_or(0, |cell| cell.end);
+        if units > available {
+            let start = spacing
+                .cells(&query)
+                .find(|cell| cell.start >= units - available)
+                .map_or(query.len(), |cell| cell.byte);
+            query.drain(..start);
+        }
+        (query, count)
     }
 
     /// Draw the filter prompt and count inside the left pane of `width` columns.
     fn draw_filter(&self, frame: &mut Frame, width: usize, spacing: &TextSpacing) {
-        let (query, count) = self.filter_row(width);
+        let (query, count) = self.filter_row(width, spacing);
         frame.right_label(QUERY_ROW, width - 2, &count, MUTED, spacing);
         frame.label(QUERY_ROW, 1..QUERY_COLUMN, "❯", ACCENT, spacing);
         frame.label(
             QUERY_ROW,
-            QUERY_COLUMN..QUERY_COLUMN + query.len(),
-            query,
+            QUERY_COLUMN..width.saturating_sub(count.len() + 4),
+            &query,
             TEXT,
             spacing,
         );
@@ -506,7 +622,8 @@ impl ProjectPicker {
     }
 }
 
-/// Draw a thin frame in `color` around `columns` by `height`, measuring the centered `title` with `spacing`.
+/// Draw the pane outline on `frame` across `columns` and `height` in `color`.
+/// Reserve a gap for the centered `title` measured with `spacing`.
 fn pane_border(
     frame: &mut Frame,
     columns: Range<usize>,
@@ -518,45 +635,24 @@ fn pane_border(
     let width = columns.len();
     let title = spacing.ellipsize(title, width - 6);
     let title_width = spacing.columns(&title);
-    let left = (width - title_width) / 2;
-    let right = width - left - title_width;
-    let title_start = columns.start + left;
-    frame.text(
-        columns.start,
-        0,
-        &format!("╭{} ", "─".repeat(left - 2)),
+    let title_start = columns.start + (width - title_width) / 2;
+    let title_end = title_start + title_width;
+    frame.outline(
+        Rect {
+            x: columns.start,
+            y: 0,
+            w: width,
+            h: height,
+        },
         color,
-        left,
+        OutlineStyle::Solid,
+        std::iter::once(title_start - 1..title_end + 1),
     );
-    frame.label(
-        0,
-        title_start..title_start + title_width,
-        &title,
-        color,
-        spacing,
-    );
-    frame.text(
-        title_start + title_width,
-        0,
-        &format!(" {}╮", "─".repeat(right - 2)),
-        color,
-        right,
-    );
-    for row in 1..height - 1 {
-        frame.text(columns.start, row, "│", color, 1);
-        frame.text(columns.end - 1, row, "│", color, 1);
-    }
-    frame.text(
-        columns.start,
-        height - 1,
-        &format!("╰{}╯", "─".repeat(width - 2)),
-        color,
-        width,
-    );
+    frame.label(0, title_start..title_end, &title, color, spacing);
 }
 
 /// Show the user-facing spelling of a canonical `path`.
-fn display_path(path: &Path) -> Cow<'_, str> {
+pub(super) fn display_path(path: &Path) -> Cow<'_, str> {
     let text = path.to_string_lossy();
     #[cfg(windows)]
     {
@@ -576,9 +672,15 @@ fn display_path(path: &Path) -> Cow<'_, str> {
 mod tests {
     use super::*;
     use crate::ui::keys::normal_character;
-    use gpui::Keystroke;
+    use gpui::{FontId, Keystroke, NoopTextSystem};
+    use std::sync::Arc;
 
-    /// Press `binding` in the `picker` at `layout` and return its requested action.
+    /// Give tests fixed-width ASCII and double-width Han spacing without a native window.
+    fn spacing() -> TextSpacing {
+        TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 10.)
+    }
+
+    /// Press `binding` in the `picker` at `layout`, committing printable native text when requested.
     fn press(
         picker: &mut ProjectPicker,
         layout: ProjectLayout,
@@ -586,7 +688,7 @@ mod tests {
     ) -> ProjectPickerAction {
         let keystroke = Keystroke::parse(binding).unwrap();
         let character = normal_character(&keystroke);
-        picker.key(
+        let action = picker.key(
             &KeyDownEvent {
                 keystroke,
                 is_held: false,
@@ -594,44 +696,77 @@ mod tests {
             },
             character.as_deref(),
             layout.project_rows(),
-        )
+        );
+        if action == ProjectPickerAction::Text
+            && let Some(text) = character
+        {
+            picker.commit_filter(&text);
+            ProjectPickerAction::Update
+        } else {
+            action
+        }
     }
 
     /// Match contiguous directory-name text and move the caret with the input focus.
     #[test]
     fn filtering_selects_a_matching_project() {
-        let roots = [PathBuf::from("Team/first"), PathBuf::from("Other/second")];
+        let roots = [
+            PathBuf::from("Team/first"),
+            PathBuf::from("Other/second"),
+            PathBuf::from("Team/项目示例"),
+        ];
         let mut picker = ProjectPicker::new(&roots);
         let layout = ProjectLayout::new(90, 24);
+        let spacing = spacing();
         assert_eq!(picker.selected_root(), Some(roots[0].as_path()));
-        assert_eq!(picker.caret(layout), (QUERY_COLUMN, QUERY_ROW));
-        picker.append("OTHER");
-        assert_eq!(picker.selected_root(), None);
-        picker.erase(true);
-        picker.append("SCD");
-        assert_eq!(picker.selected_root(), None);
-        picker.erase(true);
-        picker.append(" EcO ");
-        assert_eq!(picker.selected_root(), Some(roots[1].as_path()));
-        assert_eq!(picker.caret(layout), (QUERY_COLUMN + 5, QUERY_ROW));
-        picker.append(&"z".repeat(100));
-        assert_eq!(picker.selected_root(), None);
-        let (query, count) = picker.filter_row(layout.left);
         assert_eq!(
-            picker.caret(layout),
-            (QUERY_COLUMN + query.len(), QUERY_ROW)
+            picker.caret(layout, &spacing),
+            (QUERY_COLUMN as f32, QUERY_ROW)
+        );
+        picker.commit_filter("OTHER");
+        assert_eq!(picker.selected_root(), None);
+        picker.erase(true);
+        picker.commit_filter("SCD");
+        assert_eq!(picker.selected_root(), None);
+        picker.erase(true);
+        picker.commit_filter(" EcO ");
+        assert_eq!(picker.selected_root(), Some(roots[1].as_path()));
+        assert_eq!(
+            picker.caret(layout, &spacing),
+            ((QUERY_COLUMN + 5) as f32, QUERY_ROW)
+        );
+        picker.commit_filter(&"z".repeat(100));
+        assert_eq!(picker.selected_root(), None);
+        let (query, count) = picker.filter_row(layout.left, &spacing);
+        assert_eq!(
+            picker.caret(layout, &spacing),
+            ((QUERY_COLUMN + query.len()) as f32, QUERY_ROW)
         );
         assert_eq!(QUERY_COLUMN + query.len() + count.len() + 4, layout.left);
         assert_eq!(
             press(&mut picker, layout, "escape"),
             ProjectPickerAction::Update
         );
-        assert_eq!(picker.caret(layout), (PROJECT_CURSOR_COLUMN, PROJECT_TOP));
+        assert_eq!(
+            picker.caret(layout, &spacing),
+            (PROJECT_CURSOR_COLUMN as f32, PROJECT_TOP)
+        );
         assert_eq!(picker.selected_root(), None);
         assert_eq!(press(&mut picker, layout, "/"), ProjectPickerAction::Update);
         picker.erase(true);
         assert_eq!(picker.selected_root(), Some(roots[0].as_path()));
-        assert_eq!(picker.caret(layout), (QUERY_COLUMN, QUERY_ROW));
+        assert_eq!(
+            picker.caret(layout, &spacing),
+            (QUERY_COLUMN as f32, QUERY_ROW)
+        );
+        picker.composition.mark(None, "项目", None);
+        assert_eq!(picker.filter_row(layout.left, &spacing).0, "项目");
+        assert_eq!(picker.selected_root(), Some(roots[0].as_path()));
+        picker.focus_list();
+        assert!(picker.composition.is_empty());
+        press(&mut picker, layout, "/");
+        picker.commit_filter("项目");
+        assert_eq!(picker.selected_root(), Some(roots[2].as_path()));
     }
 
     /// Escape keeps the active filter and selection, and a held Escape cannot close the picker.
@@ -645,16 +780,20 @@ mod tests {
         ];
         let mut picker = ProjectPicker::new(&roots);
         let layout = ProjectLayout::new(90, 24);
+        let spacing = spacing();
         for key in ["j", "k", "2", "down"] {
             assert_eq!(press(&mut picker, layout, key), Update);
         }
-        assert_eq!(picker.caret(layout), (QUERY_COLUMN + 3, QUERY_ROW));
+        assert_eq!(
+            picker.caret(layout, &spacing),
+            ((QUERY_COLUMN + 3) as f32, QUERY_ROW)
+        );
         assert_eq!(press(&mut picker, layout, "escape"), Update);
         assert_eq!(picker.query, "jk2");
         assert_eq!(picker.selected_root(), Some(roots[1].as_path()));
         assert_eq!(
-            picker.caret(layout),
-            (PROJECT_CURSOR_COLUMN, PROJECT_TOP + 1)
+            picker.caret(layout, &spacing),
+            (PROJECT_CURSOR_COLUMN as f32, PROJECT_TOP + 1)
         );
         let held_escape = KeyDownEvent {
             keystroke: Keystroke::parse("escape").unwrap(),
@@ -667,6 +806,79 @@ mod tests {
         );
         assert_eq!(press(&mut picker, layout, "enter"), Open);
         assert_eq!(press(&mut picker, layout, "escape"), Close);
+    }
+
+    /// Change the hint with the input mode while giving feedback priority.
+    #[test]
+    fn filter_hint_follows_list_focus() {
+        let mut picker = ProjectPicker::new(&[]);
+        let layout = ProjectLayout::new(90, 24);
+        let spacing = spacing();
+        let filtering = picker.frame(layout, None, "", None, &spacing);
+        let status = "Project unavailable";
+        let feedback = picker.frame(layout, None, status, None, &spacing);
+
+        press(&mut picker, layout, "escape");
+        assert!(picker.frame(layout, None, "", None, &spacing) != filtering);
+        assert!(picker.frame(layout, None, status, None, &spacing) == feedback);
+
+        press(&mut picker, layout, "/");
+        assert!(picker.frame(layout, None, "", None, &spacing) == filtering);
+    }
+
+    /// Render mode-specific shortcut groups without cutting a label or its separator.
+    #[test]
+    fn shortcut_text_fits_complete_groups() {
+        let roots = [PathBuf::from("Team/project")];
+        let mut picker = ProjectPicker::new(&roots);
+        let spacing = spacing();
+        let browse = i18n::text("start.browse_projects");
+        let movement = i18n::text("picker.hint_move");
+        let open = i18n::text("picker.hint_open");
+        let first = format!("{browse}: Esc");
+        assert_eq!(
+            picker.shortcut_text(120, &spacing),
+            format!("{first} | {movement}: ↑/↓ | {open}: Enter")
+        );
+        assert_eq!(
+            picker.shortcut_text(spacing.columns(&first) + 3, &spacing),
+            first
+        );
+
+        picker.focus_list();
+        let filter = i18n::text("start.continue_filter");
+        let back = i18n::text("picker.hint_back");
+        let remove = i18n::text("start.hint_remove_entry");
+        assert_eq!(
+            picker.shortcut_text(120, &spacing),
+            format!("{filter}: / | {back}: Esc | {movement}: j/k | {open}: Enter | {remove}: d")
+        );
+    }
+
+    /// Only list navigation requests removal, and history changes keep the filter and reveal a match.
+    #[test]
+    fn remove_key_and_history_refresh_keep_the_filter() {
+        use ProjectPickerAction::{ConfirmRemove, Ignore, Update};
+
+        let roots = [
+            PathBuf::from("Team/delta"),
+            PathBuf::from("Other/delta"),
+            PathBuf::from("Team/first"),
+        ];
+        let mut picker = ProjectPicker::new(&roots);
+        let layout = ProjectLayout::new(90, 24);
+        assert_eq!(press(&mut picker, layout, "d"), Update);
+        assert_eq!(picker.query, "d");
+        assert_eq!(press(&mut picker, layout, "escape"), Update);
+        assert_eq!(press(&mut picker, layout, "d"), ConfirmRemove);
+        picker.refresh_history(&roots[1..]);
+        assert_eq!(picker.query, "d");
+        assert!(!picker.filter_focused());
+        assert_eq!(picker.selected_root(), Some(roots[1].as_path()));
+        assert!(picker.selected_choice().unwrap().parent.is_none());
+        picker.refresh_history(&roots[2..]);
+        assert_eq!(picker.selected_root(), None);
+        assert_eq!(press(&mut picker, layout, "d"), Ignore);
     }
 
     /// Counted motions reveal the target and preserve the mapping from visible rows to projects.
@@ -687,8 +899,8 @@ mod tests {
         }
         assert_eq!(picker.selected(), Some(39));
         assert_eq!(
-            picker.caret(layout),
-            (PROJECT_CURSOR_COLUMN, PROJECT_TOP + rows - 1)
+            picker.caret(layout, &spacing()),
+            (PROJECT_CURSOR_COLUMN as f32, PROJECT_TOP + rows - 1)
         );
         let last = layout.area.y + PROJECT_TOP + rows - 1;
         assert_eq!(picker.hit(layout, layout.area.x + 2, last), Some(39));

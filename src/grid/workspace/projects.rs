@@ -13,6 +13,36 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+/// Pane geometry and focus to restore when a project tabpage is selected.
+#[derive(Clone, Copy)]
+struct PageLayout {
+    /// Focused and previously focused panes.
+    focus: Focus,
+    previous_focus: Option<Focus>,
+    /// Currently hidden pane, if any.
+    hidden_pane: Option<Focus>,
+    /// Explorer sizing for horizontal and stacked layouts.
+    sidebar: usize,
+    manager_height: Option<usize>,
+    /// Pane orientation and order.
+    stacked: bool,
+    editor_first: bool,
+}
+
+impl Default for PageLayout {
+    fn default() -> Self {
+        Self {
+            focus: Focus::Editor,
+            previous_focus: None,
+            hidden_pane: None,
+            sidebar: 28,
+            manager_height: None,
+            stacked: false,
+            editor_first: false,
+        }
+    }
+}
+
 /// Retained state of a project or standalone file tab.
 pub(super) struct Project {
     /// Unique opening used to bind plugin state to this tab's lifetime.
@@ -21,6 +51,8 @@ pub(super) struct Project {
     pub(super) root: PathBuf,
     /// Last focused pane in this project.
     pub(super) focus: Focus,
+    /// Previously focused pane, retained while both panes are visible.
+    pub(super) previous_focus: Option<Focus>,
     /// The project's open buffers, cursor positions and scroll state.
     pub(super) editor: EditorWindow,
     /// Explorer state, present only when the tab represents a directory.
@@ -29,6 +61,14 @@ pub(super) struct Project {
     pub(super) hidden_pane: Option<Focus>,
     /// Preferred Explorer width in grid columns.
     pub(super) sidebar: usize,
+    /// Whether Explorer and the editor are stacked instead of side by side.
+    pub(super) stacked: bool,
+    /// Whether the editor comes before Explorer in the current layout.
+    pub(super) editor_first: bool,
+    /// Preferred Explorer height in grid rows when the panes are stacked.
+    pub(super) manager_height: Option<usize>,
+    /// Saved pane state in editor tabpage order. The active page uses the fields above.
+    page_layouts: Vec<PageLayout>,
     /// Last feedback shown in the status line.
     pub(super) status: String,
     /// Validated project-local cursor settings.
@@ -68,11 +108,102 @@ impl Project {
             manager,
             root,
             focus: Focus::Editor,
+            previous_focus: None,
             editor,
             hidden_pane: None,
             sidebar: 28,
+            stacked: false,
+            editor_first: false,
+            manager_height: None,
+            page_layouts: vec![PageLayout::default()],
             status,
             cursor_config,
+        }
+    }
+
+    /// Capture the live pane state before changing the active editor tabpage.
+    fn page_layout(&self) -> PageLayout {
+        PageLayout {
+            focus: self.focus,
+            previous_focus: self.previous_focus,
+            hidden_pane: self.hidden_pane,
+            sidebar: self.sidebar,
+            manager_height: self.manager_height,
+            stacked: self.stacked,
+            editor_first: self.editor_first,
+        }
+    }
+
+    /// Restore the active page's geometry and focus after a switch or removal.
+    fn restore_page_layout(&mut self) {
+        let PageLayout {
+            focus,
+            previous_focus,
+            hidden_pane,
+            sidebar,
+            manager_height,
+            stacked,
+            editor_first,
+        } = self.page_layouts[self.editor.active_tabpage()];
+        self.focus = focus;
+        self.previous_focus = previous_focus;
+        self.hidden_pane = hidden_pane;
+        self.sidebar = sidebar;
+        self.manager_height = manager_height;
+        self.stacked = stacked;
+        self.editor_first = editor_first;
+    }
+
+    /// Select page `index`, retaining the departing page's panes and editor view at `now`.
+    pub(super) fn select_page(&mut self, index: usize, now: f64) -> bool {
+        let previous = self.editor.active_tabpage();
+        if !self.editor.select_tabpage(index, now) {
+            return false;
+        }
+        self.page_layouts[previous] = self.page_layout();
+        self.restore_page_layout();
+        true
+    }
+
+    /// Insert a page at `now` for an optional `path`, using the current layout with editor focus.
+    pub(super) fn open_page(&mut self, path: Option<PathBuf>, now: f64) -> anyhow::Result<()> {
+        let previous = self.editor.active_tabpage();
+        let layout = self.page_layout();
+        if let Some(path) = path {
+            self.editor.open_tabpage(path, now)?;
+        } else {
+            self.editor.add_tabpage(now);
+        }
+        self.page_layouts[previous] = layout;
+        self.page_layouts.insert(
+            self.editor.active_tabpage(),
+            PageLayout {
+                focus: Focus::Editor,
+                previous_focus: None,
+                hidden_pane: layout.hidden_pane.filter(|&pane| pane != Focus::Editor),
+                ..layout
+            },
+        );
+        self.restore_page_layout();
+        Ok(())
+    }
+
+    /// Close the active page at `now` and restore the neighboring page if one exists.
+    pub(super) fn close_page(&mut self, now: f64) -> bool {
+        let previous = self.editor.active_tabpage();
+        if !self.editor.remove_tabpage(now) {
+            return false;
+        }
+        self.page_layouts.remove(previous);
+        self.restore_page_layout();
+        true
+    }
+
+    /// Focus `pane` and remember the old pane for Ctrl+w p.
+    pub(super) fn focus_pane(&mut self, pane: Focus) {
+        if self.focus != pane {
+            self.previous_focus = Some(self.focus);
+            self.focus = pane;
         }
     }
 
@@ -108,14 +239,14 @@ impl Project {
     /// Cancel pending gestures when leaving the project, retaining document and viewport state.
     fn cancel_pending_input(&mut self) {
         if let Some(manager) = &mut self.manager {
-            manager.paste_timer = None;
-            manager.count = 0;
-            manager.click = None;
+            manager.cancel_pending_undo();
+            manager.clear_count();
+            manager.clear_click();
         }
-        self.editor.dragging = None;
-        self.editor.horizontal_wheel = 0.;
-        self.editor.composition.clear();
-        self.editor.buffers[self.editor.active].vim.cancel_pending();
+        self.editor.stop_drag();
+        self.editor.reset_wheel();
+        self.editor.composition_mut().clear();
+        self.editor.cancel_pending();
     }
 }
 
@@ -237,6 +368,17 @@ impl WorkspaceTabs {
         }
     }
 
+    /// Update every open project picker to the latest history `roots`.
+    pub(super) fn refresh_project_pickers(&mut self, roots: &[PathBuf]) {
+        for tab in &mut self.tabs {
+            if let TabContent::Start(page) = &mut tab.content
+                && let Some(picker) = &mut page.picker
+            {
+                picker.refresh_history(roots);
+            }
+        }
+    }
+
     /// Visit projects in strip order, with their tab indices.
     pub(super) fn indexed(&self) -> impl Iterator<Item = (usize, &Project)> {
         self.tabs
@@ -303,10 +445,10 @@ impl WorkspaceTabs {
             .filter_map(|(tab, project)| {
                 let buffer = project
                     .editor
-                    .buffers
+                    .buffers()
                     .iter()
                     .position(|buffer| buffer.vim.doc.path.as_deref() == Some(path))?;
-                let modified = project.editor.buffers[buffer].vim.doc.modified();
+                let modified = project.editor.buffers()[buffer].vim.doc.modified();
                 Some((tab, buffer, modified))
             })
             .max_by_key(|&(tab, _, modified)| (modified, tab == self.selected));
@@ -357,6 +499,10 @@ impl WorkspaceTabs {
         }
         if let Some(project) = self.active_project_mut() {
             project.cancel_pending_input();
+        } else if let Some(page) = self.start_mut()
+            && let Some(picker) = &mut page.picker
+        {
+            picker.composition.clear();
         }
         self.activate(index);
         true
@@ -369,6 +515,16 @@ impl WorkspaceTabs {
         self.tabs[index].used = self.revision;
     }
 
+    /// Index of the most recently used tab other than the selected one.
+    pub(super) fn previous_tab_index(&self) -> Option<usize> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .filter(|&(index, tab)| index != self.selected && tab.used > 0)
+            .max_by_key(|(_, tab)| tab.used)
+            .map(|(index, _)| index)
+    }
+
     /// Move the selected tab to `index` without changing its activation history.
     pub(super) fn move_selected(&mut self, index: usize) {
         let index = index.min(self.len() - 1);
@@ -378,26 +534,36 @@ impl WorkspaceTabs {
         self.revision += 1;
     }
 
-    /// Remove the selected project after confirmation, preferring its right neighbor.
-    fn close_project(&mut self) {
-        debug_assert!(!self.active().editor.modified());
+    /// Close the selected tab, preferring its right neighbor for project and file tabs.
+    /// Start pages return to the most recently used tab, or return false to close the window.
+    fn close_tab(&mut self) -> bool {
+        let closing_start = self.start().is_some();
+        if closing_start && self.len() == 1 {
+            return false;
+        }
+        debug_assert!(
+            self.active_project()
+                .is_none_or(|project| !project.editor.modified())
+        );
         self.tabs.remove(self.selected);
         if self.tabs.is_empty() {
             self.add_start();
         }
-        self.activate(self.selected.min(self.len() - 1));
+        let next = if closing_start {
+            self.most_recent()
+        } else {
+            self.selected.min(self.len() - 1)
+        };
+        self.activate(next);
+        true
     }
 
-    /// Close the selected start page and return to the latest tab.
-    /// Return false if this was the sole tab and the caller should close the window.
-    pub(super) fn close_start(&mut self) -> bool {
-        debug_assert!(self.start().is_some());
-        if self.len() == 1 {
-            return false;
-        }
-        self.tabs.remove(self.selected);
-        self.activate(self.most_recent());
-        true
+    /// Replace all resolved tabs with one fresh start page.
+    fn close_all_tabs(&mut self) {
+        debug_assert!(self.ordered().all(|project| !project.editor.modified()));
+        self.tabs.clear();
+        let start = self.add_start();
+        self.activate(start);
     }
 
     /// Find the latest activation in the nonempty strip.
@@ -427,7 +593,7 @@ impl WorkspaceTabs {
                 .iter_mut()
                 .filter_map(|project| project.manager.as_mut())
             {
-                manager.transfers.invalidate(&path);
+                manager.invalidate_history(&path);
             }
         }
         Ok(())
@@ -474,10 +640,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        #[cfg(windows)]
+        let cancel_preedit = self
+            .projects
+            .start()
+            .and_then(|page| page.picker.as_ref())
+            .is_some_and(|picker| !picker.composition.is_empty());
         if self.picker_operation_pending() || !self.projects.select(index) {
             return false;
         }
         self.reset_tab_view(window, cx);
+        #[cfg(windows)]
+        if cancel_preedit {
+            self.sync_native_ime(window, cx, true);
+        }
         true
     }
 
@@ -490,8 +666,21 @@ impl Workspace {
     ) {
         match target {
             CloseTarget::Editor => self.hide_pane(Focus::Editor),
-            CloseTarget::Project => {
-                self.projects.close_project();
+            CloseTarget::Buffer(id) => {
+                let now = self.scroll_epoch.elapsed().as_secs_f64();
+                if self.projects.active_mut().editor.remove_buffer_tab(id, now) {
+                    self.last_cursor_space = None;
+                }
+            }
+            CloseTarget::Tab => {
+                if self.projects.close_tab() {
+                    self.reset_tab_view(window, cx);
+                } else {
+                    window.remove_window();
+                }
+            }
+            CloseTarget::AllTabs => {
+                self.projects.close_all_tabs();
                 self.reset_tab_view(window, cx);
             }
             CloseTarget::Quit => window.remove_window(),
@@ -501,8 +690,9 @@ impl Workspace {
     /// Reset transient workspace state and apply the selected tab's cursor settings.
     pub(super) fn reset_tab_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.file_picker = None;
+        self.remove_recent_project = None;
         self.help.close();
-        self.help.release_backdrop(window);
+        self.popup_backdrop.release(window);
         self.prefix = None;
         self.hovered_controls = None;
         self.resizing = false;
@@ -525,6 +715,30 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
+        // A file already open in a project keeps its shared document and page memberships.
+        let existing =
+            self.projects
+                .indexed()
+                .filter_map(|(index, project)| {
+                    project.manager.as_ref()?;
+                    let buffer =
+                        project.editor.buffers().iter().find(|buffer| {
+                            buffer.vim.doc.path.as_deref() == Some(path.as_path())
+                        })?;
+                    Some((index, buffer.vim.doc.modified()))
+                })
+                .max_by_key(|&(index, modified)| (modified, index == self.projects.selected));
+        if let Some((index, _)) = existing {
+            let now = self.scroll_epoch.elapsed().as_secs_f64();
+            let project = self.projects.project_mut(index);
+            project.editor.open(path, now)?;
+            project.hidden_pane = project.hidden_pane.filter(|&pane| pane != Focus::Editor);
+            project.focus_pane(Focus::Editor);
+            project.status.clear();
+            self.select_tab(index, window, cx);
+            self.last_cursor_space = None;
+            return Ok(());
+        }
         let index = self.projects.add_file(&path)?;
         self.select_tab(index, window, cx);
         Ok(())

@@ -4,41 +4,117 @@
 mod cursor;
 mod geometry;
 mod layer;
+mod outline;
 mod panel;
+mod popup;
+mod prompt;
 
 pub(in crate::grid) use cursor::Cursor;
+pub(in crate::grid) use geometry::exposed_regions;
 pub(crate) use geometry::{Metrics, Rect};
 pub(in crate::grid) use layer::GridLayer;
+pub(in crate::grid) use outline::OutlineStyle;
 pub(in crate::grid) use panel::sample_waves;
 pub(crate) use panel::{CursorCell, Panel};
+pub(in crate::grid) use popup::{
+    PopupBackdrop, dashed_outline_element, paint_dashed_outline, popup_outline,
+};
+pub(in crate::grid) use prompt::{PromptRow, SEARCH_ICON};
 
 use crate::ui::{
     icons::{Icon, KeyIcon},
     text::{TextCell, TextSpacing, UNITS_PER_COLUMN},
-    theme::{ACCENT, GOLD, MUTED, TEXT},
+    theme::{
+        ACCENT, ERROR_BORDER, ERROR_TEXT, GOLD, MUTED, Style, TEXT, ThemeComponent, WARNING_BORDER,
+        WARNING_TEXT,
+    },
 };
 use gpui::{Bounds, Pixels, Point, point, px, size};
+use nanobug::i18n;
+use outline::{EdgeGaps, Outline};
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+/// Separator between complete action and key captions in a grid footer.
+pub(in crate::grid) const SHORTCUT_SEPARATOR: &str = " | ";
+
+/// Format a localized `action` followed by its displayed `key` binding.
+pub(in crate::grid) fn shortcut_hint(action: &str, key: &str) -> String {
+    format!("{action}: {key}")
+}
 
 /// Corner and horizontal rule cells between each side and its padded label.
 const BORDER_LABEL_INSET: usize = 2;
 /// Logical pixels between a key's visible path and its footer caption.
 const KEY_HINT_GAP: f32 = 4.;
+/// Space for a severity icon and the gap before its title.
+const MESSAGE_ICON_COLUMNS: usize = 3;
+/// Filled warning triangle with a transparent exclamation mark.
+const WARNING_ICON: Icon = Icon::new(
+    include_bytes!("../../../assets/icons/message-warning.svg"),
+    1.,
+);
+/// Filled error circle with a transparent cross.
+const ERROR_ICON: Icon = Icon::new(
+    include_bytes!("../../../assets/icons/message-error.svg"),
+    1.,
+);
+
+/// Severity of feedback drawn in a message frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::grid) enum MessageLevel {
+    /// Progress or a successful result.
+    Info,
+    /// An action needs a different selection or input.
+    Warning,
+    /// An action failed.
+    Error,
+}
+
+impl MessageLevel {
+    /// Return the RGB outline and text colors in that order.
+    pub fn colors(self) -> (u32, u32) {
+        match self {
+            Self::Info => (MUTED, TEXT),
+            Self::Warning => (WARNING_BORDER, WARNING_TEXT),
+            Self::Error => (ERROR_BORDER, ERROR_TEXT),
+        }
+    }
+
+    /// Return the icon and localized title displayed in the outline.
+    fn heading(self) -> Option<(Icon, &'static str)> {
+        match self {
+            Self::Info => None,
+            Self::Warning => Some((WARNING_ICON, i18n::text("message.warning"))),
+            Self::Error => Some((ERROR_ICON, i18n::text("message.error"))),
+        }
+    }
+
+    /// Measure the severity icon and localized title in the grid's text `spacing`.
+    pub fn heading_columns(self, spacing: &TextSpacing) -> usize {
+        self.heading().map_or(0, |(_, title)| {
+            MESSAGE_ICON_COLUMNS + spacing.columns(title)
+        })
+    }
+}
 
 /// Center `hints` within `columns` and return their hit ranges using `cell_width` and `spacing`.
-pub(in crate::grid) fn key_hint_slots(
+pub(in crate::grid) fn key_hint_slots<const N: usize>(
     columns: usize,
     cell_width: f32,
     spacing: &TextSpacing,
-    hints: [(KeyIcon, &str); 2],
-) -> [Range<usize>; 2] {
-    let [left, right] = hints
+    hints: [(KeyIcon, &str); N],
+) -> [Range<usize>; N] {
+    let widths = hints
         .map(|(key, caption)| key.columns(cell_width, KEY_HINT_GAP) + spacing.columns(caption));
-    let start = columns.saturating_sub(left + 2 + right) / 2;
-    let end = start + left + 2;
-    [start..start + left, end..end + right]
+    let total = widths.iter().sum::<usize>() + 2 * N.saturating_sub(1);
+    let mut start = columns.saturating_sub(total) / 2;
+    widths.map(|width| {
+        let slot = start..start + width;
+        start = slot.end + 2;
+        slot
+    })
 }
 
 /// Derived cell content; empty text marks the continuation of a wide grapheme.
@@ -50,6 +126,8 @@ struct Cell {
     fg: u32,
     /// Optional RGBA selection or current-line tint; zero means transparent.
     bg: u32,
+    /// Draw this grapheme and its shadow at half opacity.
+    dimmed: bool,
 }
 
 impl Default for Cell {
@@ -58,6 +136,7 @@ impl Default for Cell {
             text: " ".into(),
             fg: TEXT,
             bg: 0,
+            dimmed: false,
         }
     }
 }
@@ -135,7 +214,7 @@ impl FrameRow {
 pub(in crate::grid) enum LabelStyle {
     /// Ordinary grid text.
     Text,
-    /// Grid text drawn at half opacity for shortcut hints.
+    /// Ordinary grid text and shadow at half opacity.
     Dimmed,
     /// Underlined keyboard key name.
     Key,
@@ -192,6 +271,7 @@ fn write_grapheme(cells: &mut [Cell], grapheme: &str, color: u32) {
         cell.text.clear();
         cell.text.push_str(text);
         cell.fg = color;
+        cell.dimmed = false;
         text = if grapheme == "\t" { " " } else { "" };
     }
 }
@@ -269,6 +349,18 @@ struct RowChevron {
     color: u32,
 }
 
+/// Area filled by the component background before its cells are drawn.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum ThemeBackground {
+    /// Fill the panel within its viewport clip.
+    #[default]
+    Full,
+    /// Leave an interior rectangle to the panels drawn there.
+    Excluding(Rect),
+    /// Draw only the panel's content and decorations.
+    Hidden,
+}
+
 /// One panel's derived character cells and decorations.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Frame {
@@ -284,8 +376,14 @@ pub struct Frame {
     guides: Vec<GuideSegment>,
     /// Tapered badge edges painted over row tints.
     chevrons: Vec<RowChevron>,
+    /// Path outlines whose geometry stays independent of the shaped rows.
+    outlines: Vec<Outline>,
     /// Vertical inset of row tint fills, in logical pixels.
     tint_inset: Pixels,
+    /// Optional component that supplies the panel's color overrides.
+    theme_component: Option<ThemeComponent>,
+    /// Which parts of the panel receive the component background.
+    theme_background: ThemeBackground,
 }
 
 impl Frame {
@@ -309,9 +407,34 @@ impl Frame {
             icons: Vec::new(),
             guides: Vec::new(),
             chevrons: Vec::new(),
+            outlines: Vec::new(),
             tint_inset: px(0.),
+            theme_component: None,
+            theme_background: ThemeBackground::Full,
         }
     }
+
+    /// Apply the colors of `component` to this frame.
+    pub(in crate::grid) fn set_theme_component(&mut self, component: ThemeComponent) {
+        self.theme_component = Some(component);
+    }
+
+    /// Leave `interior` in frame-local grid coordinates for independent child panels.
+    pub(in crate::grid) fn exclude_theme_background(&mut self, interior: Rect) {
+        self.theme_background = ThemeBackground::Excluding(interior);
+    }
+
+    /// Keep scoped text and decorations while leaving the existing background visible.
+    pub(in crate::grid) fn hide_theme_background(&mut self) {
+        self.theme_background = ThemeBackground::Hidden;
+    }
+
+    /// Apply this frame's color scope to the current window `style`.
+    fn theme_style(&self, style: Style) -> Style {
+        self.theme_component
+            .map_or(style, |component| style.for_component(component))
+    }
+
     /// Write fixed-grid `text` at cell `(x, y)` in `fg`, clipped to `limit` cells.
     /// Return the first column after the written text.
     pub fn text(&mut self, x: usize, y: usize, text: &str, fg: u32, limit: usize) -> usize {
@@ -397,14 +520,14 @@ impl Frame {
     }
 
     /// Retain the measured `cells` intersecting `viewport` grid columns in row `y`.
-    /// `tint` fills the trailing blanks, and `style` maps line byte offsets to foreground and tint.
+    /// `tint` fills the trailing blanks. `style` maps byte offsets to foreground, tint and dimming.
     pub fn viewport_line<'a>(
         &mut self,
         y: usize,
         cells: impl Iterator<Item = TextCell<'a>>,
         viewport: Range<usize>,
         tint: u32,
-        mut style: impl FnMut(usize) -> (u32, u32),
+        mut style: impl FnMut(usize) -> (u32, u32, bool),
     ) {
         let row = &mut self.rows[y];
         let left = viewport.start * UNITS_PER_COLUMN;
@@ -414,8 +537,10 @@ impl Frame {
             .skip_while(|cell| cell.end <= left)
             .take_while(|cell| cell.start < right)
         {
-            let (fg, bg) = style(cell.byte);
+            let (fg, bg, dimmed) = style(cell.byte);
+            let start = column;
             column = row.place(column, cell, left, fg, bg);
+            row.cells[start].dimmed = dimmed;
         }
         let remaining = ((right - left) as isize - row.x(column)).max(0) as usize;
         let needed = column + remaining.div_ceil(UNITS_PER_COLUMN);
@@ -522,19 +647,26 @@ impl Frame {
         });
     }
 
-    /// Paint two `hints` on `row`, using `cell_width` and `spacing` to align their captions.
-    pub(in crate::grid) fn key_hints(
+    /// Center `hints` on `row`, using `cell_width` and `spacing` to align their captions.
+    pub(in crate::grid) fn key_hints<const N: usize>(
         &mut self,
         row: usize,
         cell_width: f32,
         spacing: &TextSpacing,
-        hints: [(KeyIcon, &str); 2],
+        hints: [(KeyIcon, &str); N],
     ) {
         let slots = key_hint_slots(self.rows[row].cells.len(), cell_width, spacing, hints);
         for ((key, caption), slot) in hints.into_iter().zip(slots) {
             let start = slot.start + key.columns(cell_width, KEY_HINT_GAP);
             self.key_icon(start, row, key, -key.visible_width - KEY_HINT_GAP);
-            self.label(row, start..slot.end, caption, MUTED, spacing);
+            self.styled_label(
+                row,
+                start..slot.end,
+                caption,
+                TEXT,
+                spacing,
+                LabelStyle::Dimmed,
+            );
         }
     }
 
@@ -562,7 +694,7 @@ impl Frame {
         }
     }
 
-    /// Draw a character border with measured `title` using `spacing` and the focus accent when `active`.
+    /// Draw a rounded border with measured `title` using `spacing` and the focus accent when `active`.
     /// Add the pane's corner controls when `show_controls` is true.
     pub fn border(
         &mut self,
@@ -595,74 +727,174 @@ impl Frame {
             return;
         }
         let color = if active { ACCENT } else { MUTED };
-        self.border_rules(area, color, false);
         let controls = show_controls
             .then(|| area.corner_controls(include_help))
             .flatten();
-        let mut columns = area.border_title_columns();
-        if let Some(controls) = &controls {
-            columns.end = controls.area().x - 2;
-        }
+        let columns = area.border_title_columns(controls.as_ref());
+        let mut gaps = EdgeGaps::new();
         if !columns.is_empty() {
             let end = draw_title(self, columns, color);
-            self.clear_border_title(area, end, color);
+            gaps.push(BORDER_LABEL_INSET..end + 1);
         }
         if let Some(controls) = controls {
             let area = controls.area();
-            self.text(area.x, 0, &" ".repeat(area.w), color, area.w);
+            gaps.push(area.x..area.x + area.w);
             if let Some(help) = controls.help {
                 self.text(help.x + help.w / 2, 0, "?", GOLD, 1);
             }
         }
+        self.outline(area, color, OutlineStyle::Solid, gaps);
     }
 
-    /// Draw a titled grid section within `area`. `dashed` selects the description-style rule.
+    /// Draw a titled grid section within `area` in `color`.
     /// `draw_title` paints within the available columns and returns its last occupied edge.
     pub(in crate::grid) fn section_border(
         &mut self,
         area: Rect,
         color: u32,
-        dashed: bool,
         draw_title: impl FnOnce(&mut Self, Range<usize>) -> usize,
     ) {
         if area.w < 2 || area.h < 2 {
             return;
         }
-        self.border_rules(area, color, dashed);
-        let columns = area.border_title_columns();
-        if !columns.is_empty() {
+        let local = area.border_title_columns(None);
+        let columns = area.x + local.start..area.x + local.end;
+        let gap = (!columns.is_empty()).then(|| {
             let end = draw_title(self, columns);
-            self.clear_border_title(area, end, color);
+            area.x + BORDER_LABEL_INSET..end + 1
+        });
+        self.outline(area, color, OutlineStyle::Solid, gap);
+    }
+
+    /// Retain a stroke for `area` in `color` and `style`, skipping `gaps` in frame-local top columns.
+    pub(in crate::grid) fn outline(
+        &mut self,
+        area: Rect,
+        color: u32,
+        style: OutlineStyle,
+        gaps: impl IntoIterator<Item = Range<usize>>,
+    ) {
+        if area.w >= 2 && area.h >= 2 {
+            self.outlines.push(Outline {
+                area,
+                color,
+                style,
+                top: gaps.into_iter().collect(),
+                bottom: EdgeGaps::new(),
+            });
         }
     }
 
-    /// Paint `area`'s corners and edges using the grid rule font and `color`.
-    fn border_rules(&mut self, area: Rect, color: u32, dashed: bool) {
-        let Rect { x, y, w, h } = area;
-        let (top_left, top_right, bottom_left, bottom_right, horizontal, vertical) = if dashed {
-            ("┌", "┐", "└", "┘", "╌", "╎")
-        } else {
-            ("╭", "╮", "╰", "╯", "─", "│")
+    /// Reserve frame-local `columns` for a button in the most recently added outline's bottom edge.
+    pub(in crate::grid) fn outline_footer_gap(&mut self, columns: Range<usize>) {
+        if let Some(outline) = self.outlines.last_mut() {
+            outline.bottom.push(columns);
+        }
+    }
+
+    /// Draw the message outline for `level`, centering the severity heading using `spacing`.
+    pub(in crate::grid) fn message_border(&mut self, level: MessageLevel, spacing: &TextSpacing) {
+        self.message_border_with_title(level, None, spacing);
+    }
+
+    /// Draw the outline and icon for `level`, measuring `title` or the severity label with `spacing`.
+    pub(in crate::grid) fn message_border_with_title(
+        &mut self,
+        level: MessageLevel,
+        title: Option<&str>,
+        spacing: &TextSpacing,
+    ) {
+        let width = self.rows.first().map_or(0, |row| row.cells.len());
+        let area = Rect {
+            w: width,
+            h: self.rows.len(),
+            ..Rect::default()
         };
-        let rule = horizontal.repeat(w - 2);
-        self.text(x, y, &format!("{top_left}{rule}{top_right}"), color, w);
-        self.text(
-            x,
-            y + h - 1,
-            &format!("{bottom_left}{rule}{bottom_right}"),
-            color,
-            w,
-        );
-        for row in y + 1..y + h - 1 {
-            self.text(x, row, vertical, color, 1);
-            self.text(x + w - 1, row, vertical, color, 1);
+        let (border, text) = level.colors();
+        let Some((icon, severity)) = level.heading() else {
+            self.outline(area, border, OutlineStyle::Dashed, []);
+            return;
+        };
+        let title = title.unwrap_or(severity);
+        let heading = MESSAGE_ICON_COLUMNS + spacing.columns(title);
+        if width < heading + 4 || area.h < 2 {
+            self.outline(area, border, OutlineStyle::Solid, []);
+            return;
         }
+        let start = (width - heading) / 2;
+        self.outline(
+            area,
+            border,
+            OutlineStyle::Solid,
+            Some(start - 1..start + heading + 1),
+        );
+        self.icon(start, 0, icon);
+        self.label(
+            0,
+            start + MESSAGE_ICON_COLUMNS..start + heading,
+            title,
+            text,
+            spacing,
+        );
     }
+}
 
-    /// Leave a cell of padding around the measured title in `area`'s top rule.
-    fn clear_border_title(&mut self, area: Rect, end: usize, color: u32) {
-        let start = area.x + BORDER_LABEL_INSET;
-        let gap = end + 1 - start;
-        self.text(start, area.y, &" ".repeat(gap), color, gap);
+#[cfg(test)]
+mod message_tests {
+    use super::*;
+    use gpui::{FontId, NoopTextSystem, SvgRenderer};
+    use std::sync::Arc;
+
+    /// Alert icons and titles are centered in solid rounded outlines with separate text colors.
+    #[test]
+    fn warning_and_error_frames_center_the_severity_heading() {
+        let spacing = TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 9.);
+        let svg = SvgRenderer::new(Arc::new(()));
+        for level in [MessageLevel::Warning, MessageLevel::Error] {
+            let (border, text) = level.colors();
+            assert_ne!(border, text);
+            let heading = level.heading_columns(&spacing);
+            let width = heading + 10;
+            let mut frame = Frame::new(width, 3);
+            frame.message_border(level, &spacing);
+            frame.label(1, 2..width - 2, "msg", text, &spacing);
+            assert_eq!(frame.outlines.len(), 1);
+            let outline = &frame.outlines[0];
+            assert_eq!(outline.color, border);
+            assert_eq!(outline.style, OutlineStyle::Solid);
+            assert_eq!(outline.top.as_slice(), Some(4..6 + heading).as_slice());
+            assert!(frame.rows.iter().all(|row| {
+                row.cells
+                    .iter()
+                    .all(|cell| cell.text == " " && cell.bg == 0)
+            }));
+            let (icon, title) = level.heading().unwrap();
+            assert_eq!(frame.icons.len(), 1);
+            assert_eq!((frame.icons[0].column, frame.icons[0].row), (5, 0));
+            assert_eq!(frame.icons[0].icon, icon);
+            assert!(icon.rasterize(&svg, 20).is_some());
+            let heading_label = &frame.labels[0][0];
+            assert_eq!(
+                heading_label.x,
+                (5 + MESSAGE_ICON_COLUMNS) * UNITS_PER_COLUMN
+            );
+            assert_eq!(
+                heading_label
+                    .text
+                    .cells
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>(),
+                title
+            );
+            assert!(heading_label.text.cells.iter().all(|cell| cell.fg == text));
+            assert!(
+                frame.labels[1][0]
+                    .text
+                    .cells
+                    .iter()
+                    .all(|cell| cell.fg == text)
+            );
+        }
     }
 }

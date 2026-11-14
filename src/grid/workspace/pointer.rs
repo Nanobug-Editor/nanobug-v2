@@ -4,6 +4,7 @@ use super::{
     Workspace,
     layout::{Focus, ShellWindow, near_corner_controls},
 };
+use crate::grid::windows::editor::{EditorWindow, HeaderTarget};
 use gpui::{
     ClickEvent, Context, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollEvent,
     Window, px,
@@ -25,7 +26,8 @@ impl Workspace {
             )
         };
         if self.help.is_open() {
-            return near(ShellWindow::ShortcutHelp).then_some(ShellWindow::ShortcutHelp);
+            return (!self.help.is_editor_help() && near(ShellWindow::ShortcutHelp))
+                .then_some(ShellWindow::ShortcutHelp);
         }
         if self.file_picker.is_some() {
             return (self.file_picker_controls_available() && near(ShellWindow::FilePicker))
@@ -34,10 +36,8 @@ impl Workspace {
         if self.projects.start().is_some() {
             return None;
         }
-        [Focus::Manager, Focus::Editor]
-            .map(ShellWindow::Pane)
-            .into_iter()
-            .find(|&target| near(target))
+        let manager = ShellWindow::Pane(Focus::Manager);
+        near(manager).then_some(manager)
     }
 
     /// Update the corner controls through `cx` when the hovered `target` changes.
@@ -98,17 +98,18 @@ impl Workspace {
             // GPUI forwards caption presses here before Windows starts its native move.
             return;
         }
-        self.dismiss_leader_hint(cx);
+        self.dismiss_sequence_hint(cx);
         self.prefix = None;
         if let Some(manager) = self
             .projects
             .active_project_mut()
             .and_then(|project| project.manager.as_mut())
         {
-            manager.paste_timer = None;
-            manager.count = 0;
+            manager.cancel_pending_undo();
+            manager.clear_count();
         }
         if self.press_editor_close(event, window, cx)
+            || self.press_remove_recent_project(event, window, cx)
             || self.press_language_picker(event.position, window, cx)
         {
             cx.stop_propagation();
@@ -138,6 +139,23 @@ impl Workspace {
             return;
         }
         let (x, y) = self.metrics.cell(event.position);
+        if let Some(target) = self.editor_header_target(x, y) {
+            match target {
+                HeaderTarget::Buffer(id) | HeaderTarget::Overflow(id) => {
+                    self.finish_editor_input(window, cx);
+                    let now = self.scroll_epoch.elapsed().as_secs_f64();
+                    let project = self.projects.active_mut();
+                    project.editor.select_buffer(id, now);
+                    project.focus_pane(Focus::Editor);
+                    project.status.clear();
+                    self.last_cursor_space = None;
+                    self.sync(window, cx);
+                }
+                HeaderTarget::Tabpage(index) => self.select_editor_page(index, window, cx),
+            }
+            cx.stop_propagation();
+            return;
+        }
         let Some(project) = self.projects.active_project_mut() else {
             self.press_start_page(event, window, cx);
             cx.stop_propagation();
@@ -146,18 +164,26 @@ impl Workspace {
         let first_click = project
             .manager
             .as_mut()
-            .and_then(|manager| manager.click.take());
+            .and_then(|manager| manager.take_click());
+        let first = if project.editor_first {
+            self.layout.editor
+        } else {
+            self.layout.tree
+        };
         if project.manager.is_some()
             && project.hidden_pane.is_none()
-            && y >= self.layout.tree.y
-            && y < self.layout.tree.y + self.layout.tree.h
-            && (x == self.layout.tree.w || x == self.layout.tree.w.saturating_sub(1))
+            && if project.stacked {
+                x >= first.x && x < first.x + first.w && y == first.y + first.h
+            } else {
+                y >= first.y
+                    && y < first.y + first.h
+                    && (x == first.x + first.w || x == first.x + first.w.saturating_sub(1))
+            }
         {
             self.resizing = true;
-        } else if let Some(manager) = &mut project.manager
-            && self.layout.tree.contains(x, y)
-        {
-            project.focus = Focus::Manager;
+        } else if project.manager.is_some() && self.layout.tree.contains(x, y) {
+            project.focus_pane(Focus::Manager);
+            let manager = project.manager.as_mut().expect("visible Explorer");
             if let Some(selection) = manager.press(
                 event,
                 self.layout.tree,
@@ -181,7 +207,7 @@ impl Workspace {
                 return;
             }
         } else if self.layout.editor.contains(x, y) {
-            project.focus = Focus::Editor;
+            project.focus_pane(Focus::Editor);
             if y == self.layout.editor.y || y == self.layout.editor.y + self.layout.editor.h - 1 {
                 self.sync(window, cx);
                 return;
@@ -196,6 +222,42 @@ impl Workspace {
         self.sync(window, cx);
     }
 
+    /// Identify a visible editor title entry at the same grid cells used to draw it.
+    fn editor_header_target(&self, x: usize, y: usize) -> Option<HeaderTarget> {
+        let area = self.layout.editor;
+        if y != area.y || !area.contains(x, y) {
+            return None;
+        }
+        self.projects
+            .active_project()?
+            .editor
+            .header(area, &self.spacing, self.layout.visible_cols)
+            .target_at(x, y)
+    }
+
+    /// Remove a file label on middle-click, while preserving Canvas input and modal ownership.
+    pub(super) fn middle_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.plugin_canvas_down(event) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.modal_open() || event.click_count > 1 || self.plugins.file_busy {
+            return;
+        }
+        let (x, y) = self.metrics.cell(event.position);
+        if let Some(HeaderTarget::Buffer(id)) = self.editor_header_target(x, y) {
+            self.finish_editor_input(window, cx);
+            self.request_close(super::editor_close::CloseTarget::Buffer(id), window, cx);
+            self.sync(window, cx);
+            cx.stop_propagation();
+        }
+    }
+
     /// Update close button hover from `event` or continue resizing or selection in `window`.
     pub(super) fn mouse_move(
         &mut self,
@@ -204,6 +266,21 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if self.file_picker.is_some() {
+            if !self.help.is_open() && !self.small_modal_open() {
+                let area = self.file_picker_layout().preview_editor_area();
+                if let Some(editor) = self
+                    .file_picker
+                    .as_mut()
+                    .and_then(|session| session.focused_editor_mut())
+                {
+                    if !event.dragging() {
+                        editor.stop_drag();
+                    } else if editor.drag(event.position, area, self.metrics, &self.spacing) {
+                        self.sync(window, cx);
+                        return;
+                    }
+                }
+            }
             self.set_controls_hover(self.corner_controls_at(event.position), cx);
             return;
         }
@@ -216,12 +293,26 @@ impl Workspace {
         };
         if !event.dragging() {
             self.resizing = false;
-            project.editor.dragging = None;
+            project.editor.stop_drag();
         }
         if self.resizing {
-            let (x, _) = self.metrics.cell(event.position);
-            project.sidebar = x;
-        } else if project.editor.dragging.is_some() {
+            let (x, y) = self.metrics.cell(event.position);
+            if project.stacked {
+                let first_rows = y.saturating_sub(1);
+                let rows = self.layout.tree.h + self.layout.editor.h;
+                project.manager_height = Some(if project.editor_first {
+                    rows.saturating_sub(first_rows)
+                } else {
+                    first_rows
+                });
+            } else {
+                project.sidebar = if project.editor_first {
+                    self.layout.cols.saturating_sub(x + 1)
+                } else {
+                    x
+                };
+            }
+        } else if project.editor.is_dragging() {
             if !project.editor.drag(
                 event.position,
                 self.layout.editor,
@@ -247,8 +338,15 @@ impl Workspace {
     ) {
         let mut native_drag = self.end_plugin_field_drag() || self.resizing;
         self.resizing = false;
+        if let Some(editor) = self
+            .file_picker
+            .as_mut()
+            .and_then(|session| session.focused_editor_mut())
+        {
+            editor.stop_drag();
+        }
         if let Some(project) = self.projects.active_project_mut() {
-            native_drag |= project.editor.dragging.take().is_some();
+            native_drag |= project.editor.stop_drag();
         }
         if !native_drag {
             self.plugin_canvas_up(event, window, cx);
@@ -276,18 +374,26 @@ impl Workspace {
         let (x, y) = self.metrics.cell(event.position);
         let delta = event.delta.pixel_delta(px(self.metrics.cw));
         let horizontal = event.modifiers.shift || (delta.x != px(0.) && delta.y == px(0.));
+        let horizontal_area = if self.file_picker.is_some() {
+            EditorWindow::body(self.file_picker_layout().preview_editor_area())
+        } else {
+            self.layout.editor
+        };
         if !self.help.is_open()
-            && self.file_picker.is_none()
-            && self.layout.editor.contains(x, y)
             && horizontal
+            && horizontal_area.contains(x, y)
+            && let Some(editor) = if let Some(session) = &mut self.file_picker {
+                session.focused_editor_mut()
+            } else {
+                self.projects
+                    .active_project_mut()
+                    .map(|project| &mut project.editor)
+            }
         {
-            let editor = &mut self.projects.active_mut().editor;
-            if editor.composition.is_empty() {
+            if editor.composition().is_empty() {
                 // GPUI on Windows has already converted Shift+wheel to an X delta.
                 let delta = if delta.x != px(0.) { delta.x } else { delta.y };
-                editor.horizontal_wheel += f32::from(delta) / self.metrics.cw;
-                let columns = editor.horizontal_wheel.trunc() as isize;
-                editor.horizontal_wheel -= columns as f32;
+                let columns = editor.wheel_columns(f32::from(delta) / self.metrics.cw);
                 if columns != 0 {
                     self.scroll_frame(
                         [
@@ -328,7 +434,7 @@ impl Workspace {
         let inputs = if self.layout.tree.contains(x, y) {
             [wheel, ScrollInput::Advance, ScrollInput::Advance]
         } else if self.layout.editor.contains(x, y)
-            && self.projects.active().editor.composition.is_empty()
+            && self.projects.active().editor.composition().is_empty()
         {
             [ScrollInput::Advance, wheel, ScrollInput::Advance]
         } else {

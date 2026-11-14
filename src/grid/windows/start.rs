@@ -1,8 +1,10 @@
 //! Read-only start page with a launcher and a recent-project picker.
 
 mod projects;
+mod remove_project;
 
 pub(in crate::grid) use projects::{ProjectLayout, ProjectPicker, ProjectPickerAction};
+pub(in crate::grid) use remove_project::RemoveProject;
 
 use crate::{
     grid::render::{CursorCell, Frame, Metrics, Rect},
@@ -35,7 +37,7 @@ const CAPTION_COLUMN: usize = 3;
 struct LauncherItem {
     /// Command invoked by the row, key or Enter.
     action: StartAction,
-    /// Fixed ASCII shortcut shown at the right edge.
+    /// Direct shortcut shown at the right edge.
     key: &'static str,
     /// Localized caption shown after the icon.
     caption: &'static str,
@@ -44,20 +46,11 @@ struct LauncherItem {
 }
 
 /// Launcher rows in display order.
-const ACTIONS: [LauncherItem; 5] = [
+const ACTIONS: [LauncherItem; 4] = [
     LauncherItem {
-        action: StartAction::File,
-        key: "f",
-        caption: "start.file",
-        icon: Icon::new(
-            include_bytes!("../../../assets/icons/start/find-file.svg"),
-            1.,
-        ),
-    },
-    LauncherItem {
-        action: StartAction::Directory,
+        action: StartAction::Open,
         key: "o",
-        caption: "start.directory",
+        caption: "start.open",
         icon: Icon::new(
             include_bytes!("../../../assets/icons/start/open-project.svg"),
             1.,
@@ -80,7 +73,7 @@ const ACTIONS: [LauncherItem; 5] = [
     },
     LauncherItem {
         action: StartAction::Quit,
-        key: "q",
+        key: "X",
         caption: "start.quit",
         icon: Icon::new(include_bytes!("../../../assets/icons/start/quit.svg"), 1.),
     },
@@ -91,10 +84,8 @@ const ACTIONS: [LauncherItem; 5] = [
 pub(in crate::grid) enum StartAction {
     /// Show projects that have been opened before.
     Projects,
-    /// Pick a directory in the native shell.
-    Directory,
-    /// Pick a file in the native shell.
-    File,
+    /// Browse for a project directory or file in the file picker.
+    Open,
     /// Report the availability of global configuration.
     Config,
     /// Close this start page.
@@ -102,11 +93,14 @@ pub(in crate::grid) enum StartAction {
 }
 
 impl StartAction {
-    /// Match a native `key` against the ASCII shortcut on a row, ignoring case.
-    pub(in crate::grid) fn from_key(key: &str) -> Option<Self> {
+    /// Match a resolved ASCII `character`, treating uppercase bindings as case-sensitive.
+    pub(in crate::grid) fn from_key(character: &str) -> Option<Self> {
         ACTIONS
             .iter()
-            .find(|item| item.key.eq_ignore_ascii_case(key))
+            .find(|item| match item.key.as_bytes() {
+                [b'a'..=b'z'] => item.key.eq_ignore_ascii_case(character),
+                _ => item.key == character,
+            })
             .map(|item| item.action)
     }
 }
@@ -209,7 +203,7 @@ impl StartPage {
                     .next()
                     .map_or(1., |cell| cell.end as f32 / UNITS_PER_COLUMN as f32);
                 (
-                    CAPTION_COLUMN,
+                    CAPTION_COLUMN as f32,
                     MENU_TOP + self.menu_selection * MENU_STEP,
                     width,
                 )
@@ -219,15 +213,15 @@ impl StartPage {
                     .picker
                     .as_ref()
                     .expect("project layout belongs to the picker");
-                let (column, row) = picker.caret(layout);
+                let (column, row) = picker.caret(layout, spacing);
                 (column, row, 1.)
             }
         };
         (
             CursorCell {
                 row,
-                column: column as f32,
-                origin: metrics.at((area.x + column) as f32, (area.y + row) as f32),
+                column,
+                origin: metrics.at(area.x as f32 + column, (area.y + row) as f32),
             },
             width,
         )
@@ -299,7 +293,7 @@ impl StartPage {
                 spacing.cells(&caption),
                 0..area.w.saturating_sub(2),
                 0,
-                |_| (TEXT, 0),
+                |_| (TEXT, 0, false),
             );
             frame.right_label(row, area.w, item.key, GOLD, spacing);
         }
@@ -309,11 +303,19 @@ impl StartPage {
 }
 
 impl StartLayout {
-    /// Return the complete painted rectangle in start-page cells.
+    /// Return the menu or bordered pane bounds in start-page cells.
     pub(in crate::grid) fn area(self) -> Rect {
         match self {
             Self::Menu(area) => area,
             Self::Projects(layout) => layout.area,
+        }
+    }
+
+    /// Return the painted bounds including any row below the picker panes.
+    pub(in crate::grid) fn frame_area(self) -> Rect {
+        match self {
+            Self::Menu(area) => area,
+            Self::Projects(layout) => layout.frame_area(),
         }
     }
 
@@ -346,6 +348,8 @@ impl StartLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::keys::normal_character;
+    use gpui::Keystroke;
 
     /// Clickable rows and ASCII shortcuts follow the same launcher order.
     #[test]
@@ -353,15 +357,36 @@ mod tests {
         let page = StartPage::default();
         let layout = page.layout(90, 24);
         let area = layout.area();
-        assert_eq!(page.selected_action(), StartAction::File);
+        assert_eq!(page.selected_action(), StartAction::Open);
+        assert_eq!(StartAction::from_key("f"), None);
         assert_eq!(StartAction::from_key("n"), None);
-        for (index, key) in ["f", "o", "p", "c", "q"].into_iter().enumerate() {
-            let action = ACTIONS[index].action;
-            assert_eq!(StartAction::from_key(key), Some(action));
-            assert_eq!(StartAction::from_key(&key.to_uppercase()), Some(action));
+        assert_eq!(StartAction::from_key("q"), None);
+        for (binding, text, expected) in
+            [("x", "X", None), ("shift-x", "x", Some(StartAction::Quit))]
+        {
+            let mut key = Keystroke::parse(binding).unwrap();
+            key.key_char = Some(text.into());
+            assert_eq!(
+                normal_character(&key)
+                    .as_deref()
+                    .and_then(StartAction::from_key),
+                expected
+            );
+        }
+        let caption = match i18n::locale() {
+            i18n::Locale::English => "Open a project / file",
+            i18n::Locale::SimplifiedChinese => "打开项目 / 文件",
+        };
+        assert_eq!(i18n::text(ACTIONS[0].caption), caption);
+        for (index, item) in ACTIONS.iter().enumerate() {
+            assert_eq!(StartAction::from_key(item.key), Some(item.action));
+            assert_eq!(
+                StartAction::from_key(&item.key.to_ascii_uppercase()),
+                Some(item.action)
+            );
             assert_eq!(
                 layout.hit(&page, area.x + 3, area.y + MENU_TOP + index * MENU_STEP),
-                Some(StartHit::Menu(action))
+                Some(StartHit::Menu(item.action))
             );
         }
     }

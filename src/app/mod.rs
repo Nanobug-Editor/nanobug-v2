@@ -2,12 +2,16 @@
 
 use crate::{
     grid::{Workspace, WorkspaceTabs},
-    ui::icons::IconCache,
+    ui::{
+        icons::IconCache,
+        theme::{AppearanceSettings, GridFont},
+    },
 };
 use gpui::{
     App, AppContext, Bounds, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
     WindowOptions, px, size,
 };
+use nanobug::app_data::settings;
 
 /// Open the supplied directories or files, or show the start page without arguments.
 pub(crate) fn run() {
@@ -36,7 +40,10 @@ pub(crate) fn run() {
     };
     let paths: Vec<_> = args.into_iter().map(|path| cwd.join(path)).collect();
     // The initial documents and Explorer rows use no native window state.
-    let projects = std::thread::spawn(move || WorkspaceTabs::new(paths));
+    let projects = std::thread::spawn(move || {
+        crate::ui::theme::load_for_editor();
+        WorkspaceTabs::new(paths)
+    });
     #[cfg(windows)]
     let platform: std::rc::Rc<dyn gpui::Platform> = std::rc::Rc::new(
         gpui_windows::WindowsPlatform::new_with_parallel_graphics()
@@ -57,6 +64,9 @@ pub(crate) fn run() {
     let font_system = glyphs.clone();
     let font_trace = plugin_trace.clone();
     let fonts = std::thread::spawn(move || {
+        let mut appearance = settings::path()
+            .and_then(|path| AppearanceSettings::load(&path))
+            .unwrap_or_default();
         font_system
             .add_fonts(vec![
                 std::borrow::Cow::Borrowed(include_bytes!(concat!(
@@ -73,9 +83,16 @@ pub(crate) fn run() {
                 ))),
             ])
             .expect("register bundled grid fonts");
+        if appearance.font == GridFont::MapleMono
+            && let Err(error) = GridFont::ensure_maple(font_system.as_ref())
+        {
+            eprintln!("{error:#}");
+            appearance.font = GridFont::default();
+        }
         if let Some(trace) = font_trace {
             trace.mark("fonts_registered", serde_json::Value::Null);
         }
+        appearance
     });
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     let (platform, native_atlases) = crate::ui::native_atlas::NativeAtlases::wrap(platform);
@@ -100,7 +117,7 @@ pub(crate) fn run() {
                 ..Default::default()
             },
             move |window, cx| {
-                fonts.join().expect("bundled font preparation");
+                let appearance = fonts.join().expect("bundled font preparation");
                 let projects = projects.join().expect("startup project preparation");
                 #[cfg(feature = "plugin-probe")]
                 if let Some(probe) = &mut probe {
@@ -110,6 +127,7 @@ pub(crate) fn run() {
                     let workspace = Workspace::new(
                         projects,
                         glyphs,
+                        appearance,
                         window,
                         cx,
                         plugins,

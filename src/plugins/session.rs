@@ -1,6 +1,7 @@
 //! Editor-facing plugin session. Child processes and filesystem work stay off the UI thread.
 
 mod engine;
+mod profile;
 mod rules;
 mod trace;
 pub use super::pipe::PROCESS_MEMORY_LABEL;
@@ -14,138 +15,18 @@ pub use engine::config::{
 pub use engine::developer::DeveloperSettings;
 pub use trace::Trace;
 
-use super::package::{HostCompatibility, Identity, InstallStore, Installed, Manifest, Release};
+use super::package::{Identity, Installed, Manifest, Release};
 use nanobug_plugin_sdk::{
     DocumentSnapshot, GridSurface, Instance, Output, Permission, PluginEvent,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsString,
-    fs,
-    io::{self, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex, mpsc},
     time::Duration,
 };
 
-/// Plugin data and proposal policy selected for this editor invocation.
-pub struct Options {
-    root: Option<PathBuf>,
-    development: bool,
-    pub enabled: bool,
-    trace: Option<PathBuf>,
-}
-
-impl Options {
-    /// Consume plugin flags without treating a profile path as a project.
-    pub fn take(args: &mut Vec<OsString>, cwd: &Path) -> anyhow::Result<Self> {
-        let mut root = None;
-        let mut development = false;
-        let mut enabled = true;
-        let mut trace = None;
-        let mut index = 0;
-        while index < args.len() {
-            match args[index].to_str() {
-                Some("--plugin-profile" | "--plugin-dev-profile") => {
-                    anyhow::ensure!(root.is_none(), "Specify only one plugin profile");
-                    development = args.remove(index) == "--plugin-dev-profile";
-                    anyhow::ensure!(index < args.len(), "Expected a plugin profile directory");
-                    root = Some(cwd.join(args.remove(index)));
-                }
-                Some("--no-plugins") => {
-                    args.remove(index);
-                    enabled = false;
-                }
-                Some("--plugin-trace") => {
-                    args.remove(index);
-                    anyhow::ensure!(index < args.len(), "Expected a plugin trace file");
-                    trace = Some(cwd.join(args.remove(index)));
-                }
-                Some("--") => {
-                    args.remove(index);
-                    break;
-                }
-                _ => index += 1,
-            }
-        }
-        Ok(Self {
-            root,
-            development,
-            enabled,
-            trace,
-        })
-    }
-
-    /// Explicit profiles keep editor session history out of the ordinary environment.
-    pub fn isolated(&self) -> bool {
-        self.root.is_some()
-    }
-
-    /// Take the opt-in performance destination before opening the workspace.
-    pub fn start_trace(&mut self) -> Option<Trace> {
-        self.trace.take().map(Trace::new)
-    }
-
-    /// Resolve the per-user data directory after core startup.
-    pub fn store(self) -> anyhow::Result<InstallStore> {
-        let default = dirs::data_local_dir().map(|path| path.join("Nanobug").join("plugins-v1"));
-        let root = self
-            .root
-            .or_else(|| default.clone())
-            .ok_or_else(|| anyhow::anyhow!("Plugin data directory is unavailable"))?;
-        if self.development {
-            // Comparing resolved paths also prevents aliases into the ordinary profile.
-            let development = super::query::resolve_prefix(&root)?;
-            if let Some(default) = default {
-                let default = super::query::resolve_prefix(&default)?;
-                anyhow::ensure!(
-                    !development.starts_with(&default) && !default.starts_with(&development),
-                    "Choose a development directory separate from the regular plugin profile"
-                );
-            }
-        }
-        Ok(InstallStore::with_compatibility(
-            bind_profile_mode(&root, self.development)?,
-            HostCompatibility::current(self.development),
-        ))
-    }
-}
-
-/// Assign an unmarked profile on first use and keep its resolved directory in one mode.
-fn bind_profile_mode(root: &Path, development: bool) -> anyhow::Result<PathBuf> {
-    fs::create_dir_all(root)?;
-    let root = root.canonicalize()?;
-    let path = root.join("profile.mode");
-    let expected: &[u8] = if development {
-        b"development\n"
-    } else {
-        b"regular\n"
-    };
-    let read = || super::package::read_limited(&path, 32);
-    let actual = match read() {
-        Ok(mode) => mode,
-        Err(error)
-            if error
-                .downcast_ref::<io::Error>()
-                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
-        {
-            let mut staged = tempfile::NamedTempFile::new_in(&root)?;
-            staged.write_all(expected)?;
-            staged.as_file().sync_all()?;
-            match staged.persist_noclobber(&path) {
-                Ok(_) => return Ok(root),
-                Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => read()?,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(error) => return Err(error),
-    };
-    anyhow::ensure!(
-        actual == expected,
-        "Plugin profile belongs to another editor mode. Choose a separate profile directory."
-    );
-    Ok(root)
-}
+pub use profile::Options;
 
 /// A live project with its most recent open document snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,7 +81,7 @@ pub struct InstallReview {
 }
 
 /// One catalog entry, loaded only at startup and on opening Marketplace.
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogEntry {
     pub identity: Identity,
@@ -273,6 +154,15 @@ pub struct DocumentPresentation {
     pub features: nanobug_plugin_sdk::language::DocumentFeatures,
 }
 
+/// Live diagnostics for one version of the current document.
+#[derive(Clone)]
+pub struct DocumentDiagnostics {
+    pub version: (u64, u64),
+    /// File identity, because a rename may leave the editor revision unchanged.
+    pub path: PathBuf,
+    pub diagnostics: Vec<nanobug_plugin_sdk::Diagnostic>,
+}
+
 /// Read-only state published as a whole. The native renderer never waits for a reply.
 #[derive(Clone, Default)]
 pub struct View {
@@ -293,6 +183,8 @@ pub struct View {
     pub file_operations: Option<(String, Vec<super::file_operations::FileOperationReceipt>)>,
     /// Host-only destination for the editor's file-operation receipts.
     pub operation_root: Option<PathBuf>,
+    /// Directory of the last archive chosen in this plugin profile's local ZIP picker.
+    pub local_zip_directory: Option<PathBuf>,
     pub modules: BTreeMap<Key, State>,
     /// Status from a fresh activation check when an earlier valid match is still in use.
     pub rule_warnings: BTreeMap<Key, String>,
@@ -301,6 +193,10 @@ pub struct View {
     pub surfaces: BTreeMap<Key, Surface>,
     /// The latest valid presentation of the current document from each provider.
     pub document_presentations: BTreeMap<Key, Arc<DocumentPresentation>>,
+    /// Revision-matched diagnostics from the project language server.
+    pub document_diagnostics: BTreeMap<Key, Arc<DocumentDiagnostics>>,
+    /// Latest language-server startup or transport failure for each interested module.
+    pub analyzer_errors: BTreeMap<Key, String>,
     pub workers: BTreeMap<String, u32>,
     pub runtime_status: BTreeMap<String, RuntimeStatus>,
     pub host_resources: BTreeMap<Key, HostScopeStatus>,
@@ -328,6 +224,8 @@ pub struct CallResult {
 /// User and editor events queued on the supervisor.
 pub enum Action {
     InspectZip(PathBuf),
+    /// Remember the directory of the archive selected in the local picker and inspect it.
+    InspectChosenZip(PathBuf),
     InspectDevelopment(PathBuf),
     SetDeveloperSettings(String, DeveloperSettings),
     BuildDevelopment(String),
@@ -451,7 +349,7 @@ impl Session {
                 ),
                 Err(error) => {
                     *worker_view.lock().unwrap() = Arc::new(View {
-                        message: error.to_string(),
+                        message: format!("{error:#}"),
                         ..View::default()
                     });
                     let _ = notify.try_send(());

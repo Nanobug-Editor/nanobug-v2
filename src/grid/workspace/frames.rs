@@ -13,17 +13,13 @@ use crate::{
         render::{Frame, Rect},
         windows::WindowFrame,
     },
-    ui::theme::{ACCENT, CURRENT, CURSOR_TEXT, MUTED, TEXT},
+    ui::theme::{
+        ACCENT, CURRENT, CURSOR_TEXT, FOOTER_BLUE, FOOTER_DETAILS, FOOTER_INSERT, FOOTER_VISUAL,
+        MUTED, TEXT, ThemeComponent, WARNING_TEXT, style,
+    },
 };
 use gpui::{Context, px};
 use nanobug::{i18n, vim::Mode};
-
-/// Cool blue for the normal mode and cursor position badges.
-const FOOTER_BLUE: u32 = 0x89adf4;
-/// Darker RGBA backing for encoding and line progress.
-const FOOTER_DETAILS: u32 = 0x3b4564ff;
-/// Lavender distinguishes selection modes at a glance.
-const FOOTER_VISUAL: u32 = 0xc4a7f4;
 
 /// Format `progress` (0–100) and one-based `line` and `column` in fixed-width footer slots.
 /// The colon anchors both coordinates. Values that exceed their field show a lower bound.
@@ -48,6 +44,7 @@ impl Workspace {
     /// Update the workspace and active popup frames through `cx`.
     pub(super) fn refresh_panels(&mut self, cx: &mut Context<Self>) {
         self.refresh_tab_bar(cx);
+        self.refresh_sequence_hint(cx);
         if self.file_picker.is_some() {
             self.refresh_file_picker(cx);
             self.refresh_help_panels(cx);
@@ -57,11 +54,12 @@ impl Workspace {
         }
         if self.projects.start().is_some() {
             self.refresh_start_page(cx);
+            self.refresh_remove_recent_project(cx);
             self.refresh_language_picker(cx);
             self.refresh_editor_close(cx);
             return;
         }
-        let (frames, tree_name_preview) = self.frames();
+        let (frames, tree_name_preview) = self.frames(style(cx));
         for (panel, frame) in self.panels.iter().chain(self.bodies.iter()).zip(frames) {
             panel.update(cx, |panel, cx| panel.set(frame, cx));
         }
@@ -108,14 +106,15 @@ impl Workspace {
         let vim = active.editor.vim();
         let cols = self.layout.cols;
         let mut footer = Frame::new(cols, FOOTER_ROWS);
+        footer.set_theme_component(ThemeComponent::Footer);
         footer.inset_row_tints(px(FOOTER_BADGE_INSET_Y));
         let doc = &vim.doc;
         let (row, column) = doc.location(doc.cursor);
         let line = row + 1;
-        let progress = line * 100 / doc.starts.len().max(1);
+        let progress = line.min(vim.line_count()) * 100 / vim.line_count();
         let (details, position) = footer_labels(line, column + 1, progress);
         let slots = self.footer_slots();
-        let blue = (FOOTER_BLUE << 8) | 0xff;
+        let blue = FOOTER_BLUE;
         footer.tint(
             0,
             slots.details_tip + 1,
@@ -131,9 +130,13 @@ impl Workspace {
         if active.hidden_pane != Some(Focus::Editor)
             && matches!(vim.mode, Mode::Command | Mode::Search)
         {
-            let mut command = active.editor.command_text();
-            command.push_str(&active.editor.composition.text);
-            footer.label(0, slots.left, &command, ACCENT, &self.spacing);
+            footer.label(
+                0,
+                slots.left,
+                &active.editor.command_text(),
+                ACCENT,
+                &self.spacing,
+            );
             return footer;
         }
 
@@ -141,8 +144,8 @@ impl Workspace {
             (i18n::text("manager.title"), FOOTER_BLUE)
         } else {
             let color = match vim.mode {
-                Mode::Insert => ACCENT,
-                Mode::Visual | Mode::VisualLine => FOOTER_VISUAL,
+                Mode::Insert | Mode::Replace => FOOTER_INSERT,
+                Mode::Visual | Mode::VisualLine | Mode::VisualBlock => FOOTER_VISUAL,
                 _ => FOOTER_BLUE,
             };
             (vim.mode.label(), color)
@@ -153,7 +156,7 @@ impl Workspace {
         let (background, foreground) = if modal_open {
             (CURRENT, MUTED)
         } else {
-            ((mode_color << 8) | 0xff, CURSOR_TEXT)
+            (mode_color, CURSOR_TEXT)
         };
         footer.tint(0, 0, tip, background);
         footer.chevron(0, tip, false, background);
@@ -165,24 +168,31 @@ impl Workspace {
             &self.spacing,
         );
 
-        let message = if active.status.is_empty() {
-            &vim.message
+        let (message, color) = if !active.status.is_empty() {
+            (active.status.as_str(), TEXT)
+        } else if !vim.message.is_empty() {
+            (vim.message.as_str(), TEXT)
+        } else if active.focus == Focus::Editor
+            && let Some(message) = active.editor.buffer().caret_diagnostic()
+        {
+            // The footer is a single grid row even when the language server sends notes.
+            (message.lines().next().unwrap_or_default(), WARNING_TEXT)
         } else {
-            &active.status
+            ("", TEXT)
         };
         let message_start = (tip + 1 + FOOTER_LABEL_GAP).min(slots.left.end);
         footer.label(
             0,
             message_start..slots.left.end,
             message,
-            TEXT,
+            color,
             &self.spacing,
         );
         footer
     }
 
-    /// Compose the active project's panes with the shared status and command row.
-    fn frames(&self) -> ([Frame; 6], Option<(Rect, Frame)>) {
+    /// Compose the active project's panes and use `appearance` for the Explorer preview background.
+    fn frames(&self, appearance: crate::ui::theme::Style) -> ([Frame; 6], Option<(Rect, Frame)>) {
         let layout = self.layout;
         let vim = self.projects.active().editor.vim();
         let help_open = self.help.is_open();
@@ -204,14 +214,16 @@ impl Workspace {
                         context(Focus::Manager, layout.tree),
                         layout.cols,
                         vim.doc.path.as_deref(),
+                        appearance,
                     );
                     (frames.chrome, frames.body, frames.preview)
                 },
             );
-        let editor = self.projects.active().editor.frames(
-            context(Focus::Editor, layout.editor),
-            &self.projects.active().root,
-        );
+        let editor = self
+            .projects
+            .active()
+            .editor
+            .frames(context(Focus::Editor, layout.editor), layout.visible_cols);
         (
             [
                 manager_chrome,

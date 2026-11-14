@@ -3,12 +3,15 @@
 mod archive;
 pub(super) mod background;
 mod receipt;
+pub(super) mod rust_analyzer;
+mod rustfmt;
 
 use super::package::{InstallStore, Installed, ToolDecl};
 use anyhow::{Context, Result, ensure};
+use nanobug_plugin_sdk::{DocumentSnapshot, document_wire::MAX_DOCUMENT_BYTES};
 use serde_json::{Value, json};
 use std::{
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, ExitStatus, Stdio},
     sync::{
@@ -57,7 +60,7 @@ impl Source {
         );
         if let Some(path) = &self.configured_path {
             let path = existing(&self.project, Path::new(path))?;
-            let lease = archive::lease_existing(self.store.root(), &path, &self.closed)?;
+            let lease = archive::lease_existing(self.store.state_root(), &path, &self.closed)?;
             return Ok(PreparedExecutable {
                 path,
                 _lease: lease,
@@ -83,7 +86,7 @@ impl Source {
                 .contains(&nanobug_plugin_sdk::Permission::Network),
             "Native tool downloads require network permission"
         );
-        archive::prepare(self.store.root(), download, &self.closed)
+        archive::prepare(self.store.state_root(), download, &self.closed)
     }
 }
 
@@ -175,6 +178,117 @@ fn command(executable: &Path, directory: &Path) -> Command {
         command.process_group(0);
     }
     command
+}
+
+/// Format a snapshot over pipes. Only the caller can apply the returned text to the buffer.
+pub(super) fn format_rust(
+    root: &Path,
+    path: &Path,
+    document: &DocumentSnapshot,
+    deadline: Instant,
+    closed: &AtomicBool,
+) -> Result<String> {
+    let check = || {
+        ensure!(
+            !closed.load(Ordering::Acquire),
+            "Project execution was stopped"
+        );
+        ensure!(Instant::now() < deadline, "rustfmt timed out");
+        Ok(())
+    };
+    check()?;
+    let mut launch = rustfmt::command(root, path)?;
+    launch.stdin(Stdio::piped()).stderr(Stdio::piped());
+    check()?;
+    let mut process = Process::own(launch.spawn().context("Could not start rustfmt")?)?;
+    let mut stdin = process
+        .child
+        .stdin
+        .take()
+        .context("rustfmt stdin is unavailable")?;
+    let stdout = process
+        .child
+        .stdout
+        .take()
+        .context("rustfmt stdout is unavailable")?;
+    let stderr = process
+        .child
+        .stderr
+        .take()
+        .context("rustfmt stderr is unavailable")?;
+    let source = document.text.clone();
+    let (writer, written) = mpsc::sync_channel(1);
+    // Drain both streams while supplying stdin so large snapshots cannot block the child.
+    std::thread::spawn(move || {
+        let result = stdin.write_all(source.as_bytes());
+        drop(stdin);
+        let _ = writer.send(result);
+    });
+    let output = read_rustfmt_pipe(stdout, MAX_DOCUMENT_BYTES);
+    let errors = read_rustfmt_pipe(stderr, OUTPUT_LIMIT);
+    let status = loop {
+        check()?;
+        if let Some(status) = process.child.try_wait()? {
+            process.group.take();
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+    if !status.success() {
+        let stderr = errors.recv_timeout(remaining()).ok().and_then(Result::ok);
+        let details = stderr.as_deref().map(String::from_utf8_lossy);
+        let summary: String = details
+            .as_deref()
+            .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
+            .unwrap_or("Check the Rust syntax and installed rustfmt component")
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(240)
+            .collect();
+        anyhow::bail!("rustfmt failed: {summary}");
+    }
+    written
+        .recv_timeout(remaining())
+        .context("rustfmt did not finish reading its input")??;
+    let bytes = output
+        .recv_timeout(remaining())
+        .context("rustfmt did not finish writing its output")??;
+    check()?;
+    ensure!(
+        bytes.len() <= MAX_DOCUMENT_BYTES,
+        "rustfmt output exceeds the plugin document size limit"
+    );
+    ensure!(
+        !bytes.is_empty() || document.text.trim().is_empty(),
+        "rustfmt returned no text"
+    );
+    let text = String::from_utf8(bytes).context("rustfmt output is not UTF-8")?;
+    Ok(if text.contains("\r\n") {
+        text.replace("\r\n", "\n")
+    } else {
+        text
+    })
+}
+
+/// Keep a bounded prefix while draining the pipe to EOF so the process can exit normally.
+fn read_rustfmt_pipe(
+    mut pipe: impl Read + Send + 'static,
+    limit: usize,
+) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
+    let (send, receive) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = (|| {
+            pipe.by_ref()
+                .take(limit as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            std::io::copy(&mut pipe, &mut std::io::sink())?;
+            Ok(bytes)
+        })();
+        let _ = send.send(result);
+    });
+    receive
 }
 
 struct Captured {

@@ -16,7 +16,7 @@ mod layout;
 mod leader_hint;
 #[cfg(all(test, windows))]
 mod native_test;
-mod plugin_manager;
+mod plugins;
 mod pointer;
 #[cfg(feature = "plugin-probe")]
 mod probe;
@@ -26,10 +26,14 @@ mod start_page;
 mod tabs;
 mod view;
 mod viewport;
+mod window_keys;
 
 use crate::grid::{
-    render::{Cursor, Metrics, Panel, Rect},
-    windows::{help::HelpWindow, start::StartPage},
+    render::{Cursor, Metrics, Panel, PopupBackdrop, Rect},
+    windows::{
+        help::HelpWindow,
+        start::{RemoveProject, StartPage},
+    },
 };
 
 use self::{
@@ -37,6 +41,7 @@ use self::{
     file_picker::PickerSession,
     keyboard::PendingPrefix,
     layout::{Layout, ShellWindow},
+    leader_hint::HintDelay,
     recent_projects::RecentProjects,
     start_page::StartPreview,
     tabs::TabBar,
@@ -62,20 +67,28 @@ pub(crate) struct Workspace {
     start_panel: Entity<Panel>,
     /// Directory scan shown by the active project picker.
     start_preview: Option<StartPreview>,
+    /// Selected history entry awaiting confirmation from the project picker.
+    remove_recent_project: Option<RemoveProject>,
     /// Active picker session, including its render panels and pending operations.
     file_picker: Option<PickerSession>,
     /// Last successfully browsed directory for openings from the start page.
     file_picker_directory: Option<PathBuf>,
     /// Shortcut-help window owns popup visibility and cached content.
     help: HelpWindow,
+    /// Shared blurred workspace image for the shortcut and plugin popups.
+    popup_backdrop: PopupBackdrop,
     /// Pending decisions for closing a pane, project or the native window.
     editor_close: Option<EditorClose>,
     /// Highlighted language while the picker is open.
     language_selection: Option<Locale>,
     /// Retained choices positioned between the language picker's two half-row gaps.
     language_list: Entity<Panel>,
-    /// Cached cells for the leader hint, language picker chrome or editor close dialog.
+    /// Cached cells for key sequence hints, language picker chrome or a confirmation dialog.
     popup_panel: Entity<Panel>,
+    /// Opening timer and visibility of the current key sequence hint.
+    hint_delay: HintDelay,
+    /// Current page of an oversized key sequence hint.
+    hint_page: usize,
     /// Window whose border currently shows its corner controls.
     hovered_controls: Option<ShellWindow>,
     /// Ignore repeats of a key that just dismissed a popup, pane or project.
@@ -83,12 +96,14 @@ pub(crate) struct Workspace {
     /// Windows interception of Alt+Esc while this native window is active.
     #[cfg(windows)]
     alt_escape: Option<alt_escape::AltEscape>,
-    /// Pending workspace leader or Explorer sequence.
+    /// Pending workspace leader, window command, or Explorer sequence.
     prefix: Option<PendingPrefix>,
     /// Current shared font geometry.
     metrics: Metrics,
     /// Editor-wide theme, grid font and independent user zoom.
     appearance: AppearanceSettings,
+    /// Settings file edited by explicit appearance commands.
+    appearance_settings_path: Option<PathBuf>,
     /// Device scale used to snap the current logical grid geometry.
     display_scale: f32,
     /// Native metrics for the actual glyphs selected by the window's text layout.
@@ -118,17 +133,18 @@ pub(crate) struct Workspace {
     /// Accumulated vertical wheel delta, supporting high-resolution touchpads.
     wheel: f32,
     /// Manager and the optional plugin surface that share the native keyboard and cursor.
-    plugins: plugin_manager::PluginUi,
+    plugins: plugins::PluginCoordinator,
     /// Optional native surface and host draft for the P0 experiment.
     #[cfg(feature = "plugin-probe")]
     probe: Option<probe::Probe>,
 }
 
 impl Workspace {
-    /// Open project `paths` in `window` through `cx`, using `glyphs` for text geometry.
+    /// Open `projects` in `window` through `cx`, measuring `glyphs` with the startup `appearance`.
     pub(crate) fn new(
         projects: WorkspaceTabs,
         glyphs: Arc<dyn PlatformTextSystem>,
+        appearance: AppearanceSettings,
         window: &mut Window,
         cx: &mut Context<Self>,
         plugins: nanobug::plugins::session::Options,
@@ -144,11 +160,12 @@ impl Workspace {
         } else {
             RecentProjects::new(projects.ordered().map(|project| project.root.clone()))
         };
-        let appearance = AppearanceSettings::default();
         cx.set_global(appearance.style(window.appearance()));
         let (metrics, spacing) = dpi::measure(window, &glyphs, appearance);
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
+        #[cfg(windows)]
+        Self::install_caption_tabs(window, cx);
         let weak = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             weak.update(cx, |workspace, cx| {
@@ -158,8 +175,9 @@ impl Workspace {
                 {
                     return false;
                 }
-                if workspace.file_picker.take().is_some() {
+                if workspace.file_picker.is_some() {
                     workspace.help.close();
+                    workspace.finish_file_picker(None, window, cx);
                 }
                 if workspace.prepare_plugin_close(CloseTarget::Quit, window, cx) {
                     return false;
@@ -175,8 +193,11 @@ impl Workspace {
         });
         cx.observe_window_activation(window, |workspace, window, cx| {
             if !window.is_window_active() {
-                workspace.dismiss_leader_hint(cx);
+                workspace.dismiss_sequence_hint(cx);
             }
+            workspace
+                .help
+                .update_keyboard_modifiers(window.modifiers(), false);
             #[cfg(windows)]
             {
                 if window.is_window_active() {
@@ -208,13 +229,17 @@ impl Workspace {
             recent_projects,
             start_panel: cx.new(|_| Panel::new(StartPage::content_metrics(metrics))),
             start_preview: None,
+            remove_recent_project: None,
             file_picker: None,
             file_picker_directory: None,
             help: HelpWindow::new(metrics, cx),
+            popup_backdrop: PopupBackdrop::default(),
             editor_close: None,
             language_selection: None,
             language_list: cx.new(|_| Panel::new(metrics)),
             popup_panel: cx.new(|_| Panel::new(metrics)),
+            hint_delay: HintDelay::default(),
+            hint_page: 0,
             hovered_controls: None,
             held_close_key: None,
             #[cfg(windows)]
@@ -222,6 +247,7 @@ impl Workspace {
             prefix: None,
             metrics,
             appearance,
+            appearance_settings_path: nanobug::app_data::settings::path().ok(),
             display_scale: window.scale_factor(),
             glyphs,
             spacing,
@@ -244,7 +270,7 @@ impl Workspace {
             cursor: cx.new(|_| Cursor::new(Effect::Afterglow, config)),
             resizing: false,
             wheel: 0.,
-            plugins: plugin_manager::PluginUi::new(
+            plugins: plugins::PluginCoordinator::new(
                 (!isolated).then_some(plugins),
                 plugin_trace,
                 metrics,
@@ -263,17 +289,21 @@ impl Workspace {
             || self.small_modal_open()
     }
 
-    /// Whether the language picker or editor close dialog currently owns pane input.
+    /// Whether the language picker or a confirmation dialog currently owns pane input.
     fn small_modal_open(&self) -> bool {
-        self.language_selection.is_some() || self.editor_close.is_some()
+        self.language_selection.is_some()
+            || self.editor_close.is_some()
+            || self.remove_recent_project.is_some()
     }
 
-    /// Keep Alt+Escape interception limited to the selected editor pane.
+    /// Enable Alt+Escape when the editor pane or its keyboard help owns input.
     #[cfg(windows)]
     fn editor_accepts_alt_escape(&self) -> bool {
-        self.projects
-            .active_project()
-            .is_some_and(|project| project.focus == layout::Focus::Editor)
-            && !self.modal_open()
+        self.help.keyboard_visible()
+            || !self.modal_open()
+                && self
+                    .projects
+                    .active_project()
+                    .is_some_and(|project| project.focus == layout::Focus::Editor)
     }
 }

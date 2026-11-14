@@ -19,11 +19,6 @@ pub(in crate::grid) enum ManagerCommand {
 }
 
 impl ManagerWindow {
-    /// Whether the unmodified printable `character` requests closing Explorer.
-    pub(in crate::grid) fn matches_close_key(character: Option<&str>) -> bool {
-        character == Some("q")
-    }
-
     /// Interpret `key` after `prefix`, updating local state and returning scroll and host effects.
     pub(in crate::grid) fn key(
         &mut self,

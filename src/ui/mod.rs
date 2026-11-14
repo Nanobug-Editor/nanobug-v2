@@ -2,6 +2,7 @@
 //! Concrete grid windows and their retained renderer live in `grid`.
 
 pub(crate) mod backdrop;
+pub(crate) mod file_icons;
 pub(crate) mod icons;
 pub(crate) mod ime;
 pub(crate) mod keys;

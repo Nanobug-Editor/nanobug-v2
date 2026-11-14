@@ -1,11 +1,11 @@
 //! Filesystem commands run by the picker on a background worker.
 
-use crate::grid::windows::{
-    PathChange,
-    file_picker::Delete,
-    manager::{FileTransfers, move_exclusive},
+use crate::grid::{
+    render::MessageLevel,
+    windows::{PathChange, file_picker::Delete},
 };
 use anyhow::{Context, Result, ensure};
+use nanobug::filesystem::{FileTransfers, move_exclusive};
 use nanobug::i18n;
 use std::{
     fs::{self, OpenOptions},
@@ -35,15 +35,18 @@ pub(super) struct Outcome {
     pub select: Option<PathBuf>,
     /// Localized operation feedback.
     pub status: String,
+    /// Severity of the operation feedback, including failures after partial changes.
+    pub level: MessageLevel,
 }
 
 impl Outcome {
-    /// Build feedback with no filesystem changes.
-    fn message(status: String) -> Self {
+    /// Build feedback of `level` with no filesystem changes.
+    fn message(level: MessageLevel, status: String) -> Self {
         Self {
             changes: Vec::new(),
             select: None,
             status,
+            level,
         }
     }
 }
@@ -58,7 +61,7 @@ impl Operation {
         roots: &[PathBuf],
     ) -> Outcome {
         self.apply(directory, transfers, dirty, roots)
-            .unwrap_or_else(|error| Outcome::message(format!("{error:#}")))
+            .unwrap_or_else(|error| Outcome::message(MessageLevel::Error, format!("{error:#}")))
     }
 
     /// Apply the operation and collect all visible changes for the workspace.
@@ -72,6 +75,7 @@ impl Operation {
         if let Self::External(path) = self {
             open::that_detached(&path).with_context(|| path.display().to_string())?;
             return Ok(Outcome::message(
+                MessageLevel::Info,
                 i18n::text("picker.external_opened").into(),
             ));
         }
@@ -105,13 +109,14 @@ impl Operation {
                     }],
                     select: Some(path),
                     status: i18n::text("picker.created").into(),
+                    level: MessageLevel::Info,
                 })
             }
             Self::Rename(path, name) => {
                 validate_parent(&path)?;
                 let target = child_path(path.parent().expect("validated parent"), &name)?;
                 if path == target {
-                    return Ok(Outcome::message(String::new()));
+                    return Ok(Outcome::message(MessageLevel::Info, String::new()));
                 }
                 guard_move(&path, roots)?;
                 guard_dirty(&path, dirty)?;
@@ -132,6 +137,7 @@ impl Operation {
                     }],
                     select: Some(target),
                     status: i18n::text("picker.renamed").into(),
+                    level: MessageLevel::Info,
                 })
             }
             Self::Delete(delete) => delete_paths(delete, dirty, roots),
@@ -147,6 +153,7 @@ impl Operation {
                     changes,
                     select,
                     status: i18n::text("manager.pasted").into(),
+                    level: MessageLevel::Info,
                 })
             }
             Self::External(_) => {
@@ -206,7 +213,7 @@ fn delete_paths(delete: Delete, dirty: &[PathBuf], roots: &[PathBuf]) -> Result<
         guard_dirty(path, dirty)?;
         guard_move(path, roots)?;
     }
-    let mut outcome = Outcome::message(i18n::text("picker.deleted").into());
+    let mut outcome = Outcome::message(MessageLevel::Info, i18n::text("picker.deleted").into());
     for path in delete.paths {
         let result = if delete.permanent {
             permanently_delete(&path).map_err(anyhow::Error::from)
@@ -219,6 +226,7 @@ fn delete_paths(delete: Delete, dirty: &[PathBuf], roots: &[PathBuf]) -> Result<
                 to: None,
             }),
             Err(error) => {
+                outcome.level = MessageLevel::Error;
                 outcome.status = i18n::format(
                     "picker.delete_failed",
                     &[("path", &path.display()), ("error", &error)],
@@ -300,11 +308,13 @@ mod tests {
             &[],
         );
         assert!(conflict.changes.is_empty());
+        assert_eq!(conflict.level, MessageLevel::Error);
         assert_eq!(fs::read_to_string(&second).unwrap(), "second");
         assert!(child_path(&root, "../escape").is_err());
         let renamed =
             Operation::Rename(first, "中文.txt".into()).run(Some(&root), &mut transfers, &[], &[]);
         assert_eq!(renamed.select, Some(root.join("中文.txt")));
+        assert_eq!(renamed.level, MessageLevel::Info);
         assert_eq!(fs::read_to_string(root.join("中文.txt")).unwrap(), "first");
     }
 }
