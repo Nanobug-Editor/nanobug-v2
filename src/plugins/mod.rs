@@ -1,5 +1,6 @@
 //! Host contracts for plugin packages, execution, and editor services.
 
+pub mod completion;
 mod credentials;
 pub mod drawing;
 pub mod edits;

@@ -4,9 +4,50 @@ use super::{Buffer, EditorWindow};
 use crate::ui::ime::Composition;
 
 impl EditorWindow {
-    /// Inspect all canonical buffers, including those retained by other pages.
+    /// Inspect all buffers owned by this window.
     pub(in crate::grid) fn buffers(&self) -> &[Buffer] {
         &self.buffers
+    }
+
+    /// Enumerate this window's file labels in display order.
+    pub(in crate::grid) fn visible_buffers(&self) -> std::slice::Iter<'_, Buffer> {
+        self.buffers.iter()
+    }
+
+    /// Resolve a file label's stable buffer identity to this window's buffer index.
+    pub(in crate::grid) fn buffer_index(&self, id: u64) -> Option<usize> {
+        self.buffers.iter().position(|buffer| buffer.id == id)
+    }
+
+    /// Select a file by its label, retaining the outgoing buffer's viewport.
+    pub(in crate::grid) fn select_buffer(&mut self, id: u64, _now: f64) -> bool {
+        let Some(index) = self.buffer_index(id).filter(|&index| index != self.active) else {
+            return false;
+        };
+        self.cancel_pending();
+        self.active = index;
+        self.reset_buffer_input();
+        true
+    }
+
+    /// Cancel pointer and native composition state when changing buffers or panes.
+    pub(super) fn reset_buffer_input(&mut self) {
+        self.composition.clear();
+        self.dragging = None;
+        self.reset_wheel();
+    }
+
+    /// Settle the current input sequence before leaving the editor or checking for unsaved changes.
+    pub(in crate::grid) fn finish_buffer_input(&mut self) -> super::EditResult {
+        self.reset_buffer_input();
+        self.edit(|vim, register| {
+            if vim.mode == nanobug::vim::Mode::Normal {
+                vim.cancel_pending();
+                nanobug::vim::Action::None
+            } else {
+                vim.key("Escape", register)
+            }
+        })
     }
 
     /// Index of the buffer currently presented by this window.
@@ -17,6 +58,11 @@ impl EditorWindow {
     /// Inspect the displayed buffer and its retained viewport.
     pub(in crate::grid) fn buffer(&self) -> &Buffer {
         &self.buffers[self.active]
+    }
+
+    /// Override the SQL dialect for the selected buffer without touching its text.
+    pub(in crate::grid) fn set_sql_dialect(&mut self, dialect: Option<String>) {
+        self.buffers[self.active].set_sql_dialect(dialect);
     }
 
     /// Native input routes use this preedit without changing committed document text.
@@ -88,7 +134,7 @@ impl EditorWindow {
         buffer.vim.jump_to(offset);
     }
 
-    /// Navigate this page's buffers in `forward` order or select the `edge`.
+    /// Navigate this window's buffers in `forward` order or select the `edge`.
     /// An explicit `count` on an edge command selects a one-based buffer index.
     pub(in crate::grid) fn navigate_buffers(
         &mut self,
@@ -106,7 +152,7 @@ impl EditorWindow {
             index
         } else {
             let distance = count.unwrap_or(1) % len;
-            (self.visible_buffer_index() + if forward { distance } else { len - distance }) % len
+            (self.active + if forward { distance } else { len - distance }) % len
         };
         let id = self.visible_buffers().nth(index).unwrap().id;
         self.select_buffer(id, 0.);

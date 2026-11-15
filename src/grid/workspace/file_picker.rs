@@ -1039,11 +1039,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let dirty = self
-            .projects
-            .ordered()
-            .flat_map(|project| project.editor.dirty_paths())
-            .collect::<Vec<_>>();
+        let dirty = self.projects.dirty_paths().collect::<Vec<_>>();
         let roots = self
             .projects
             .ordered()

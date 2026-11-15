@@ -1,0 +1,151 @@
+use super::*;
+use crate::grid::{render::Rect, workspace::editor_splits::SplitAxis};
+use std::fs;
+
+/// Give the test tabs an isolated store at `directory`.
+fn tabs_with_store(directory: &Path) -> WorkspaceTabs {
+    let mut tabs = WorkspaceTabs::new(Vec::new());
+    tabs.sessions.directory = Some(directory.to_owned());
+    tabs
+}
+
+/// Restore nested splits and duplicate file views while rereading text from disk.
+#[test]
+fn restores_project_pages_panes_and_file_views_without_drafts() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let root = workspace.path().canonicalize()?;
+    let store = root.join("sessions");
+    let readme = root.join("README.md");
+    let source = root.join("source.txt");
+    fs::write(&readme, "first\nsecond\nthird\nfourth\n")?;
+    fs::write(&source, "source\n")?;
+
+    let mut tabs = tabs_with_store(&store);
+    tabs.replace_start_with_project(root.clone());
+    let project = tabs.active_mut();
+    project.editor.open(source.clone(), 0.)?;
+    project.editor.open(readme.clone(), 0.)?;
+    let first = project.active_editor_id();
+    let buffer = project.editor.buffer_mut();
+    buffer.vim.doc.cursor = buffer.vim.doc.offset(1, 2);
+    buffer.scroll.snap(1, 0.);
+    buffer.columns.snap(2, 0.);
+    let area = Rect {
+        x: 0,
+        y: 0,
+        w: 120,
+        h: 40,
+    };
+    assert!(project.open_split(SplitAxis::Columns, Some(readme.clone()), area, 0.)?);
+    let second = project.active_editor_id();
+    let buffer = project.editor.buffer_mut();
+    buffer.vim.doc.cursor = buffer.vim.doc.offset(2, 3);
+    buffer.scroll.snap(2, 0.);
+    assert!(
+        project
+            .editor
+            .set_markdown_view_mode(crate::grid::windows::editor::MarkdownViewMode::Edit)
+    );
+    assert!(project.open_split(SplitAxis::Rows, Some(source.clone()), area, 0.)?);
+    project.sidebar = 33;
+    project.open_page(Some(source.clone()), 0.)?;
+    assert_eq!(project.active_page(), 1);
+    let snapshot = ProjectSnapshot::capture(project);
+    project
+        .editor
+        .edit(|vim, register| vim.text("iPRIVATE DRAFT", register));
+    assert!(
+        tabs.session_batch(Some(CloseTarget::Tab))
+            .unwrap()
+            .write()
+            .is_empty()
+    );
+    let bytes = fs::read_to_string(session_path(&store, &root))?;
+    assert!(!bytes.contains("PRIVATE DRAFT"));
+
+    let mut reopened = tabs_with_store(&store);
+    let (_, added) = reopened.add(root.clone(), None);
+    assert!(added);
+    let recovered = reopened.project_mut(1);
+    assert_eq!(recovered.editor.vim().doc.text, "source\n");
+    assert_eq!(recovered.active_page(), 1);
+    assert!(ProjectSnapshot::capture(recovered).pages == snapshot.pages);
+    assert!(recovered.select_page(0, 0.));
+    assert_eq!(recovered.sidebar, 33);
+    assert_eq!(recovered.split_count(), 3);
+    for (id, row) in [(first, 1), (second, 2)] {
+        let pane = recovered.editor_by_id(id).unwrap();
+        let buffer = pane.buffer();
+        assert_eq!(buffer.vim.doc.path.as_deref(), Some(readme.as_path()));
+        assert_eq!(buffer.vim.doc.location(buffer.vim.doc.cursor).0, row);
+        assert_eq!(buffer.scroll.target(), row);
+    }
+    assert_eq!(recovered.editor_by_id(first).unwrap().buffers().len(), 2);
+    assert_eq!(
+        recovered
+            .editor_by_id(first)
+            .unwrap()
+            .buffer()
+            .columns
+            .target(),
+        2
+    );
+    assert_eq!(
+        recovered.editor_by_id(second).unwrap().markdown_view_mode(),
+        Some(crate::grid::windows::editor::MarkdownViewMode::Edit)
+    );
+    Ok(())
+}
+
+/// Keep the most recent snapshot, skip missing file labels and honor an explicit file request.
+#[test]
+fn skips_missing_files_and_rejects_an_older_write_after_close() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let root = workspace.path().canonicalize()?;
+    let store = root.join("sessions");
+    let readme = root.join("README.md");
+    let missing = root.join("missing.txt");
+    let requested = root.join("requested.txt");
+    fs::write(&readme, "first\nlast\n")?;
+    fs::write(&missing, "removed\n")?;
+    fs::write(&requested, "explicitly opened\n")?;
+    let mut tabs = tabs_with_store(&store);
+    tabs.replace_start_with_project(root.clone());
+    let delayed = tabs.session_batch(None).unwrap();
+    let project = tabs.active_mut();
+    let cursor = project.editor.vim().doc.offset(1, 3);
+    project.editor.buffer_mut().vim.doc.cursor = cursor;
+    project.editor.open(missing.clone(), 0.)?;
+    project.open_page(Some(readme), 0.)?;
+    assert!(
+        tabs.session_batch(Some(CloseTarget::Quit))
+            .unwrap()
+            .write()
+            .is_empty()
+    );
+    assert!(delayed.write().is_empty());
+    assert_eq!(fs::read_dir(&store)?.count(), 1);
+    fs::remove_file(missing)?;
+
+    let mut recovered = tabs.sessions.open(root, Some(requested.clone()));
+    assert_eq!(recovered.page_count(), 2);
+    assert_eq!(
+        recovered.editor.vim().doc.path.as_deref(),
+        Some(requested.as_path())
+    );
+    assert_eq!(
+        recovered.status,
+        i18n::format("project_session.skipped_files", &[("count", &1)])
+    );
+    assert!(recovered.select_page(0, 0.));
+    assert_eq!(recovered.editor.buffers().len(), 1);
+    assert_eq!(
+        recovered
+            .editor
+            .vim()
+            .doc
+            .location(recovered.editor.vim().doc.cursor),
+        (1, 3)
+    );
+    Ok(())
+}

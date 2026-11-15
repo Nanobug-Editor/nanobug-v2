@@ -29,6 +29,7 @@ pub(super) mod developer;
 mod drafts;
 mod language;
 mod resource;
+pub(super) mod sql_dialect;
 mod startup;
 mod tool_control;
 
@@ -99,6 +100,8 @@ struct Engine {
     records: BTreeMap<String, Arc<Installed>>,
     releases: BTreeMap<String, Arc<Release>>,
     projects: BTreeMap<u64, Project>,
+    /// Project preferences and overrides supplied by the editor's active buffers.
+    sql_dialects: sql_dialect::Dialects,
     active: Option<u64>,
     rules: Rules,
     config: config::Configurations,
@@ -240,6 +243,7 @@ impl Engine {
             records: BTreeMap::new(),
             releases: BTreeMap::new(),
             projects: BTreeMap::new(),
+            sql_dialects: sql_dialect::Dialects::new(&state),
             active: None,
             draft: drafts,
             draft_write: Instant::now(),
@@ -357,7 +361,7 @@ impl Engine {
         }
     }
 
-    fn projects(&mut self, (active, projects): Projects) {
+    fn projects(&mut self, (active, projects, dialects): Projects) {
         self.active = active;
         self.projects = projects
             .into_iter()
@@ -385,6 +389,9 @@ impl Engine {
             self.changed = true;
         }
         self.config.projects(self.projects.values());
+        if self.sql_dialects.update(&self.projects, dialects) {
+            self.reconcile();
+        }
     }
 
     fn config_affects_write(&self, scope: config::ConfigScope, revision: u64, owner: &Key) -> bool {
@@ -463,6 +470,7 @@ impl Engine {
         }
         let _ = self.flush_drafts(false, None);
         self.config.refresh();
+        self.sql_dialects.refresh();
         self.advance_config_applies();
         if let Some(configurations) = self.config.take_view() {
             self.view.configurations = Arc::new(configurations);

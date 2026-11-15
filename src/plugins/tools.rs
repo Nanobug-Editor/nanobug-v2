@@ -2,6 +2,7 @@
 
 mod archive;
 pub(super) mod background;
+mod language;
 mod receipt;
 pub(super) mod rust_analyzer;
 mod rustfmt;
@@ -22,6 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(super) use language::format_language;
 pub(super) use receipt::review;
 pub use receipt::{ToolOperation, ToolOperationState};
 
@@ -181,9 +183,9 @@ fn command(executable: &Path, directory: &Path) -> Command {
 }
 
 /// Format a snapshot over pipes. Only the caller can apply the returned text to the buffer.
-pub(super) fn format_rust(
-    root: &Path,
-    path: &Path,
+fn format_snapshot(
+    mut launch: Command,
+    tool: &str,
     document: &DocumentSnapshot,
     deadline: Instant,
     closed: &AtomicBool,
@@ -193,29 +195,32 @@ pub(super) fn format_rust(
             !closed.load(Ordering::Acquire),
             "Project execution was stopped"
         );
-        ensure!(Instant::now() < deadline, "rustfmt timed out");
+        ensure!(Instant::now() < deadline, "{tool} timed out");
         Ok(())
     };
     check()?;
-    let mut launch = rustfmt::command(root, path)?;
     launch.stdin(Stdio::piped()).stderr(Stdio::piped());
     check()?;
-    let mut process = Process::own(launch.spawn().context("Could not start rustfmt")?)?;
+    let mut process = Process::own(
+        launch
+            .spawn()
+            .with_context(|| format!("Could not start {tool}"))?,
+    )?;
     let mut stdin = process
         .child
         .stdin
         .take()
-        .context("rustfmt stdin is unavailable")?;
+        .context("Formatter stdin is unavailable")?;
     let stdout = process
         .child
         .stdout
         .take()
-        .context("rustfmt stdout is unavailable")?;
+        .context("Formatter stdout is unavailable")?;
     let stderr = process
         .child
         .stderr
         .take()
-        .context("rustfmt stderr is unavailable")?;
+        .context("Formatter stderr is unavailable")?;
     let source = document.text.clone();
     let (writer, written) = mpsc::sync_channel(1);
     // Drain both streams while supplying stdin so large snapshots cannot block the child.
@@ -224,8 +229,8 @@ pub(super) fn format_rust(
         drop(stdin);
         let _ = writer.send(result);
     });
-    let output = read_rustfmt_pipe(stdout, MAX_DOCUMENT_BYTES);
-    let errors = read_rustfmt_pipe(stderr, OUTPUT_LIMIT);
+    let output = read_format_pipe(stdout, MAX_DOCUMENT_BYTES);
+    let errors = read_format_pipe(stderr, OUTPUT_LIMIT);
     let status = loop {
         check()?;
         if let Some(status) = process.child.try_wait()? {
@@ -241,29 +246,29 @@ pub(super) fn format_rust(
         let summary: String = details
             .as_deref()
             .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
-            .unwrap_or("Check the Rust syntax and installed rustfmt component")
+            .unwrap_or("Check the document syntax and installed formatter")
             .chars()
             .filter(|c| !c.is_control())
             .take(240)
             .collect();
-        anyhow::bail!("rustfmt failed: {summary}");
+        anyhow::bail!("{tool} failed: {summary}");
     }
     written
         .recv_timeout(remaining())
-        .context("rustfmt did not finish reading its input")??;
+        .context("Formatter did not finish reading its input")??;
     let bytes = output
         .recv_timeout(remaining())
-        .context("rustfmt did not finish writing its output")??;
+        .context("Formatter did not finish writing its output")??;
     check()?;
     ensure!(
         bytes.len() <= MAX_DOCUMENT_BYTES,
-        "rustfmt output exceeds the plugin document size limit"
+        "Formatter output exceeds the plugin document size limit"
     );
     ensure!(
         !bytes.is_empty() || document.text.trim().is_empty(),
-        "rustfmt returned no text"
+        "Formatter returned no text"
     );
-    let text = String::from_utf8(bytes).context("rustfmt output is not UTF-8")?;
+    let text = String::from_utf8(bytes).context("Formatter output is not UTF-8")?;
     Ok(if text.contains("\r\n") {
         text.replace("\r\n", "\n")
     } else {
@@ -272,7 +277,7 @@ pub(super) fn format_rust(
 }
 
 /// Keep a bounded prefix while draining the pipe to EOF so the process can exit normally.
-fn read_rustfmt_pipe(
+fn read_format_pipe(
     mut pipe: impl Read + Send + 'static,
     limit: usize,
 ) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {

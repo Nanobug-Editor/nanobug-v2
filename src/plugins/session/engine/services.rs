@@ -121,7 +121,8 @@ impl Engine {
             | Service::DeleteCredential { key } => key,
             Service::QuerySyntax { .. }
             | Service::ReadProjectAncestors { .. }
-            | Service::Rustfmt => {
+            | Service::Rustfmt
+            | Service::FormatLanguage { .. } => {
                 self.message("This service requires an awaited invocation");
                 return;
             }

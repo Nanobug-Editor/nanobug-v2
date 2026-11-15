@@ -13,7 +13,7 @@ pub(in crate::grid) use cursor::Cursor;
 pub(in crate::grid) use geometry::exposed_regions;
 pub(crate) use geometry::{Metrics, Rect};
 pub(in crate::grid) use layer::GridLayer;
-pub(in crate::grid) use outline::OutlineStyle;
+pub(in crate::grid) use outline::{OutlineStyle, outline_path};
 pub(in crate::grid) use panel::sample_waves;
 pub(crate) use panel::{CursorCell, Panel};
 pub(in crate::grid) use popup::{
@@ -25,8 +25,8 @@ use crate::ui::{
     icons::{Icon, KeyIcon},
     text::{TextCell, TextSpacing, UNITS_PER_COLUMN},
     theme::{
-        ACCENT, ERROR_BORDER, ERROR_TEXT, GOLD, MUTED, Style, TEXT, ThemeComponent, WARNING_BORDER,
-        WARNING_TEXT,
+        ACCENT, ERROR_BORDER, ERROR_TEXT, GOLD, MUTED, Style, TEXT, TREE_GUIDE, ThemeComponent,
+        WARNING_BORDER, WARNING_TEXT,
     },
 };
 use gpui::{Bounds, Pixels, Point, point, px, size};
@@ -285,33 +285,65 @@ struct RowIcon {
     row: usize,
     /// SVG drawn at the cell anchor.
     icon: Icon,
-    /// Custom canvas relative to the row anchor. Other icons use a font-sized square.
-    canvas: Option<Bounds<Pixels>>,
+    /// Placement of the icon's canvas within the row.
+    placement: IconPlacement,
+}
+
+/// Determine the size and anchor of an SVG canvas.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IconPlacement {
+    /// A font-sized square starting at the column's left edge.
+    Default,
+    /// Explicit canvas relative to the column's left edge and the row midpoint.
+    Custom(Bounds<Pixels>),
+    /// Tight canvas ending at the column's right edge, sized as a percentage of the font size.
+    RightAligned(u8),
+}
+
+/// Snap a logical window coordinate to a device pixel boundary at `scale`.
+fn snap_pixel(value: Pixels, scale: f32) -> Pixels {
+    px((f32::from(value) * scale).round() / scale)
 }
 
 impl RowIcon {
     /// Return the icon's slot at panel `origin`, centered in its row using `metrics`.
-    fn bounds(&self, origin: Point<Pixels>, metrics: Metrics) -> Bounds<Pixels> {
-        let canvas = self.canvas.unwrap_or_else(|| {
-            let side = px(metrics.font_size);
-            Bounds::new(point(px(0.), -side / 2.), size(side, side))
-        });
+    /// Right-aligned icons use the raster dimensions at device `scale` to avoid a second fit.
+    fn bounds(&self, origin: Point<Pixels>, metrics: Metrics, scale: f32) -> Bounds<Pixels> {
         let anchor = origin
             + point(
                 px(self.column as f32 * metrics.cw),
                 px((self.row as f32 + 0.5) * metrics.lh),
             );
-        Bounds::new(anchor + canvas.origin, canvas.size)
+        match self.placement {
+            IconPlacement::Default => {
+                let side = px(metrics.font_size);
+                Bounds::new(anchor - point(px(0.), side / 2.), size(side, side))
+            }
+            IconPlacement::Custom(canvas) => Bounds::new(anchor + canvas.origin, canvas.size),
+            IconPlacement::RightAligned(percent) => {
+                let edge = (metrics.font_size * f32::from(percent) * 0.01 * scale)
+                    .round()
+                    .max(1.) as i32;
+                let (width, height) = self.icon.raster_dimensions(edge);
+                let width = px(width as f32 / scale);
+                let height = px(height as f32 / scale);
+                let right = snap_pixel(origin.x + px((self.column + 1) as f32 * metrics.cw), scale);
+                let top = snap_pixel(anchor.y - height / 2., scale);
+                Bounds::new(point(right - width, top), size(width, height))
+            }
+        }
     }
 }
 
-/// One horizontal or vertical tree guide with half-cell coordinates.
+/// One horizontal or vertical line with half-cell coordinates.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct GuideSegment {
     /// Start of the line in half columns and half rows.
     from: (usize, usize),
     /// End of the line in the same coordinates, to the right or below `from`.
     to: (usize, usize),
+    /// RGB role of a half-opacity rule, aligned by its right edge. Tree guides use their RGBA role.
+    rule: Option<u32>,
 }
 
 impl GuideSegment {
@@ -324,14 +356,26 @@ impl GuideSegment {
                     px(x as f32 * metrics.cw * 0.5),
                     px(y as f32 * metrics.lh * 0.5),
                 );
-            at.map(|v| px((f32::from(v) * scale).round() / scale))
+            at.map(|v| snap_pixel(v, scale))
         };
         let from = snap(self.from);
         let to = snap(self.to);
         let pixel = px(scale.recip());
         Bounds::new(
-            from,
+            if self.rule.is_some() {
+                from - point(pixel, px(0.))
+            } else {
+                from
+            },
             size((to.x - from.x).max(pixel), (to.y - from.y).max(pixel)),
+        )
+    }
+
+    /// Resolve the painted RGBA value using the panel's theme `style`.
+    fn color(self, style: Style) -> u32 {
+        self.rule.map_or_else(
+            || style.tint(TREE_GUIDE),
+            |role| (style.foreground(role) << 8) | 0x80,
         )
     }
 }
@@ -372,7 +416,7 @@ pub struct Frame {
     first_row: usize,
     /// Icons painted over the cells and retained separately from text shaping.
     icons: Vec<RowIcon>,
-    /// Explorer guides painted over the row tints, before the icons.
+    /// Guides and rules painted over the row tints, before the icons.
     guides: Vec<GuideSegment>,
     /// Tapered badge edges painted over row tints.
     chevrons: Vec<RowChevron>,
@@ -384,6 +428,10 @@ pub struct Frame {
     theme_component: Option<ThemeComponent>,
     /// Which parts of the panel receive the component background.
     theme_background: ThemeBackground,
+    /// Workspace columns within which text graphemes must fit completely to paint.
+    whole_grapheme_columns: Option<Range<usize>>,
+    /// Retained row and tint that continue for half a column past the text viewport.
+    trailing_row_tint: Option<(usize, u32)>,
 }
 
 impl Frame {
@@ -411,7 +459,19 @@ impl Frame {
             tint_inset: px(0.),
             theme_component: None,
             theme_background: ThemeBackground::Full,
+            whole_grapheme_columns: None,
+            trailing_row_tint: None,
         }
+    }
+
+    /// Paint whole text graphemes within `columns` measured from the workspace grid origin.
+    pub(in crate::grid) fn keep_whole_graphemes(&mut self, columns: Range<usize>) {
+        self.whole_grapheme_columns = Some(columns);
+    }
+
+    /// Continue the `row` tint past the fixed right viewport edge by half a column.
+    pub(in crate::grid) fn extend_row_tint(&mut self, row: usize, color: u32) {
+        self.trailing_row_tint = Some((row, color));
     }
 
     /// Apply the colors of `component` to this frame.
@@ -616,7 +676,24 @@ impl Frame {
             column,
             row,
             icon,
-            canvas: None,
+            placement: IconPlacement::Default,
+        });
+    }
+
+    /// Place a tightly cropped `icon` at the right edge of `column` on `row`.
+    /// Size its longer side to `percent` of the font size.
+    pub(in crate::grid) fn right_aligned_icon(
+        &mut self,
+        column: usize,
+        row: usize,
+        icon: Icon,
+        percent: u8,
+    ) {
+        self.icons.push(RowIcon {
+            column,
+            row,
+            icon,
+            placement: IconPlacement::RightAligned(percent),
         });
     }
 
@@ -643,7 +720,7 @@ impl Frame {
             column,
             row,
             icon,
-            canvas: Some(canvas),
+            placement: IconPlacement::Custom(canvas),
         });
     }
 
@@ -685,13 +762,26 @@ impl Frame {
         self.guides.push(GuideSegment {
             from: (x, y),
             to: (x, middle + usize::from(continues)),
+            rule: None,
         });
         if let Some(icon_column) = branch_before {
             self.guides.push(GuideSegment {
                 from: (x, middle),
                 to: ((x + 2).min(icon_column * 2), middle),
+                rule: None,
             });
         }
+    }
+
+    /// Draw a one-device-pixel rule on `row` to the left of the `column` boundary at half opacity.
+    /// Resolve the RGB `color` from the panel's theme.
+    pub(in crate::grid) fn vertical_rule(&mut self, column: usize, row: usize, color: u32) {
+        let x = column * 2;
+        self.guides.push(GuideSegment {
+            from: (x, row * 2),
+            to: (x, (row + 1) * 2),
+            rule: Some(color),
+        });
     }
 
     /// Draw a rounded border with measured `title` using `spacing` and the focus accent when `active`.

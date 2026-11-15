@@ -323,6 +323,18 @@ impl GridScroll {
     pub fn target(&self) -> usize {
         self.target
     }
+    /// Follow an already animated `position` from another viewport within `maximum`.
+    /// Use fractional cells while it moves, then settle on the nearest whole cell at `now`.
+    pub fn follow(&mut self, position: f32, maximum: usize, moving: bool, now: f64) {
+        let position = f64::from(position).clamp(0., maximum as f64);
+        self.maximum = maximum;
+        self.target = position.round() as usize;
+        self.spring
+            .snap(if moving { position } else { self.target as f64 });
+        self.last_time = now;
+        self.wheeling = false;
+        self.tail = false;
+    }
     /// Whether another viewport animation frame is necessary.
     pub fn is_active(&self) -> bool {
         self.spring.value != self.target as f64 || self.spring.velocity != 0.

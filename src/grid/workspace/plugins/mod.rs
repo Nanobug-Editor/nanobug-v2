@@ -10,6 +10,7 @@ mod edits;
 mod field;
 mod file_ops;
 mod formatting;
+mod hover;
 mod interaction;
 mod language;
 
@@ -27,6 +28,7 @@ mod rust_analyzer_test;
 mod rust_plugin_test;
 mod session_link;
 mod shortcuts;
+mod sql_dialect;
 mod surface_link;
 mod workflow;
 
@@ -47,7 +49,7 @@ use crate::{
 };
 use gpui::{
     AnyElement, AppContext, Context, Entity, IntoElement, KeyDownEvent, MouseDownEvent,
-    ParentElement, Styled, Window, div, rgba,
+    ParentElement, Styled, Task, Window, div, rgba,
 };
 use nanobug::i18n;
 use nanobug::plugins::session::{
@@ -93,6 +95,8 @@ pub(super) struct PluginCoordinator {
     open_snapshots: BTreeMap<(u64, u64), Arc<DocumentSnapshot>>,
     active: Option<u64>,
     projects: Vec<Project>,
+    /// SQL overrides in the last project snapshot sent to the supervisor.
+    sql_dialects: BTreeMap<u64, String>,
     pub(super) open: bool,
     pub(super) composition: Composition,
     credential_draft: Option<CredentialDraft>,
@@ -111,6 +115,14 @@ pub(super) struct PluginCoordinator {
     file_close: Option<CloseTarget>,
     undo_edits: Option<edits::Undo>,
     language: Option<language::LanguageResults>,
+    /// Definition replies accumulate without opening a list or taking editor focus.
+    pending_definition: Option<language::LanguageResults>,
+    /// Detail text and the native query tied to the current normal-mode caret.
+    definition_hover: Option<hover::DefinitionHover>,
+    /// Insert-mode results retain editor input and render beside its caret.
+    completion: Option<language::CompletionPopup>,
+    /// The timer for the latest eligible edit, cancelled by new input or dismissal.
+    completion_delay: Option<Task<()>>,
     /// Outline of the current version, shown by the existing plugin list popup.
     outline: Option<outline::Outline>,
     request_id: u64,
@@ -139,6 +151,7 @@ impl PluginCoordinator {
             open_snapshots: BTreeMap::new(),
             active: None,
             projects: Vec::new(),
+            sql_dialects: BTreeMap::new(),
             open: false,
             composition: Composition::default(),
             credential_draft: None,
@@ -157,6 +170,10 @@ impl PluginCoordinator {
             file_close: None,
             undo_edits: None,
             language: None,
+            pending_definition: None,
+            definition_hover: None,
+            completion: None,
+            completion_delay: None,
             outline: None,
             request_id: 0,
             skip_draft_close: false,

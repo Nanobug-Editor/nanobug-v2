@@ -1,8 +1,35 @@
 //! Workspace adapter for session link.
 
 use super::*;
+use crate::grid::workspace::layout::Focus;
+use nanobug::plugins::session::LanguageServerPhase;
 
 impl Workspace {
+    /// Return the server phase for the visible document or its open project.
+    pub(in crate::grid::workspace) fn active_language_server_status(
+        &self,
+    ) -> Option<(&'static str, LanguageServerPhase)> {
+        let project = self.projects.active_project()?;
+        if project.hidden_pane == Some(Focus::Editor) {
+            return None;
+        }
+        let document = &project.editor.vim().doc;
+        let status = self
+            .plugins
+            .view
+            .language_servers
+            .get(&project.plugin_scope)?;
+        status
+            .document
+            .as_ref()
+            .is_none_or(|(opening, path)| {
+                project.focus == Focus::Editor
+                    && document.opening == *opening
+                    && document.path.as_ref() == Some(path)
+            })
+            .then_some((status.name, status.phase))
+    }
+
     /// Drop retired atlas entries only after this frame replaces the one that could use them.
     pub(in crate::grid::workspace) fn retire_canvas_images_after_paint(
         &mut self,
@@ -43,7 +70,7 @@ impl Workspace {
         if self.plugins.traced_scene.replace(revision) != Some(revision) {
             let body = project
                 .editor
-                .text_area(self.layout.editor)
+                .text_area(self.active_editor_area())
                 .pixels(self.metrics);
             trace.mark(
                 "document_scene",
@@ -79,7 +106,10 @@ impl Workspace {
                         if cx
                             .update(|window, cx| {
                                 view.update(cx, |workspace, cx| {
+                                    let previous_server = workspace.active_language_server_status();
                                     workspace.plugins.update_view();
+                                    let server_changed =
+                                        previous_server != workspace.active_language_server_status();
                                     if let Some(session) = &workspace.plugins.session {
                                         for (&id, request) in &workspace.plugins.view.text_measurements {
                                             let value = request.lines.iter().zip(request.prepared.iter()).map(|(line, prepared)| {
@@ -107,6 +137,10 @@ impl Workspace {
                                         workspace.repaint([nanobug::animation::scroll::ScrollInput::Advance; 3], window, cx);
                                     } else {
                                         workspace.sync_plugin_projects();
+                                        if server_changed {
+                                            workspace.refresh_footer(cx);
+                                            cx.notify();
+                                        }
                                     }
                                     if workspace.plugins.open || workspace.plugins.surface.key.is_some()
                                         || !workspace.plugins.retired_images.is_empty()
@@ -225,7 +259,18 @@ impl Workspace {
                         .any(|snapshot| snapshot.opening == *opening)
             })
         });
-        if self.plugins.active != active || self.plugins.projects != projects {
+        let dialects = self
+            .projects
+            .ordered()
+            .filter_map(|project| {
+                let dialect = project.editor.buffer().sql_dialect()?;
+                Some((project.plugin_scope, dialect.to_owned()))
+            })
+            .collect();
+        if self.plugins.active != active
+            || self.plugins.projects != projects
+            || self.plugins.sql_dialects != dialects
+        {
             if self
                 .plugins
                 .surface
@@ -241,11 +286,16 @@ impl Workspace {
             }
             self.plugins.active = active;
             self.plugins.projects = projects;
+            self.plugins.sql_dialects = dialects;
             self.plugins
                 .session
                 .as_ref()
                 .expect("plugin session")
-                .projects(active, self.plugins.projects.clone());
+                .projects_with_sql_dialects(
+                    active,
+                    self.plugins.projects.clone(),
+                    self.plugins.sql_dialects.clone(),
+                );
         }
     }
 

@@ -11,17 +11,30 @@ use crate::{
         theme::{CURRENT, GOLD, MUTED, PREEDIT, TEXT, ThemeComponent, WARNING_TEXT},
     },
 };
+use nanobug_plugin_sdk::language::Highlight;
 
-/// Right-facing fold marker, with its visible path inside one character cell.
+/// Empty source columns between the rendered text and the Markdown split divider.
+const MARKDOWN_SOURCE_RIGHT_PADDING: usize = 1;
+
+/// Resolve the foreground role at document byte `offset` from sorted `highlights`.
+fn syntax_foreground(highlights: &[Highlight], offset: usize) -> Option<u32> {
+    let index = highlights.partition_point(|span| span.range.end <= offset);
+    highlights
+        .get(index)
+        .filter(|span| span.range.start <= offset)
+        .map(|span| crate::ui::theme::syntax_color(span.kind))
+}
+
+/// Right-facing fold marker with a tight crop at the arrow tip.
 pub(super) static FOLD_ARROW: Icon = Icon::new(
     include_bytes!("../../../../assets/icons/fold-chevron.svg"),
-    1.,
+    8.8 / 13.4,
 );
 
 /// The same fold marker in amber for a header with a diagnostic.
 static DIAGNOSTIC_FOLD_ARROW: Icon = Icon::new(
     include_bytes!("../../../../assets/icons/fold-chevron-warning.svg"),
-    1.,
+    8.8 / 13.4,
 );
 
 /// Retained frames used by the editor's fixed chrome and independently clipped text layers.
@@ -45,13 +58,19 @@ impl EditorWindow {
         }
     }
 
-    /// Return the text viewport inside `area` after applying the gutter and any requested height.
+    /// Return the text viewport within `area`, accounting for the gutter, divider gap and view height.
     pub(in crate::grid) fn text_area(&self, area: Rect) -> Rect {
-        let body = Self::body(area);
+        let body = self.source_body(area);
         let gutter = (self.vim().line_count().to_string().len().max(4) + 2).min(body.w);
+        let width = body.w - gutter;
+        let padding = if self.markdown_view_mode() == Some(super::MarkdownViewMode::Split) {
+            MARKDOWN_SOURCE_RIGHT_PADDING.min(width.saturating_sub(1))
+        } else {
+            0
+        };
         Rect {
             x: body.x + gutter,
-            w: body.w - gutter,
+            w: width - padding,
             h: self.vim().view_height(body.h),
             ..body
         }
@@ -77,6 +96,14 @@ impl EditorWindow {
         }));
         self.header(context.area, context.spacing, visible_cols)
             .paint(&mut edit, context.spacing, context.selected);
+        if self.markdown_view_mode() == Some(super::MarkdownViewMode::Split)
+            && let Some(preview) = self.markdown_preview_area(context.area)
+        {
+            let divider = preview.x - context.area.x - 1;
+            for row in 1..context.area.h.saturating_sub(1) {
+                edit.vertical_rule(divider, row, MUTED);
+            }
+        }
         let (numbers, text) = self.content_frames(context, |_| None);
         EditorFrames {
             chrome: edit,
@@ -86,6 +113,7 @@ impl EditorWindow {
     }
 
     /// Draw text and line numbers for `context`, using `color_at` for optional syntax colors by byte offset.
+    /// Built-in Markdown colors fill gaps left by the provider and `color_at`.
     /// The caret row shows its document line number. Other rows show the number of j/k steps to reach them.
     pub(in crate::grid) fn content_frames(
         &self,
@@ -103,7 +131,12 @@ impl EditorWindow {
         let active = context.selected;
         let selection_tint = context.selection_tint();
         let body = self.text_area(context.area);
-        let gutter = body.x - Self::body(context.area).x;
+        let source = self.source_body(context.area);
+        let gutter = body.x - source.x;
+        let divider_padding = source.x + source.w - (body.x + body.w);
+        if body.h == 0 {
+            return (Frame::new(0, 0), Frame::new(0, 0));
+        }
         let first = buffer.scroll.first_cell();
         let mut numbers = Frame::viewport(gutter, body.h + 1, first);
         numbers.set_theme_component(ThemeComponent::Gutter);
@@ -112,10 +145,23 @@ impl EditorWindow {
         let right = left + width;
         let mut text = Frame::viewport(width, body.h + 1, first);
         text.set_theme_component(ThemeComponent::Editor);
+        text.keep_whole_graphemes(body.x..body.x + body.w);
         let composition = if active {
             self.composition.text.as_str()
         } else {
             ""
+        };
+        let highlights = buffer.highlights();
+        let markdown = buffer.markdown_highlights();
+        let foreground = |offset| {
+            syntax_foreground(highlights, offset)
+                .or_else(|| color_at(offset))
+                .or_else(|| {
+                    markdown
+                        .as_deref()
+                        .and_then(|spans| syntax_foreground(spans, offset))
+                })
+                .unwrap_or(TEXT)
         };
         for visible in 0..=body.h {
             let display_row = first + visible;
@@ -129,36 +175,32 @@ impl EditorWindow {
             let current = row == line && active;
             if current {
                 numbers.tint(visible, 0, gutter, CURRENT);
+                if divider_padding > 0 {
+                    // The left outline is centered in its border cell. Match its half-column gap.
+                    text.extend_row_tint(visible, CURRENT);
+                }
             }
             let number_color = if current { GOLD } else { MUTED };
             let width = gutter.saturating_sub(2);
             let folded = vim.doc.folded_at(line);
-            if folded {
-                numbers.text(
-                    0,
-                    visible,
-                    &format!("{number:>width$}"),
-                    number_color,
-                    width,
-                );
-                if let Some(column) = Self::fold_arrow_column(gutter) {
-                    let icon = if buffer.diagnostic_on_line(line) {
+            numbers.text(
+                0,
+                visible,
+                &format!("{number:>width$}"),
+                number_color,
+                width,
+            );
+            if let Some(column) = Self::fold_arrow_column(gutter) {
+                let diagnostic = buffer.diagnostic_on_line(line);
+                if folded {
+                    let icon = if diagnostic {
                         DIAGNOSTIC_FOLD_ARROW
                     } else {
                         FOLD_ARROW
                     };
-                    numbers.icon(column, visible, icon);
-                }
-            } else {
-                numbers.text(
-                    0,
-                    visible,
-                    &format!("{number:>width$} │"),
-                    number_color,
-                    gutter,
-                );
-                if gutter >= 2 && buffer.diagnostic_on_line(line) {
-                    numbers.text(gutter - 1, visible, "!", WARNING_TEXT, 1);
+                    numbers.right_aligned_icon(column, visible, icon, 56);
+                } else if diagnostic {
+                    numbers.text(column, visible, "!", WARNING_TEXT, 1);
                 }
             }
             let (mut displayed, preedit) = buffer.displayed_line(line, composition);
@@ -175,16 +217,6 @@ impl EditorWindow {
             let closing_byte = source_len + FOLD_ELLIPSIS.len();
             let selection = vim.selection_on_line(line);
             let tint = if current { CURRENT } else { 0 };
-            let highlights = buffer.highlights();
-            let foreground = |offset| {
-                let index = highlights.partition_point(|span| span.range.end <= offset);
-                highlights
-                    .get(index)
-                    .filter(|span| span.range.start <= offset)
-                    .map(|span| crate::ui::theme::syntax_color(span.kind))
-                    .or_else(|| color_at(offset))
-                    .unwrap_or(TEXT)
-            };
             text.viewport_line(
                 visible,
                 context.spacing.cells(&displayed),

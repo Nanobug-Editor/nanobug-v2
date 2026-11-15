@@ -163,10 +163,30 @@ impl Engine {
         let mut wanted = BTreeMap::new();
         let mut states = BTreeMap::new();
         let mut rule_warnings = BTreeMap::new();
+        let sql_providers: BTreeMap<_, _> = self
+            .projects
+            .values()
+            .filter_map(|project| {
+                let path = project.document.as_ref()?.path.as_deref()?;
+                sql_dialect::is_generic_sql(path)
+                    .then(|| (project.id, self.sql_provider(project.id).map(str::to_owned)))
+            })
+            .collect();
         for (namespace, record) in &self.records {
-            let compatible = self.store.compatibility().check(&record.release.manifest);
+            let manifest = &record.release.manifest;
+            let compatible = self.store.compatibility().check(manifest);
             for project in self.projects.values() {
-                for module in &record.release.manifest.modules {
+                let project_dialect = self.sql_dialects.project_preference(project.id);
+                let path = project
+                    .document
+                    .as_ref()
+                    .and_then(|doc| doc.path.as_deref());
+                for module in &manifest.modules {
+                    let dialect_module = sql_dialect::is_dialect_module(&manifest.id, module);
+                    // Evaluate only the explicitly selected SQL server before an SQL file is opened.
+                    let project_sql_server = dialect_module
+                        && module.language_server.is_some()
+                        && project_dialect == Some(manifest.id.as_str());
                     let key = Key {
                         namespace: namespace.clone(),
                         instance: Instance {
@@ -178,6 +198,13 @@ impl Engine {
                         (false, State::Disabled)
                     } else if let Err(error) = &compatible {
                         (false, State::Failed(error.to_string()))
+                    } else if dialect_module
+                        && ((!module.accepts_document(path) && !project_sql_server)
+                            || sql_providers
+                                .get(&project.id)
+                                .is_some_and(|selected| selected.as_ref() != Some(namespace)))
+                    {
+                        (false, State::Unmatched)
                     } else {
                         let configured = self.config.rule(project.id, namespace, &module.id);
                         let source = match configured {
@@ -199,6 +226,11 @@ impl Engine {
                                 source,
                                 &record.grants,
                                 &record.rule_paths,
+                                if dialect_module {
+                                    project_dialect
+                                } else {
+                                    None
+                                },
                             );
                             rules.insert(key.clone());
                             let (allowed, state) = self.rules.state(&key);
@@ -314,6 +346,8 @@ impl Engine {
                     State::Failed(error.clone())
                 } else if live.opened
                     && !self.installation.ready_candidates.contains(&key.namespace)
+                    && runtime
+                        .is_some_and(|runtime| !runtime.closing.contains(&key.instance.project))
                 {
                     State::Ready
                 } else {
@@ -457,16 +491,26 @@ impl Engine {
         {
             return;
         }
-        let disabled = !self.enabled
-            || self
-                .records
-                .get(namespace)
-                .is_none_or(|record| !record.enabled);
+        let record = self.records.get(namespace);
+        let disabled = !self.enabled || record.is_none_or(|record| !record.enabled);
+        // Dedicated dialect packages release idle workers rather than keeping one per SQL choice.
+        let sql_only = record.is_some_and(|record| {
+            let manifest = &record.release.manifest;
+            !manifest.modules.is_empty()
+                && manifest
+                    .modules
+                    .iter()
+                    .all(|module| sql_dialect::is_dialect_module(&manifest.id, module))
+        });
         let closing = runtime
             .instances
             .keys()
             .filter_map(|instance| {
-                (disabled || !self.projects.contains_key(&instance.project))
+                let inactive_dialect = sql_only
+                    && !self.lifecycle.wanted.keys().any(|key| {
+                        key.namespace == namespace && key.instance.project == instance.project
+                    });
+                (disabled || inactive_dialect || !self.projects.contains_key(&instance.project))
                     .then_some(instance.project)
             })
             .collect::<BTreeSet<_>>();

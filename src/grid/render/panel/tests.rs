@@ -22,7 +22,7 @@ fn keyboard_icons_use_visible_path_heights() {
     let mut frame = Frame::new(16, 1);
     let icon = crate::ui::icons::Icon::new(b"", 1.8);
     frame.icon(0, 0, icon);
-    let default = frame.icons[0].bounds(metrics.origin, metrics);
+    let default = frame.icons[0].bounds(metrics.origin, metrics, 1.);
     assert_eq!(default.size.width, px(GRID_FONT_SIZE));
     assert_eq!(default.size.height, px(GRID_FONT_SIZE));
 
@@ -34,7 +34,11 @@ fn keyboard_icons_use_visible_path_heights() {
         (KeyIcon::ENTER, 12.),
     ] {
         frame.key_icon(2, 0, key, 0.);
-        let bounds = frame.icons.last().unwrap().bounds(metrics.origin, metrics);
+        let bounds = frame
+            .icons
+            .last()
+            .unwrap()
+            .bounds(metrics.origin, metrics, 1.);
         for scale in [1., 1.25, 1.5] {
             let edge =
                 (f32::from(bounds.size.width.max(bounds.size.height)) * scale).round() as i32;
@@ -65,6 +69,58 @@ fn keyboard_icons_use_visible_path_heights() {
             assert!(
                 (center - metrics.lh / 2.).abs() * scale <= 1.,
                 "ink center {center}px at scale {scale}",
+            );
+        }
+    }
+}
+
+/// A right-aligned fold arrow and a vertical rule reach the same pixel-snapped grid edge.
+#[test]
+fn fold_arrow_and_vertical_rule_align_to_the_grid_edge() {
+    use crate::ui::{
+        icons::Icon,
+        theme::{MUTED, ThemeComponent},
+    };
+    use gpui::SvgRenderer;
+
+    let svg = SvgRenderer::new(Arc::new(()));
+    let mut frame = Frame::new(6, 3);
+    for (row, asset) in [
+        include_bytes!("../../../../assets/icons/fold-chevron.svg").as_slice(),
+        include_bytes!("../../../../assets/icons/fold-chevron-warning.svg").as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        frame.right_aligned_icon(4, row, Icon::new(asset, 8.8 / 13.4), 56);
+    }
+    frame.vertical_rule(5, 2, MUTED);
+    let guide = frame.guides[0];
+    let style = Style::default().for_component(ThemeComponent::Gutter);
+    assert_eq!(guide.color(style), (style.foreground(MUTED) << 8) | 0x80);
+
+    for scale in [1., 1.25, 1.5, 1.75, 2.] {
+        let metrics = Metrics {
+            cw: (9.6f32 * scale).round() / scale,
+            lh: 21.,
+            font_size: GRID_FONT_SIZE,
+            origin: point(px(14.), px(-7.4)),
+        };
+        let rule = guide.bounds(metrics.origin, metrics, scale);
+        assert!((f32::from(rule.size.width) * scale - 1.).abs() < 0.001);
+        for arrow in &frame.icons {
+            let bounds = arrow.bounds(metrics.origin, metrics, scale);
+            assert!((f32::from(bounds.right() - rule.right()) * scale).abs() < 0.001);
+            let edge = (f32::from(bounds.size.height) * scale).round() as i32;
+            let raster = arrow.icon.rasterize(&svg, edge).unwrap();
+            let width = raster.size(0).width.0 as usize;
+            assert!(
+                raster
+                    .as_bytes(0)
+                    .unwrap()
+                    .chunks_exact(width * 4)
+                    .any(|row| row[width * 4 - 1] > 0),
+                "the arrow tip should reach the last raster column at scale {scale}"
             );
         }
     }
@@ -125,6 +181,15 @@ fn measured_chinese_keeps_glyph_and_selection_positions_when_panned() {
         .glyph_width(0, 2, &text_system, glyphs.as_ref())
         .unwrap();
     assert!((first - second).abs() < 0.01);
+}
+
+/// Fractional panning reveals a wide cell only once its whole advance fits.
+#[test]
+fn grapheme_viewport_requires_whole_advance_on_both_horizontal_edges() {
+    let clip = px(12.)..px(48.);
+    for (x, fits) in [(11.75, false), (12., true), (32., true), (32.25, false)] {
+        assert_eq!(graphemes_fit(Some(&clip), px(x), 16.), fits);
+    }
 }
 
 /// Partially scrolled text keeps the dimmed and full-opacity runs in separate positions.

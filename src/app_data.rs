@@ -1,8 +1,8 @@
 //! Data stored beside the editor executable.
 
 pub mod settings;
-
 use anyhow::{Context, Result, ensure};
+
 use std::{
     env,
     fs::{self, File},
@@ -16,6 +16,11 @@ pub(crate) fn directory_for(editor: &Path) -> Result<PathBuf> {
         .parent()
         .context("Editor installation directory is unavailable")?
         .join("data"))
+}
+
+/// Locate the local project snapshots beside the running editor.
+pub fn project_sessions_directory() -> Result<PathBuf> {
+    Ok(directory_for(&env::current_exe()?)?.join("project-sessions"))
 }
 
 /// Open history beside the running editor, importing per-user history on first use.

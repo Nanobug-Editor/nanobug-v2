@@ -3,13 +3,18 @@
 use crate::grid::windows::manager::ManagerWindow;
 
 use crate::grid::render::{GridLayer, Panel, Rect, exposed_regions, popup_outline};
-use crate::grid::windows::{help::HelpWindow, start::StartPage};
+use crate::grid::windows::{
+    editor::{CompletionMenu, DefinitionHoverPopup},
+    help::HelpWindow,
+    start::StartPage,
+};
 
 use super::{
     Workspace,
     language::language_list_bounds,
     layout::{Focus, ShellWindow},
     leader_hint::border_gaps,
+    markdown::external_markdown_url,
 };
 use crate::ui::{
     icons::{Icon, IconCache},
@@ -18,11 +23,13 @@ use crate::ui::{
 #[cfg(windows)]
 use gpui::WindowControlArea;
 use gpui::{
-    AnyElement, Bounds, Context, ElementInputHandler, Entity, InteractiveElement, IntoElement,
-    MouseButton, NavigationDirection, ParentElement, Pixels, Render, StatefulInteractiveElement,
-    StyleRefinement, Styled, Window, canvas, div, point, px, rgba, size,
+    AnyElement, Bounds, ClickEvent, Context, ElementInputHandler, Entity, InteractiveElement,
+    IntoElement, MouseButton, NavigationDirection, ParentElement, Pixels, Render,
+    StatefulInteractiveElement, StyleRefinement, Styled, Window, canvas, div, point, px, rgba,
+    size,
 };
 use nanobug::animation::scroll::ScrollInput;
+use std::rc::Rc;
 
 /// Cross drawn in the border gap for a hovered pane or popup.
 const CLOSE_ICON: Icon = Icon::new(include_bytes!("../../../assets/icons/pane-close.svg"), 1.);
@@ -30,8 +37,83 @@ const CLOSE_ICON: Icon = Icon::new(include_bytes!("../../../assets/icons/pane-cl
 const CLOSE_ICON_SIZE: f32 = 12.;
 
 impl Workspace {
+    /// Route external links from the painted `popup` in `window` through the workspace `cx`.
+    fn definition_hover_links(
+        &self,
+        popup: DefinitionHoverPopup,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let row_height = self.metrics.lh;
+        let bounds = popup.body_bounds();
+        let popup = Rc::new(popup);
+        let link = move |position| {
+            popup
+                .link_at(position, row_height)
+                .and_then(external_markdown_url)
+        };
+        let hot = link(window.mouse_position()).is_some();
+        let move_link = link.clone();
+        let press_link = link.clone();
+        let layer = div()
+            .id("definition-hover-links")
+            .absolute()
+            .left(bounds.left())
+            .top(bounds.top())
+            .w(bounds.size.width)
+            .h(bounds.size.height)
+            .on_mouse_move(cx.listener(move |_, event: &gpui::MouseMoveEvent, _, cx| {
+                if move_link(event.position).is_some() != hot {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                if press_link(event.position).is_some() {
+                    cx.stop_propagation();
+                }
+            })
+            .on_click(cx.listener(move |workspace, event, window, cx| {
+                if let ClickEvent::Mouse(click) = event
+                    && click.down.click_count == 1
+                    && let Some(url) = link(click.down.position)
+                    && workspace
+                        .definition_hover_popup(window, cx)
+                        .and_then(|current| {
+                            current
+                                .link_at(click.up.position, row_height)
+                                .and_then(external_markdown_url)
+                        })
+                        .as_ref()
+                        == Some(&url)
+                {
+                    cx.open_url(url.as_str());
+                    cx.stop_propagation();
+                }
+            }));
+        if hot { layer.cursor_pointer() } else { layer }.into_any_element()
+    }
+
+    /// Pair ready completion labels with the menu fitted inside `window` at the logical caret.
+    pub(super) fn completion_menu(
+        &self,
+        window: &Window,
+    ) -> Option<(CompletionMenu, Vec<&str>, usize)> {
+        let (labels, selected) = self.completion_items()?;
+        let editor = &self.projects.active_project()?.editor;
+        let viewport = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
+        let menu = editor.completion_menu(
+            self.active_editor_area(),
+            self.metrics,
+            &self.spacing,
+            viewport,
+            &labels,
+            selected,
+        )?;
+        Some((menu, labels, selected))
+    }
+
     /// Place fixed panels and scrollable bodies, keeping the footer aligned to the bottom inset.
-    fn grid_layers(&self) -> Option<[GridLayer; 6]> {
+    fn grid_layers(&self) -> Option<Vec<GridLayer>> {
         let project = self.projects.active_project()?;
         let fixed = |panel: &Entity<Panel>, rect: Rect| GridLayer {
             panel: panel.clone(),
@@ -40,15 +122,16 @@ impl Workspace {
         };
         let scrolled =
             |panel, rect, fraction| GridLayer::scrolled(panel, rect, fraction, self.metrics);
+        let editor_area = self.active_editor_area();
         let [numbers, text] = project.editor.content_layers(
-            self.layout.editor,
+            editor_area,
             self.metrics,
             &self.bodies[1],
             &self.bodies[2],
         );
-        Some([
+        let mut layers = vec![
             fixed(&self.panels[0], self.layout.tree),
-            fixed(&self.panels[1], self.layout.editor),
+            fixed(&self.panels[1], editor_area),
             GridLayer {
                 panel: self.panels[2].clone(),
                 bounds: self.footer_bounds(),
@@ -64,7 +147,32 @@ impl Workspace {
             ),
             numbers,
             text,
-        ])
+        ];
+        for (pane, area) in self.editor_rects() {
+            let Some(panels) = self
+                .inactive_editor_panels
+                .iter()
+                .find(|entry| entry.pane == pane)
+            else {
+                continue;
+            };
+            let Some(editor) = project.editor_by_id(pane) else {
+                continue;
+            };
+            let [chrome, numbers, text] = &panels.layers;
+            layers.push(fixed(chrome, area));
+            layers.extend(editor.content_layers(area, self.metrics, numbers, text));
+        }
+        Some(layers)
+    }
+
+    /// Match source text panels that must clip around an inline popup.
+    fn is_editor_text_panel(&self, panel: &Entity<Panel>) -> bool {
+        panel == &self.bodies[2]
+            || self
+                .inactive_editor_panels
+                .iter()
+                .any(|editor| panel == &editor.layers[2])
     }
 
     /// Position the preview over its scrolled tree row, clipping vertically to the tree body.
@@ -112,6 +220,52 @@ fn layer_element(
     } else {
         panel.cached(positioned(bounds)).into_any_element()
     })
+}
+
+/// Exclude `popup` from the editor's text layer without changing adjacent retained layers.
+/// The clipped strips have separate cache scopes inside this layer.
+fn editor_text_element(
+    layer: GridLayer,
+    popup: Option<Bounds<Pixels>>,
+    window: &Window,
+) -> Option<AnyElement> {
+    let clip = layer.clip.unwrap_or(layer.bounds);
+    let Some(popup) = popup.filter(|bounds| !clip.intersect(bounds).is_empty()) else {
+        return layer_element(layer, window);
+    };
+    Some(
+        div()
+            .id(("inline-popup-text-underlay", layer.panel.entity_id()))
+            .absolute()
+            .left_0()
+            .top_0()
+            .size_full()
+            .children(
+                exposed_regions(clip, popup)
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(side, clip)| {
+                        if clip.is_empty() {
+                            return None;
+                        }
+                        Some(
+                            div()
+                                .id(("inline-popup-text-strip", side))
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .size_full()
+                                .child(clipped_entity(
+                                    layer.panel.clone(),
+                                    layer.bounds,
+                                    clip,
+                                    window,
+                                )),
+                        )
+                    }),
+            )
+            .into_any_element(),
+    )
 }
 
 /// Draw `entity` at its window-relative `bounds` through a fixed rectangular `clip`.
@@ -188,9 +342,10 @@ impl Render for Workspace {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::middle_mouse_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
-            .on_mouse_exit(
-                cx.listener(|workspace, _, _, cx| workspace.set_controls_hover(None, cx)),
-            )
+            .on_mouse_exit(cx.listener(|workspace, _, _, cx| {
+                workspace.set_controls_hover(None, cx);
+                workspace.update_markdown_pointer(None, cx);
+            }))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_scroll(cx.listener(Self::scroll));
@@ -206,9 +361,7 @@ impl Render for Workspace {
                     .on_mouse_up(button, cx.listener(Self::plugin_canvas_up));
             }
         }
-        let layers = self
-            .file_picker_layers()
-            .or_else(|| self.grid_layers().map(Vec::from));
+        let layers = self.file_picker_layers().or_else(|| self.grid_layers());
         let start_layout = self
             .file_picker
             .is_none()
@@ -245,6 +398,32 @@ impl Render for Workspace {
         let small_popup_bounds = small_popup.map(|area| area.pixels(self.metrics));
         let leader_bounds = small_popup_bounds.filter(|_| small_modal.is_none());
         let message_bounds = message.as_ref().map(|layer| layer.bounds);
+        let (completion_bounds, completion) =
+            self.completion_menu(window)
+                .map_or((None, None), |(menu, labels, selected)| {
+                    let bounds = menu.bounds();
+                    let element = menu.element(
+                        &labels,
+                        self.completion_query(),
+                        selected,
+                        self.metrics,
+                        &self.spacing,
+                    );
+                    (Some(bounds), Some(element))
+                });
+        let hover = if small_popup.is_none() && plugin_popup.is_none() {
+            self.definition_hover_popup(window, cx)
+        } else {
+            None
+        };
+        let inline_popup_bounds =
+            completion_bounds.or_else(|| hover.as_ref().map(|popup| popup.bounds()));
+        let markdown =
+            if self.file_picker.is_none() && !self.help.is_open() && plugin_popup.is_none() {
+                self.prepare_markdown_previews(window, cx)
+            } else {
+                Vec::new()
+            };
         if let Some(area) = plugin_popup {
             let outline = popup_outline(area.pixels(self.metrics), self.metrics);
             root = root.child(self.popup_backdrop.element(
@@ -373,14 +552,16 @@ impl Render for Workspace {
                             if clip.is_empty() {
                                 return None;
                             }
-                            layer_element(
-                                GridLayer {
-                                    panel: layer.panel.clone(),
-                                    bounds: layer.bounds,
-                                    clip: Some(clip),
-                                },
-                                window,
-                            )
+                            let layer = GridLayer {
+                                panel: layer.panel.clone(),
+                                bounds: layer.bounds,
+                                clip: Some(clip),
+                            };
+                            if self.is_editor_text_panel(&layer.panel) {
+                                editor_text_element(layer, inline_popup_bounds, window)
+                            } else {
+                                layer_element(layer, window)
+                            }
                         });
                     let mut underlay = div()
                         .id(("popup-underlay", index))
@@ -388,7 +569,12 @@ impl Render for Workspace {
                         .left_0()
                         .top_0()
                         .size_full()
-                        .children(visible);
+                        .children(visible)
+                        .children(
+                            markdown
+                                .iter()
+                                .filter_map(|(_, preview)| preview.element(Some(region))),
+                        );
                     if !self.small_modal_open()
                         && picker_prompt.is_none()
                         && document_results.is_none()
@@ -404,12 +590,12 @@ impl Render for Workspace {
                 }
                 if let Some(message) = message {
                     // An interactive popup can cover part of the message while the timer runs.
-                    let cuts =
-                        small_popup_bounds
-                            .into_iter()
-                            .chain(leader_bounds.into_iter().flat_map(|popup| {
-                                border_gaps(message.bounds, popup, self.metrics, self.metrics)
-                            }));
+                    let cuts = small_popup_bounds
+                        .into_iter()
+                        .chain(inline_popup_bounds)
+                        .chain(leader_bounds.into_iter().flat_map(|popup| {
+                            border_gaps(message.bounds, popup, self.metrics, self.metrics)
+                        }));
                     for (index, clip) in visible_regions(message.bounds, cuts)
                         .into_iter()
                         .enumerate()
@@ -447,14 +633,26 @@ impl Render for Workspace {
                     }
                 }
             } else {
-                root = root.children(
-                    layers
-                        .into_iter()
-                        .flatten()
-                        .chain(start)
-                        .chain(preview)
-                        .filter_map(|layer| layer_element(layer, window)),
-                );
+                root = root
+                    .children(
+                        layers
+                            .into_iter()
+                            .flatten()
+                            .chain(start)
+                            .chain(preview)
+                            .filter_map(|layer| {
+                                if self.is_editor_text_panel(&layer.panel) {
+                                    editor_text_element(layer, inline_popup_bounds, window)
+                                } else {
+                                    layer_element(layer, window)
+                                }
+                            }),
+                    )
+                    .children(
+                        markdown
+                            .iter()
+                            .filter_map(|(_, preview)| preview.element(None)),
+                    );
             }
         }
         #[cfg(feature = "plugin-probe")]
@@ -489,9 +687,24 @@ impl Render for Workspace {
                 ),
             );
         }
+        root = root.children(completion);
+        if let Some(popup) = hover {
+            self.popup_panel.update(cx, |panel, cx| {
+                panel.set(popup.footer_frame(&self.spacing), cx)
+            });
+            root = root
+                .child(popup.chrome_element(self.metrics))
+                .child(
+                    self.popup_panel
+                        .clone()
+                        .cached(positioned(popup.footer_bounds(self.metrics.lh))),
+                )
+                .child(popup.body_element(self.metrics.lh))
+                .child(self.definition_hover_links(popup, window, cx));
+        }
         #[cfg(windows)]
         {
-            // The whole project strip participates in the native caption move loop.
+            // Both tab groups participate in the native caption move loop.
             root = root.child(
                 div()
                     .absolute()
@@ -504,20 +717,30 @@ impl Render for Workspace {
         }
         #[cfg(not(windows))]
         if !self.modal_open() {
-            root = root.children(self.tabs.click_targets(tab_metrics).map(|(index, bounds)| {
-                div()
-                    .id(("project-tab", index))
-                    .absolute()
-                    .left(bounds.origin.x)
-                    .top(bounds.origin.y)
-                    .w(bounds.size.width)
-                    .h(bounds.size.height)
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(move |workspace, _, window, cx| {
-                        workspace.activate_project_tab(index, window, cx);
-                        cx.stop_propagation();
-                    }))
-            }));
+            use super::tabs::CaptionTarget;
+
+            root = root.children(
+                self.tabs
+                    .click_targets(tab_metrics)
+                    .map(|(target, bounds)| {
+                        let id = match target {
+                            CaptionTarget::Project(index) => ("project-tab", index),
+                            CaptionTarget::Page(index) => ("tabpage", index),
+                        };
+                        div()
+                            .id(id)
+                            .absolute()
+                            .left(bounds.origin.x)
+                            .top(bounds.origin.y)
+                            .w(bounds.size.width)
+                            .h(bounds.size.height)
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |workspace, _, window, cx| {
+                                workspace.activate_caption_target(target, window, cx);
+                                cx.stop_propagation();
+                            }))
+                    }),
+            );
         }
         if let Some(target) = self.hovered_controls
             && target != ShellWindow::Pane(Focus::Editor)
@@ -582,6 +805,16 @@ impl Render for Workspace {
                         .size_full(),
                     ),
             );
+        }
+        let plugin_surface = self
+            .plugin_surface_area()
+            .map(|area| area.pixels(self.metrics));
+        if self.set_painted_markdown_preview(
+            markdown,
+            [small_popup_bounds, inline_popup_bounds, plugin_surface],
+            window,
+        ) {
+            root = root.cursor_pointer();
         }
         let view = cx.entity();
         root.child(

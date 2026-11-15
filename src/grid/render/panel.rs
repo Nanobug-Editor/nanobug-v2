@@ -6,9 +6,7 @@ use crate::{
     ui::{
         backdrop::BackdropRaster,
         text::{UNITS_PER_COLUMN, chinese_base},
-        theme::{
-            ACCENT, GRID_CHINESE_FONT, GRID_RULE_FONT_FAMILY, GridFont, Style, TREE_GUIDE, style,
-        },
+        theme::{ACCENT, GRID_CHINESE_FONT, GRID_RULE_FONT_FAMILY, GridFont, Style, style},
     },
 };
 use gpui::{
@@ -18,7 +16,7 @@ use gpui::{
     rgb, rgba,
 };
 use nanobug::animation::cursor::{Vec2, Wave};
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, ops::Range, rc::Rc};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -92,6 +90,15 @@ impl Run {
     fn position(&self, glyph: &ShapedGlyph, cluster: usize) -> Point<Pixels> {
         let shift = self.shifts.get(cluster).copied().unwrap_or_default();
         glyph.position + point(shift, px(0.))
+    }
+
+    /// Check whether the entire measured cell of `cluster` at `origin` fits the source `clip`.
+    fn cluster_fits(&self, clip: Option<&Range<Pixels>>, origin: Pixels, cluster: usize) -> bool {
+        graphemes_fit(
+            clip,
+            origin + px(cluster as f32 * self.advance),
+            self.advance,
+        )
     }
 
     /// Yield the native glyphs and their fonts for the retained grapheme at `cluster`.
@@ -245,9 +252,14 @@ impl Panel {
         data.set_style(scoped);
         data.prepare(window);
         let metrics = data.metrics;
+        let source_clip = data.horizontal_grapheme_clip(window);
         data.paint_theme_background(bounds, |area, color| {
             raster.fill(area.intersect(&clip), color)
         });
+        if let Some((area, color)) = data.trailing_tint(bounds, source_clip.as_ref()) {
+            raster.fill(area.intersect(&clip), color);
+        }
+        let clip = text_bounds(clip, source_clip.as_ref());
         for outline in &data.frame.outlines {
             if let Some(path) = outline.path(bounds.origin, metrics) {
                 let color = (data.style.foreground(outline.color) << 8) | 0xff;
@@ -267,8 +279,12 @@ impl Panel {
                 let baseline = point(bounds.origin.x + run.x, y + run.baseline(metrics.lh));
                 for shaped in &run.line.runs {
                     for glyph in &shaped.glyphs {
+                        let cluster = run.cluster(glyph.index);
+                        if !run.cluster_fits(source_clip.as_ref(), baseline.x, cluster) {
+                            continue;
+                        }
                         raster.glyph(
-                            baseline + run.position(glyph, run.cluster(glyph.index)),
+                            baseline + run.position(glyph, cluster),
                             RenderGlyphParams {
                                 font_id: shaped.font_id,
                                 glyph_id: glyph.id,
@@ -299,11 +315,11 @@ impl Panel {
         for guide in &data.frame.guides {
             raster.fill(
                 guide.bounds(bounds.origin, metrics, scale).intersect(&clip),
-                data.style.tint(TREE_GUIDE),
+                guide.color(data.style),
             );
         }
         for icon in &data.frame.icons {
-            raster.icon(icon.icon, icon.bounds(bounds.origin, metrics), clip);
+            raster.icon(icon.icon, icon.bounds(bounds.origin, metrics, scale), clip);
         }
     }
 
@@ -334,6 +350,7 @@ impl Panel {
         }
         let width = text.width().max(1);
         let metrics = data.metrics;
+        let source_clip = data.horizontal_grapheme_clip(window);
         let cell_x = metrics.spacing_px(row.x(column));
         data.prepare_row(cell.row, window.text_system())?;
         let (run, cluster) = data.cache[cell.row].as_ref()?.cluster_at(column, width)?;
@@ -343,6 +360,9 @@ impl Panel {
             f32::from(origin.y) + metrics.lh * 0.5,
         );
         let (_, shift) = sample_waves(&data.waves, center);
+        if !run.cluster_fits(source_clip.as_ref(), origin.x + shift.x, cluster) {
+            return None;
+        }
         let baseline = origin + point(px(0.), run.baseline(metrics.lh)) + shift;
         Some(CursorText {
             font_size: run.line.font_size,
@@ -622,12 +642,45 @@ impl PanelData {
         }
     }
 
+    /// Convert the source clip to device-snapped horizontal bounds in `window`.
+    fn horizontal_grapheme_clip(&self, window: &Window) -> Option<Range<Pixels>> {
+        let columns = self.frame.whole_grapheme_columns.as_ref()?;
+        let snap = |column| {
+            window
+                .pixel_snap_point(self.metrics.at(column as f32, 0.))
+                .x
+        };
+        Some(snap(columns.start).max(px(0.))..snap(columns.end).min(window.viewport_size().width))
+    }
+
+    /// Position the trailing tint against the fixed text clip and follow its row in `bounds`.
+    fn trailing_tint(
+        &self,
+        bounds: Bounds<Pixels>,
+        source_clip: Option<&Range<Pixels>>,
+    ) -> Option<(Bounds<Pixels>, u32)> {
+        let (row, color) = self.frame.trailing_row_tint?;
+        let start = source_clip?.end;
+        let y = bounds.top() + px(row as f32 * self.metrics.lh);
+        let area =
+            self.frame
+                .tint_bounds(point(start, y), px(self.metrics.cw * 0.5), self.metrics.lh);
+        Some((area, self.style.tint(color)))
+    }
+
     /// Paint rows at `bounds` in `window` using `cx`.
     fn paint(&self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        let source_clip = self.horizontal_grapheme_clip(window);
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             self.paint_theme_background(bounds, |area, color| {
                 window.paint_quad(fill(area, rgba(color)));
             });
+            if let Some((area, color)) = self.trailing_tint(bounds, source_clip.as_ref()) {
+                window.paint_quad(fill(area, rgba(color)));
+            }
+        });
+        let clip = text_bounds(bounds, source_clip.as_ref());
+        window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
             for outline in &self.frame.outlines {
                 if let Some(path) = outline.path(bounds.origin, self.metrics) {
                     window.paint_path(path, rgb(self.style.foreground(outline.color)));
@@ -652,13 +705,26 @@ impl PanelData {
                         (f32::from(y) + self.metrics.lh * 0.5 - wave.center.y).abs()
                             <= wave.front() + 7.
                     });
-                    if waves_here || !run.shifts.is_empty() {
+                    let run_fits = graphemes_fit(
+                        source_clip.as_ref(),
+                        origin.x,
+                        run.clusters.len() as f32 * run.advance,
+                    );
+                    if waves_here || !run.shifts.is_empty() || !run_fits {
                         let waves = if waves_here {
                             self.waves.as_slice()
                         } else {
                             &[]
                         };
-                        paint_glyph_run(run, origin, self.metrics.lh, waves, self.style, window);
+                        paint_glyph_run(
+                            run,
+                            origin,
+                            self.metrics.lh,
+                            waves,
+                            self.style,
+                            source_clip.as_ref(),
+                            window,
+                        );
                         continue;
                     }
                     let _ = run.shadow.paint(
@@ -701,19 +767,36 @@ impl PanelData {
             for guide in &self.frame.guides {
                 window.paint_quad(fill(
                     guide.bounds(bounds.origin, self.metrics, scale),
-                    rgba(self.style.tint(TREE_GUIDE)),
+                    rgba(guide.color(self.style)),
                 ));
             }
             for icon in &self.frame.icons {
                 cx.global::<IconCache>().paint(
                     icon.icon,
-                    icon.bounds(bounds.origin, self.metrics),
+                    icon.bounds(bounds.origin, self.metrics, scale),
                     window,
                     cx,
                 );
             }
         });
     }
+}
+
+/// Restrict ordinary row content to the text viewport, keeping any trailing tint separate.
+fn text_bounds(bounds: Bounds<Pixels>, source_clip: Option<&Range<Pixels>>) -> Bounds<Pixels> {
+    source_clip.map_or(bounds, |clip| {
+        bounds.intersect(&Bounds::from_corners(
+            point(clip.start, bounds.top()),
+            point(clip.end.max(clip.start), bounds.bottom()),
+        ))
+    })
+}
+
+/// Whether the span of `width` logical pixels at `x` fits inside an optional horizontal `clip`.
+fn graphemes_fit(clip: Option<&Range<Pixels>>, x: Pixels, width: f32) -> bool {
+    // Fixed-point advances are converted separately from the snapped panel origin.
+    let tolerance = px(0.001);
+    clip.is_none_or(|clip| x + tolerance >= clip.start && x + px(width) <= clip.end + tolerance)
 }
 
 /// Return the accumulated tint and bounded glyph displacement of `waves` at `center`.
@@ -733,13 +816,15 @@ pub(in crate::grid) fn sample_waves(waves: &[Wave], center: Vec2) -> (f32, Point
     )
 }
 
-/// Paint native glyphs of `run` at `origin` in `window`, using row `height` and any active `waves`.
+/// Paint native glyphs of `run` at `origin` in `window` using its row `height` and theme `style`.
+/// Apply any active `waves` and keep whole graphemes inside the horizontal source `clip`.
 fn paint_glyph_run(
     run: &Run,
     origin: Point<Pixels>,
     height: f32,
     waves: &[Wave],
     style: Style,
+    clip: Option<&Range<Pixels>>,
     window: &mut Window,
 ) {
     let layout = &run.line;
@@ -752,6 +837,9 @@ fn paint_glyph_run(
                 f32::from(origin.y) + height * 0.5,
             );
             let (light, shift) = sample_waves(waves, center);
+            if !run.cluster_fits(clip, origin.x + shift.x, cluster) {
+                continue;
+            }
             let at = origin + run.position(glyph, cluster) + point(px(0.), baseline) + shift;
             if glyph.is_emoji {
                 let _ = window.paint_emoji(at, shaped.font_id, glyph.id, layout.font_size);

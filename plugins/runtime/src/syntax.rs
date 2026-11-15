@@ -8,7 +8,7 @@ use nanobug_plugin_sdk::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     io::BufRead,
     ops::{ControlFlow, Range},
     time::{Duration, Instant},
@@ -58,6 +58,7 @@ struct Syntax {
     parser: Parser,
     trees: VecDeque<(Key, Tree, Option<Value>)>,
     queries: VecDeque<(String, String, Query)>,
+    embedded_queries: BTreeMap<&'static str, Query>,
 }
 
 impl Syntax {
@@ -135,9 +136,88 @@ impl Syntax {
             }
             (language.into(), source.into(), query)
         };
-        let result = capture(&entry.2, root, doc, deadline);
+        let result = (|| {
+            let mut result = capture(&entry.2, root, doc, deadline)?;
+            if (0..entry.2.pattern_count()).any(|index| {
+                entry
+                    .2
+                    .property_settings(index)
+                    .iter()
+                    .any(|setting| setting.key.as_ref() == "nanobug.embedded")
+            }) {
+                self.append_embedded(language, root, &doc.text, &mut result, deadline);
+            }
+            Ok(serde_json::to_value(result)?)
+        })();
         self.queries.push_back(entry);
         result
+    }
+
+    /// Add captures from inline scripts, styles and Astro frontmatter in document coordinates.
+    fn append_embedded(
+        &mut self,
+        language: &str,
+        root: Node<'_>,
+        text: &str,
+        result: &mut SyntaxQuery,
+        deadline: Instant,
+    ) {
+        if !matches!(
+            language,
+            "html" | "vue" | "vue-template" | "svelte" | "astro"
+        ) {
+            return;
+        }
+        let vue = matches!(language, "vue" | "vue-template");
+        let mut regions = descendants(root)
+            .take_while(|_| Instant::now() < deadline)
+            .filter(|node| !vue || node.parent() == Some(root))
+            .filter_map(|node| {
+                if language == "astro" && node.kind() == "frontmatter" {
+                    node.named_child(0)
+                        .filter(|child| child.kind() == "frontmatter_js_block")
+                        .map(|child| ("typescript", child.byte_range()))
+                } else {
+                    embedded_region(node, text, false)
+                }
+            });
+        for (grammar_name, range) in regions.by_ref().take(MAX_EMBEDDED_RANGES) {
+            let limit = MAX_CAPTURES - result.captures.len();
+            if limit == 0 {
+                break;
+            }
+            let Some(grammar) = grammar(grammar_name) else {
+                continue;
+            };
+            if let std::collections::btree_map::Entry::Vacant(slot) =
+                self.embedded_queries.entry(grammar_name)
+            {
+                let Ok(query) = Query::new(&grammar, &embedded_highlights(grammar_name)) else {
+                    result.complete = false;
+                    continue;
+                };
+                slot.insert(query);
+            }
+            let bytes = &text.as_bytes()[range.clone()];
+            let Ok(tree) = parse_tree(&mut self.parser, &grammar, bytes, deadline) else {
+                result.complete = false;
+                break;
+            };
+            let (captures, complete) = query_captures(
+                &self.embedded_queries[grammar_name],
+                tree.root_node(),
+                bytes,
+                range.start,
+                limit,
+                deadline,
+            );
+            result.complete &= complete;
+            result.captures.extend(captures);
+        }
+        result.complete &= result.captures.len() < MAX_CAPTURES
+            && regions.next().is_none()
+            && Instant::now() < deadline;
+        result.captures.sort_by_key(|capture| capture.range.start);
     }
 }
 
@@ -147,34 +227,9 @@ fn capture(
     root: Node<'_>,
     doc: &DocumentSnapshot,
     deadline: Instant,
-) -> anyhow::Result<Value> {
-    let mut cursor = QueryCursor::new();
-    cursor.set_match_limit(128);
-    let mut progress = |_: &tree_sitter::QueryCursorState| {
-        if Instant::now() < deadline {
-            ControlFlow::Continue(())
-        } else {
-            ControlFlow::Break(())
-        }
-    };
-    let options = QueryCursorOptions::new().progress_callback(&mut progress);
-    let mut matches = cursor.captures_with_options(query, root, doc.text.as_bytes(), options);
-    let mut captures = Vec::new();
-    while captures.len() < MAX_CAPTURES {
-        let Some((matched, index)) = matches.next() else {
-            break;
-        };
-        let item = matched.captures[*index];
-        captures.push(Capture {
-            name: query.capture_names()[item.index as usize].into(),
-            range: ByteRange {
-                start: item.node.start_byte(),
-                end: item.node.end_byte(),
-            },
-        });
-    }
-    let complete = captures.len() < MAX_CAPTURES;
-    drop(matches);
+) -> anyhow::Result<SyntaxQuery> {
+    let (captures, complete) =
+        query_captures(query, root, doc.text.as_bytes(), 0, MAX_CAPTURES, deadline);
     anyhow::ensure!(Instant::now() < deadline, "Syntax query timed out");
     let diagnostics = descendants(root)
         .take_while(|_| Instant::now() < deadline)
@@ -191,15 +246,53 @@ fn capture(
         })
         .collect::<Vec<_>>();
     anyhow::ensure!(Instant::now() < deadline, "Syntax diagnostics timed out");
-    Ok(serde_json::to_value(SyntaxQuery {
+    Ok(SyntaxQuery {
         opening: doc.opening,
         revision: doc.revision,
-        complete: complete
-            && diagnostics.len() < MAX_DIAGNOSTICS
-            && !cursor.did_exceed_match_limit(),
+        complete: complete && diagnostics.len() < MAX_DIAGNOSTICS,
         captures,
         diagnostics,
-    })?)
+    })
+}
+
+/// Collect at most `limit` captures within the shared deadline, offset into the original text.
+fn query_captures(
+    query: &Query,
+    root: Node<'_>,
+    bytes: &[u8],
+    offset: usize,
+    limit: usize,
+    deadline: Instant,
+) -> (Vec<Capture>, bool) {
+    let mut cursor = QueryCursor::new();
+    cursor.set_match_limit(128);
+    let mut progress = |_: &tree_sitter::QueryCursorState| {
+        if Instant::now() < deadline {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(())
+        }
+    };
+    let options = QueryCursorOptions::new().progress_callback(&mut progress);
+    let mut matches = cursor.captures_with_options(query, root, bytes, options);
+    let mut captures = Vec::new();
+    while captures.len() < limit {
+        let Some((matched, index)) = matches.next() else {
+            break;
+        };
+        let item = matched.captures[*index];
+        captures.push(Capture {
+            name: query.capture_names()[item.index as usize].into(),
+            range: ByteRange {
+                start: offset + item.node.start_byte(),
+                end: offset + item.node.end_byte(),
+            },
+        });
+    }
+    drop(matches);
+    let complete =
+        captures.len() < limit && !cursor.did_exceed_match_limit() && Instant::now() < deadline;
+    (captures, complete)
 }
 
 /// Keep the original node-list response for consumers of ParseDocument.
@@ -404,15 +497,191 @@ fn script_language(lang: &str, content_type: Option<&str>) -> Option<&'static st
     }
 }
 
+/// Resolve worker-owned captures for a detected inline language.
+fn embedded_highlights(name: &str) -> String {
+    match name {
+        "javascript" => SCRIPT_HIGHLIGHTS.to_owned(),
+        "typescript" => [SCRIPT_HIGHLIGHTS, TYPESCRIPT_HIGHLIGHTS].join("\n"),
+        "tsx" => [SCRIPT_HIGHLIGHTS, TYPESCRIPT_HIGHLIGHTS, JSX_HIGHLIGHTS].join("\n"),
+        "css" => STYLE_HIGHLIGHTS.to_owned(),
+        "json" => JSON_HIGHLIGHTS.to_owned(),
+        _ => String::new(),
+    }
+}
+
+/// Syntax shared by the ECMAScript-family embedded grammars.
+const SCRIPT_HIGHLIGHTS: &str = r#"
+[
+  "as" "async" "await" "break" "case" "catch" "class" "const" "continue"
+  "debugger" "default" "delete" "do" "else" "export" "extends" "finally"
+  "for" "from" "function" "if" "import" "in" "instanceof" "let" "new" "of"
+  "return" "static" "switch" "throw" "try" "typeof" "var" "void" "while" "yield"
+] @keyword
+
+[(comment) (hash_bang_line)] @comment
+[(string) (template_string) (regex)] @string
+[(number) (true) (false) (null) (undefined)] @constant
+
+(function_declaration name: (identifier) @function @symbol.function)
+(generator_function_declaration name: (identifier) @function @symbol.function)
+(method_definition name: (property_identifier) @function @symbol.method)
+(variable_declarator
+  name: (identifier) @function @symbol.function
+  value: [(arrow_function) (function_expression)])
+(class_declaration name: (_) @type @symbol.class)
+(call_expression function: (identifier) @function)
+(call_expression function: (member_expression property: (property_identifier) @function))
+(new_expression constructor: (identifier) @type)
+
+[(statement_block) (class_body) (object) (array)] @fold
+"#;
+
+/// Additional types and declarations supported by TypeScript and TSX scripts.
+const TYPESCRIPT_HIGHLIGHTS: &str = r#"
+[
+  "abstract" "declare" "enum" "implements" "interface" "keyof" "namespace"
+  "private" "protected" "public" "type" "readonly" "override" "satisfies"
+] @keyword
+[(type_identifier) (predefined_type)] @type
+(decorator (identifier) @attribute)
+(interface_declaration name: (type_identifier) @symbol.interface)
+(type_alias_declaration name: (type_identifier) @symbol.type)
+(enum_declaration name: (identifier) @type @symbol.enum)
+(abstract_class_declaration name: (type_identifier) @symbol.class)
+(function_signature name: (identifier) @function @symbol.function)
+(method_signature name: (property_identifier) @function @symbol.method)
+[(interface_body) (enum_body) (object_type)] @fold
+"#;
+
+/// Distinguish JSX tags and attributes in embedded TSX.
+const JSX_HIGHLIGHTS: &str = r#"
+(jsx_opening_element) @fold
+(jsx_element) @fold
+(jsx_self_closing_element) @fold
+(jsx_opening_element name: (identifier) @type)
+(jsx_closing_element name: (identifier) @type)
+(jsx_self_closing_element name: (identifier) @type)
+(jsx_attribute (property_identifier) @attribute)
+"#;
+
+/// CSS declaration, selector and folding captures for inline styles.
+const STYLE_HIGHLIGHTS: &str = r#"
+[(tag_name) (unit)] @type
+[(attribute_name) (property_name) (class_name) (id_name) (feature_name)] @attribute
+(function_name) @function
+(string_value) @string
+[(integer_value) (float_value) (color_value)] @constant
+[(comment) (js_comment)] @comment
+
+[
+  "@charset" "@import" "@media" "@keyframes" "@namespace" "@supports"
+  (at_keyword) (important) (from) (to)
+] @keyword
+
+(rule_set (selectors) @symbol.selector)
+(keyframes_statement (keyframes_name) @symbol.keyframes)
+
+[(block) (keyframe_block_list) (comment)] @fold
+"#;
+
+/// JSON values and collection folds in data-script tags.
+const JSON_HIGHLIGHTS: &str = r#"
+(string) @string
+[(number) (null) (true) (false)] @constant
+(comment) @comment
+[(array) (object)] @fold
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The same outer query can opt in to embedded captures without changing diagnostics.
+    #[test]
+    fn markup_queries_include_inline_captures_only_when_requested() {
+        let mut syntax = Syntax::default();
+        let plain_query = "(tag_name) @type";
+        let opt_in_query = "((document) (#set! nanobug.embedded)) (tag_name) @type";
+        for (index, (language, text, expected)) in [
+            (
+                "html",
+                "<p>世界</p><script>function hello() {}</script><style>p {color: red;}</style>",
+                &[("function", "hello"), ("attribute", "color")][..],
+            ),
+            (
+                "vue",
+                "<template><p>世界</p></template><script setup lang=\"ts\">let value: number;</script>",
+                &[("keyword", "let"), ("type", "number")][..],
+            ),
+            (
+                "svelte",
+                "<p>世界</p><script lang=\"ts\">let value: number;</script><style>p {color: red;}</style>",
+                &[("type", "number"), ("attribute", "color")][..],
+            ),
+            (
+                "astro",
+                "---\nimport Card from './Card.astro';\n---\n<Card />",
+                &[("keyword", "import"), ("string", "'./Card.astro'")][..],
+            ),
+            (
+                "html",
+                "<script type=\"application/json\">{\"name\": \"世界\", \"count\": 3}</script>",
+                &[("string", "\"世界\""), ("constant", "3")][..],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let doc = DocumentSnapshot {
+                opening: index as u64,
+                revision: 0,
+                path: None,
+                text: text.into(),
+            };
+            let run = |syntax: &mut Syntax, query| -> SyntaxQuery {
+                let result = syntax.run(language.into(), &doc, Some(query)).unwrap();
+                serde_json::from_value(result).unwrap()
+            };
+            let plain = run(&mut syntax, plain_query);
+            let with_embedded = run(&mut syntax, opt_in_query);
+            assert!(plain.complete && with_embedded.complete, "{language}");
+            assert!(plain.diagnostics.is_empty() && with_embedded.diagnostics.is_empty());
+            assert!(!plain.captures.is_empty(), "{language}");
+            assert!(plain.captures.iter().all(|outer| {
+                with_embedded.captures.iter().any(|capture| {
+                    capture.name == outer.name && capture.range == outer.range
+                })
+            }));
+            for (name, value) in expected {
+                let matches = |capture: &Capture| {
+                    capture.name == *name && text.get(capture.range.start..capture.range.end) == Some(value)
+                };
+                assert!(!plain.captures.iter().any(matches), "{language}: {value}");
+                assert!(with_embedded.captures.iter().any(matches), "{language}: {value}");
+            }
+        }
+    }
+}
+
 fn grammar(name: &str) -> Option<Language> {
     Some(match name {
         "html" | "vue" | "vue-template" => tree_sitter_html::LANGUAGE.into(),
         "css" => tree_sitter_css::LANGUAGE.into(),
-        "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        "javascript" | "jsx" => tree_sitter_javascript::LANGUAGE.into(),
         "json" => tree_sitter_json::LANGUAGE.into(),
         "rust" => tree_sitter_rust::LANGUAGE.into(),
         "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         "tsx" => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        "astro" => tree_sitter_astro_next::LANGUAGE.into(),
+        "csharp" => tree_sitter_c_sharp::LANGUAGE.into(),
+        "go" => tree_sitter_go::LANGUAGE.into(),
+        "java" => tree_sitter_java::LANGUAGE.into(),
+        "kotlin" => tree_sitter_kotlin_ng::LANGUAGE.into(),
+        "php" => tree_sitter_php::LANGUAGE_PHP.into(),
+        "python" => tree_sitter_python::LANGUAGE.into(),
+        "ruby" => tree_sitter_ruby::LANGUAGE.into(),
+        "sql" => tree_sitter_sequel::LANGUAGE.into(),
+        "svelte" => tree_sitter_svelte_ng::LANGUAGE.into(),
         _ => return None,
     })
 }

@@ -110,6 +110,11 @@ impl Workspace {
             .panels
             .iter()
             .chain(&self.bodies)
+            .chain(
+                self.inactive_editor_panels
+                    .iter()
+                    .flat_map(|editor| &editor.layers),
+            )
             .chain([
                 &self.tree_name_preview,
                 &self.language_list,

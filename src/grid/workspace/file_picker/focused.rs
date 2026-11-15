@@ -478,7 +478,7 @@ impl Workspace {
             cx.write_to_clipboard(ClipboardItem::new_string(editor.register().text.clone()));
         }
         let message = match result.edit.action {
-            Action::Close(_) => {
+            Action::Close(_) | Action::QuitAll(_) => {
                 self.leave_file_preview(&key.key, window, cx);
                 return true;
             }
@@ -498,16 +498,19 @@ impl Workspace {
             | Action::TabNavigate(_, _)
             | Action::TabNew(_)
             | Action::TabClose
+            | Action::Split { .. }
             | Action::SaveClose
             | Action::BracketBuffer { .. }
             | Action::BracketDiagnostic { .. }
             | Action::Filter { .. }
             | Action::Format(_)
+            | Action::SqlDialect { .. }
             | Action::CancelFormat
             | Action::UndoPlugin
             | Action::PluginComplete
             | Action::PluginDiagnose
             | Action::PluginDefinition
+            | Action::PluginHover
             | Action::PluginOutline
             | Action::PluginFold
             | Action::PluginCommand(_)

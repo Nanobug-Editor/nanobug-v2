@@ -14,22 +14,64 @@ fn edit_active(projects: &mut WorkspaceTabs) {
     });
 }
 
-/// Closing one label retains the shared draft, while its last label asks about that draft alone.
+/// Closing one label asks about its own draft and leaves another page's fork intact.
 #[test]
-fn shared_buffer_close_only_confirms_the_last_label() {
+fn file_labels_close_only_their_own_page_draft() {
     let directory = tempfile::tempdir().unwrap();
     let mut projects = WorkspaceTabs::new(vec![directory.path().to_path_buf()]);
     edit_active(&mut projects);
-    let buffer = projects.active().editor.buffer().id;
+    let original = projects.active().editor.buffer().id;
     projects.active_mut().open_page(None, 0.).unwrap();
-    assert!(EditorClose::new(&projects, CloseTarget::Buffer(buffer)).is_none());
-    assert!(projects.active_mut().editor.remove_buffer_tab(buffer, 0.));
-    assert!(projects.active_mut().select_page(0, 0.));
+    let buffer = projects.active().editor.buffer().id;
+    assert_ne!(buffer, original);
     let mut close = EditorClose::new(&projects, CloseTarget::Buffer(buffer)).unwrap();
     assert_eq!(close.pending.len(), 1);
     assert!(close.resolve(Choice::Discard, None, &mut projects));
     assert!(projects.active_mut().editor.remove_buffer_tab(buffer, 0.));
     assert!(projects.active().editor.buffer_index(buffer).is_none());
+    assert!(projects.active_mut().select_page(0, 0.));
+    assert_eq!(projects.active().editor.buffer().id, original);
+    assert_eq!(projects.active().editor.vim().doc.text, "!");
+}
+
+/// A counted close resolves the addressed split without changing its sibling's draft.
+#[test]
+fn split_close_uses_the_addressed_pane() {
+    use super::super::editor_splits::SplitAxis;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut projects = WorkspaceTabs::new(vec![directory.path().to_path_buf()]);
+    let original = projects.active().active_editor_id();
+    edit_active(&mut projects);
+    let area = Rect {
+        x: 0,
+        y: 0,
+        w: 100,
+        h: 30,
+    };
+    assert!(
+        projects
+            .active_mut()
+            .open_split(SplitAxis::Columns, None, area, 0.)
+            .unwrap()
+    );
+    let sibling = projects.active().active_editor_id();
+    edit_active(&mut projects);
+
+    let mut close = EditorClose::new(&projects, CloseTarget::Split(original)).unwrap();
+    assert_eq!(
+        close.pending,
+        [PendingBuffer {
+            tab: 0,
+            pane: original,
+            index: 0
+        }]
+    );
+    assert!(close.resolve(Choice::Discard, None, &mut projects));
+    let project = projects.active();
+    assert!(!project.editor_by_id(original).unwrap().modified());
+    assert_eq!(project.active_editor_id(), sibling);
+    assert_eq!(project.editor.vim().doc.text, "!!");
 }
 
 /// Match `key` against the current locale's captions, accounting for repeats and `multiple` files.
@@ -192,7 +234,14 @@ fn save_failure_keeps_the_draft_and_original_file() {
     fs::set_permissions(&path, permissions).unwrap();
     assert!(!completed);
     assert!(close.error.is_some());
-    assert_eq!(close.pending, [PendingBuffer { tab: 0, index: 0 }]);
+    assert_eq!(
+        close.pending,
+        [PendingBuffer {
+            tab: 0,
+            pane: 0,
+            index: 0
+        }]
+    );
     assert_eq!(fs::read_to_string(&path).unwrap(), "original");
     assert_eq!(projects.active().editor.vim().doc.text, "!original");
     assert!(projects.active().editor.modified());
@@ -241,7 +290,14 @@ fn quitting_from_start_prompts_for_inactive_projects_and_defers_discards() {
     assert!(tabs.select(1));
     edit_active(&mut tabs);
     let project_close = EditorClose::new(&tabs, CloseTarget::Tab).unwrap();
-    assert_eq!(project_close.pending, [PendingBuffer { tab: 1, index: 0 }]);
+    assert_eq!(
+        project_close.pending,
+        [PendingBuffer {
+            tab: 1,
+            pane: 0,
+            index: 0
+        }]
+    );
     let start = tabs.add_start();
     assert!(tabs.select(start));
     assert!(EditorClose::new(&tabs, CloseTarget::Tab).is_none());
@@ -294,7 +350,14 @@ fn save_all_resumes_after_naming_an_untitled_buffer() {
     let mut close = EditorClose::new(&tabs, CloseTarget::Tab).unwrap();
     assert!(!close.resolve(Choice::SaveAll, None, &mut tabs));
     assert!(close.picking_path);
-    assert_eq!(close.pending[0], PendingBuffer { tab: 0, index: 0 });
+    assert_eq!(
+        close.pending[0],
+        PendingBuffer {
+            tab: 0,
+            pane: 0,
+            index: 0
+        }
+    );
     assert_eq!(fs::read_to_string(&second).unwrap(), "!draft");
     assert_eq!(fs::read_to_string(&first).unwrap(), "draft");
 

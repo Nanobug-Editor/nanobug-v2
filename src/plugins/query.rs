@@ -68,6 +68,8 @@ pub(super) enum Dependency {
     File(FileDependency),
     Document(Option<String>, Option<(u64, u64)>),
     DocumentPath(Option<PathBuf>),
+    /// The observed filename extension, with ASCII letters normalized to lowercase.
+    DocumentExtension(Option<String>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -305,7 +307,9 @@ pub(super) fn resolve_prefix(path: &Path) -> Result<PathBuf> {
 pub(super) fn files_current(deps: &[Dependency]) -> bool {
     deps.iter().all(|dep| match dep {
         Dependency::File(observation) => observation.current(),
-        Dependency::Document(..) | Dependency::DocumentPath(_) => true,
+        Dependency::Document(..)
+        | Dependency::DocumentPath(_)
+        | Dependency::DocumentExtension(_) => true,
     })
 }
 
@@ -330,6 +334,9 @@ pub(super) fn document_current(
         }
         Dependency::DocumentPath(before) => {
             *before == project.and_then(|project| project.document.as_ref()?.path.clone())
+        }
+        Dependency::DocumentExtension(before) => {
+            *before == document_extension(project.and_then(|project| project.document.as_deref()))
         }
         _ => true,
     })
@@ -478,6 +485,12 @@ fn transient(error: &io::Error) -> bool {
     ) || cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))
 }
 
+/// Return the document's extension as a normalized, independently trackable lookup.
+fn document_extension(document: Option<&DocumentSnapshot>) -> Option<String> {
+    let path = document?.path.as_deref()?;
+    Some(path.extension()?.to_str()?.to_ascii_lowercase())
+}
+
 fn query(
     context: &ContextData,
     kind: Query,
@@ -492,11 +505,17 @@ fn query(
         !context.cancelled.load(Ordering::Acquire),
         "Rule evaluation cancelled"
     );
-    if kind == Query::DocumentPath {
+    if matches!(kind, Query::DocumentPath | Query::DocumentExtension) {
         ensure!(
             context.grants.contains(&Permission::ReadDocument),
             "Plugin has no document-read grant"
         );
+        if kind == Query::DocumentExtension {
+            let extension = document_extension(context.document.as_deref());
+            let value = json!(extension);
+            *dependency = Some(Dependency::DocumentExtension(extension));
+            return Ok(value);
+        }
         let path = context.document.as_ref().and_then(|doc| doc.path.clone());
         let value = serde_json::to_value(&path)?;
         *dependency = Some(Dependency::DocumentPath(path));

@@ -330,6 +330,35 @@ fn insert_control_keys_edit_text_and_wait_for_the_register_name() {
     assert_eq!(vim.doc.line(1), "wordother");
 }
 
+/// Omni completion requests the host while keeping Insert mode and document text.
+#[test]
+fn insert_omni_completion_consumes_its_prefix() {
+    let (mut vim, mut register) = editor("value");
+    vim.key("A", &mut register);
+    assert_eq!(vim.key("Ctrl+x", &mut register), Action::None);
+    assert!(vim.awaiting_key());
+    assert_eq!(vim.key("Ctrl+o", &mut register), Action::PluginComplete);
+    assert_eq!(vim.mode, super::Mode::Insert);
+    assert_eq!(vim.doc.text, "value");
+    assert!(vim.accepts_text());
+    vim.key("Ctrl+x", &mut register);
+    vim.key("Escape", &mut register);
+    assert_eq!(vim.mode, super::Mode::Normal);
+    assert!(!vim.awaiting_key());
+    assert_eq!(vim.key("Ctrl+]", &mut register), Action::PluginDefinition);
+    assert_eq!(vim.text("gO", &mut register), Action::PluginOutline);
+}
+
+/// The detail shortcut is a Normal-mode query and remains ordinary text in Insert mode.
+#[test]
+fn definition_details_key_is_normal_mode_only() {
+    let (mut vim, mut register) = editor("name");
+    assert_eq!(vim.key("K", &mut register), Action::PluginHover);
+    vim.key("i", &mut register);
+    assert_eq!(vim.key("K", &mut register), Action::None);
+    assert_eq!(vim.doc.text, "Kname");
+}
+
 /// Characterwise Visual puts replace the last character at its actual byte range.
 #[test]
 fn visual_put_keeps_the_selected_end_of_line_position() {

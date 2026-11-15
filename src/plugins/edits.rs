@@ -53,7 +53,7 @@ fn open_project_text(
             && project_path(root, path)? == resolved,
         "Project file changed while the plugin was working"
     );
-    let doc = Document::from_file_bytes(resolved, bytes, expected.is_some())?;
+    let doc = Document::from_file_bytes(resolved, bytes)?;
     Ok((doc, version))
 }
 

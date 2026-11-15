@@ -470,7 +470,7 @@ fn native_rust_plugin_formats_unsaved_buffer_and_project_saves() -> Result<()> {
     )
 }
 
-/// Approve tool execution in the active project and return its scope once the plugin is ready.
+/// Approve tool execution and return the active project scope once its formatter is ready.
 /// `app` and `window` host the native workspace and drive the session updates.
 async fn allow_rust_formatting(app: &AsyncApp, window: WindowHandle<Workspace>) -> Result<u64> {
     let scope = step(app, window, |workspace, _, _| {
@@ -486,12 +486,14 @@ async fn allow_rust_formatting(app: &AsyncApp, window: WindowHandle<Workspace>) 
     until(
         app,
         window,
-        "Rust activation and project tool execution",
+        "Rust formatter and project tool execution",
         |workspace| {
             Ok(
                 workspace.plugins.view.project_execution.get(&scope) == Some(&true)
                     && workspace.plugins.view.modules.iter().any(|(key, state)| {
-                        key.instance.project == scope && *state == State::Ready
+                        key.instance.project == scope
+                            && key.instance.module == "format"
+                            && *state == State::Ready
                     }),
             )
         },

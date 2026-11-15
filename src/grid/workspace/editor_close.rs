@@ -5,6 +5,7 @@ use crate::{
     grid::{
         mnemonic::Mnemonic,
         render::{Frame, MessageLevel, Rect},
+        windows::editor::EditorWindow,
     },
     ui::{
         text::TextSpacing,
@@ -105,9 +106,15 @@ fn click_choice(
 /// The scope of the user's close request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CloseTarget {
-    /// The editor pane in the selected project.
+    /// Hide the last editor on the active page or the standalone editor.
     Editor,
-    /// Close the active page's file label with this stable buffer identity.
+    /// Remove the pane with this project-local identity from the active page.
+    Split(usize),
+    /// Remove the active page and all of its panes.
+    Page,
+    /// Remove the active page's other panes and retain the focused editor.
+    OtherSplits,
+    /// Close the active editor's file label with this stable buffer identity.
     Buffer(u64),
     /// The selected tab, including start pages.
     Tab,
@@ -117,19 +124,32 @@ pub(super) enum CloseTarget {
     Quit,
 }
 
-/// Identifies a modified buffer while the dialog holds tab and buffer order fixed.
+impl CloseTarget {
+    /// Whether closing the target ends a project lifetime and must drain plugins.
+    pub(super) fn closes_project(self) -> bool {
+        matches!(self, Self::Tab | Self::AllTabs | Self::Quit)
+    }
+}
+
+/// Identifies a modified buffer while the dialog holds tab, page and buffer order fixed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingBuffer {
     /// Project tab that owns the buffer.
     tab: usize,
-    /// Buffer index within that project.
+    /// Stable editor identity within the project.
+    pane: usize,
+    /// Buffer index in that editor.
     index: usize,
 }
 
 impl PendingBuffer {
     /// Read the document for this queued buffer in `projects`.
     fn document(self, projects: &WorkspaceTabs) -> &Document {
-        &projects.project(self.tab).editor.buffers()[self.index]
+        &projects
+            .project(self.tab)
+            .editor_by_id(self.pane)
+            .expect("pending editor is retained")
+            .buffers()[self.index]
             .vim
             .doc
     }
@@ -160,29 +180,42 @@ impl EditorClose {
         });
         let mut pending = VecDeque::new();
         for (tab, project) in active.into_iter().chain(others) {
-            let editor = &project.editor;
-            if let CloseTarget::Buffer(id) = target {
-                if let Some(index) = editor.buffer_index(id)
-                    && !editor.buffer_in_other_tabpage(id)
-                    && editor.buffers()[index].vim.doc.modified()
-                {
-                    pending.push_back(PendingBuffer { tab, index });
+            let active_pane = project.active_editor_id();
+            match target {
+                CloseTarget::Buffer(id) => {
+                    if let Some(index) = project.editor.buffer_index(id)
+                        && project.editor.buffers()[index].vim.doc.modified()
+                    {
+                        pending.push_back(PendingBuffer {
+                            tab,
+                            pane: active_pane,
+                            index,
+                        });
+                    }
                 }
-                continue;
+                CloseTarget::Editor => queue_dirty(&mut pending, tab, active_pane, &project.editor),
+                CloseTarget::Split(pane) => {
+                    if let Some(editor) = project.editor_by_id(pane) {
+                        queue_dirty(&mut pending, tab, pane, editor);
+                    }
+                }
+                CloseTarget::Page | CloseTarget::OtherSplits => {
+                    if target == CloseTarget::Page {
+                        queue_dirty(&mut pending, tab, active_pane, &project.editor);
+                    }
+                    for (pane, editor) in
+                        project.page_editors().filter(|(id, _)| *id != active_pane)
+                    {
+                        queue_dirty(&mut pending, tab, pane, editor);
+                    }
+                }
+                CloseTarget::Tab | CloseTarget::AllTabs | CloseTarget::Quit => {
+                    queue_dirty(&mut pending, tab, active_pane, &project.editor);
+                    for (pane, editor) in project.editors().filter(|(id, _)| *id != active_pane) {
+                        queue_dirty(&mut pending, tab, pane, editor);
+                    }
+                }
             }
-            // Hiding a pane in a multi-page project retains its documents and all other views.
-            if target == CloseTarget::Editor && editor.tabpage_count() > 1 {
-                continue;
-            }
-            let order = std::iter::once(editor.active_index())
-                .chain((0..editor.buffers().len()).filter(|&index| index != editor.active_index()));
-            pending.extend(order.filter_map(|index| {
-                editor.buffers()[index]
-                    .vim
-                    .doc
-                    .modified()
-                    .then_some(PendingBuffer { tab, index })
-            }));
         }
         (!pending.is_empty()).then(|| Self {
             target,
@@ -215,19 +248,19 @@ impl EditorClose {
                 };
                 for _ in 0..count {
                     let buffer = self.pending[0];
-                    let filename = buffer.document(projects).path.as_ref();
+                    let document = buffer.document(projects);
+                    let filename = document.path.as_ref();
                     if filename.is_none() && path.is_none() {
                         self.picking_path = true;
                         return false;
                     }
-                    // Overlapping project roots can retain different drafts for one path.
+                    // Independent panes can retain different drafts for one path.
                     if choice == Choice::SaveAll
                         && let Some(filename) = filename
-                        && self
-                            .pending
-                            .iter()
-                            .skip(1)
-                            .any(|other| other.document(projects).path.as_ref() == Some(filename))
+                        && self.pending.iter().skip(1).any(|other| {
+                            let other = other.document(projects);
+                            other.path.as_ref() == Some(filename) && other.text != document.text
+                        })
                     {
                         self.error = Some(i18n::text("editor_close.duplicate_draft").into());
                         return false;
@@ -248,7 +281,8 @@ impl EditorClose {
             for buffer in self.discarded.drain(..) {
                 projects
                     .project_mut(buffer.tab)
-                    .editor
+                    .editor_by_id_mut(buffer.pane)
+                    .expect("pending editor is retained")
                     .discard(buffer.index);
             }
         }
@@ -256,26 +290,33 @@ impl EditorClose {
     }
 }
 
-/// Save `buffer` in `projects`, preventing Save As to another open buffer's `path`.
+/// Add modified buffers in the editor for `tab` and `pane` to `pending`, with its active file first.
+fn queue_dirty(
+    pending: &mut VecDeque<PendingBuffer>,
+    tab: usize,
+    pane: usize,
+    editor: &EditorWindow,
+) {
+    let active = editor.active_index();
+    let order =
+        std::iter::once(active).chain((0..editor.buffers().len()).filter(|&index| index != active));
+    pending.extend(order.filter_map(|index| {
+        editor.buffers()[index]
+            .vim
+            .doc
+            .modified()
+            .then_some(PendingBuffer { tab, pane, index })
+    }));
+}
+
+/// Save `buffer` in its owning editor and refresh Explorer after Save As to `path`.
 fn save_buffer(
     projects: &mut WorkspaceTabs,
     buffer: PendingBuffer,
     path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    if let Some(path) = &path {
-        let path = path.canonicalize().unwrap_or_else(|_| path.clone());
-        if projects.ordered().any(|project| {
-            project
-                .editor
-                .buffers()
-                .iter()
-                .any(|buffer| buffer.vim.doc.path.as_ref() == Some(&path))
-        }) {
-            anyhow::bail!(i18n::text("editor_close.path_open"));
-        }
-    }
     let save_as = path.is_some();
-    projects.save_buffer(buffer.tab, buffer.index, path)?;
+    projects.save_editor_buffer(buffer.tab, buffer.pane, buffer.index, path)?;
     if save_as && let Some(manager) = &mut projects.project_mut(buffer.tab).manager {
         let _ = manager.refresh();
     }
@@ -355,7 +396,7 @@ impl Workspace {
             frame.border(title, true, false, spacing);
             1
         };
-        if !matches!(close.target, CloseTarget::Editor | CloseTarget::Buffer(_)) {
+        if close.target.closes_project() {
             frame.label(
                 details_row,
                 slot.clone(),

@@ -12,7 +12,8 @@
         });
     }
     return {
-        host: Object.freeze({
+        // Allow detecting the result format without changing the list of host data APIs.
+        host: Object.freeze(Object.defineProperty({
             context: Object.freeze(context),
             exists: path => query("exists", { path }),
             readFile: (path, options = {}) => query("read_file", { ...options, path }),
@@ -21,8 +22,10 @@
             readDocument: path => query("document", { path }),
             // Track file switches without rerunning the rule for every edit.
             documentPath: () => query("document_path", {}),
+            // Match a file type without invalidating the rule on same-type renames.
+            documentExtension: () => query("document_extension", {}),
             list: path => query("list", { path })
-        }),
+        }, "supportsLanguageServerStartup", { value: true })),
         take() {
             const result = JSON.stringify(queued);
             queued = [];

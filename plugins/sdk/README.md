@@ -38,7 +38,12 @@ Copy-Item plugins/sdk/examples/nanobug-plugin.toml,plugins/sdk/examples/detect.j
 ## 调用与数据
 
 - Rust 插件用 `export_plugin!(handler)` 导出入口。回调接收 `Input`，返回 `Output`。宿主核对模块导出和导入。安装流程在发布安装记录前检查 WASM 并准备编译缓存。
-- 规则是一个异步 JS 函数体，最终返回布尔值。可以通过 `host.exists`、`host.readFile`、`host.readBytes`、`host.scanText`、`host.readDocument`、`host.list` 查询已授权数据。分段读取返回下一位置及是否结束。`readFile` 和 `scanText` 使用 UTF-8，二进制文件可分段用 `readBytes`。文件接口读取磁盘内容，文档接口读取宿主正文。
+- 规则是一个异步 JS 函数体，可以返回布尔值，或返回 `{ active: true, startLanguageServer: true }`，激活模块并请求为已打开的项目提前启动该模块声明的语言服务器。布尔值沿用按文档启动的行为。宿主在执行前仍检查模块权限和项目工具执行授权。跨版本插件可用 `host.supportsLanguageServerStartup` 判断运行时是否支持对象结果。
+- 激活规则也可以通过对象中的 `excludeDirs` 提供语言服务器的自动排除目录，例如 `excludeDirs: ["coverage"]`。填写从项目根目录出发的具体目录路径。支持排除选项的服务器适配器会把它与项目手动名单一起应用。
+- SQL 方言规则可读取 `host.context.projectSqlDialect` 中显式保存的项目方言 ID。自动模式下该属性缺省，缓冲区覆盖仅用于当前 SQL 文件的路由。
+- 多个模块可以把 `rule` 指向同一个 JS 文件。该文件用扁平的 `export default { document: async host => …, complete: async host => … }` 导出规则，键与清单的 `[[modules]].id` 一一对应。宿主每次只调用当前模块的函数，同步和异步函数均可使用。原有直接写 `return` 的异步函数体也继续支持。
+- `host.documentExtension()` 返回不含点号且 ASCII 字母转为小写的当前文档扩展名，无扩展名时返回 `null`。该查询只追踪扩展名变化，所以改名或切换到同类型文件时可继续沿用原判断。
+- 可以通过 `host.exists`、`host.readFile`、`host.readBytes`、`host.scanText`、`host.readDocument`、`host.list` 查询已授权数据。分段读取返回下一位置及是否结束。`readFile` 和 `scanText` 使用 UTF-8，二进制文件可分段用 `readBytes`。文件接口读取磁盘内容，文档接口读取宿主正文。
 - 激活规则需要读取项目外文件时，在清单顶层声明 `permissions = ["read_rule_paths"]` 和 `rule_paths`。例如 Windows 本地包可以填写 `rule_paths = ['C:\LocalFixture\status.txt']`。最多列出四个准确的绝对文件路径。JS 调用时传入与清单相同的路径字符串，可查询存在、读取文本或字节、扫描文本。目录列出、正文、写入和业务 WASM 均使用各自的权限。编辑器先显示清单中的路径，用户确认后才访问这些路径并在本机保存授权。文件更新、创建和删除会触发重算。父目录被替换后，可重新安装当前版本并确认路径来恢复授权。规则文件查询拒绝路径中的 `..`、符号链接和 Windows 目录联接，并支持获准的网络共享文件。主动联网接口由业务模块的权限控制。
 - 文档位置使用 UTF-8 字节偏移。每次打开和每次正文修改都有独立的标识。编辑结果需要使用同一次输入里的版本。宿主核对整个编辑组，再写入正文。未打开的 UTF-8 项目文件可以用 `ReadProjectText` 读取，显式命令将返回的路径和版本放入 `project_file_edits`。提议修改未打开的文件需要 `read_project` 和 `edit_document` 权限。同一预览可包含打开和未打开的文件。确认后，未打开的文件会成为未保存的缓冲区。写盘仍由用户保存。
 - 自动刷新交互模块时，编辑器可以在内部只发送正文变动。运行进程缺少旧版本会请求补发正文，插件回调始终收到原格式的 `Input`。
@@ -55,11 +60,14 @@ Copy-Item plugins/sdk/examples/nanobug-plugin.toml,plugins/sdk/examples/detect.j
 - `document` 提供者收到 `Open` 和 `DocumentChanged`，返回 `Output.document_features`。高亮使用主题角色，折叠返回 UTF-8 范围，大纲返回名称和跳转字节。宿主按文档打开代次、修订和运行代次检查结果。声明该能力需要 `read_document`。
 - `Output.completion_items` 可以提供标签和单个替换范围，范围需包含请求的光标位置。原有 `Output.completions` 仍按字符串插入。
 - `definition` 由项目授权的原生语言服务处理。宿主用 `Output.definitions` 传递目标文件及从零开始的行号和 UTF-16 列号。
-- Rust 模块可以声明 `rust_analyzer = true` 和 `document_extensions = ["rs"]`，将已声明的补全、诊断和定义跳转交给宿主管理的 rust-analyzer。项目授权执行后，宿主同步已打开的 Rust 缓冲区，并仅显示与当前文档修订匹配的实时诊断。普通 WASM 事件仍可提供语法和基础补全。
+- `hover` 由项目授权的原生语言服务处理。`PluginEvent::Hover.offset` 指定当前文档中的 UTF-8 字节位置，宿主将语言服务器返回的签名、类型和文档转为有长度上限的 Markdown，放入 `Output.hover`。服务端标为纯文本的内容按字面显示。
+- Rust 模块可以声明 `rust_analyzer = true` 和 `document_extensions = ["rs"]`，将已声明的补全、诊断、定义跳转和符号详情交给宿主管理的 rust-analyzer。项目授权执行后，宿主同步已打开的 Rust 缓冲区，并仅显示与当前文档修订匹配的实时诊断。普通 WASM 事件仍可提供语法和基础补全。
+- 通用语言模块可声明宿主支持的 `language_server`。补全、诊断、定义跳转和符号详情继续由 `provides` 声明。宿主在项目授权后启动对应语言服务器，并把未保存的文档通过 LSP 同步。提供者可用普通 WASM 回调实现基础补全和语法诊断。
 - `QuerySyntax` 在公共解析进程中对当前正文执行 Tree-sitter 查询，返回捕获范围和语法错误。查询和旧的 `ParseDocument` 共用文档语法树。使用 `await_service = true` 及一条服务请求，`ServiceResult` 的输出将完成原调用，受原调用的截止时间和文档版本约束。
 - `ReadProjectAncestors` 使用相同的等待方式，从当前文档目录向上读取指定文件，边界为打开的项目根，要求 `read_project`。返回按距离排序的项目相对路径和 UTF-8 正文。
 - `format` 提供者收到 `Format` 后，可以用 `Output.edits` 返回文本修改，或用 `Output.format_error` 报告失败。保存到新路径时，事件的可选 `path` 字段会提供目标，但编辑范围仍以当前缓冲区为准。
 - Rust 格式化提供者可以在等待式 `Format` 调用中请求 `Service::Rustfmt`。宿主要求读取和编辑文档、运行本机工具及当前项目执行权限，把当前正文通过标准输入传递给 rustfmt，并以字符串返回标准输出。
+- 其他格式化提供者可在等待式 `Format` 调用中使用 `Service::FormatLanguage { tool }`。宿主选择格式化命令，将文档正文通过标准输入发送。内置 SQL 格式化器使用文档权限。原生工具另需工具权限和项目授权。
 
 ## Canvas 自绘
 

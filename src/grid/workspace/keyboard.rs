@@ -1,6 +1,9 @@
 //! Global shortcuts, modal keyboard routing and committed native text.
 
-use crate::grid::windows::{editor::EditorWindow, help::HelpCommand};
+use crate::grid::windows::{
+    editor::{EditorWindow, MarkdownViewMode},
+    help::HelpCommand,
+};
 use crate::ui::keys::normal_character;
 
 use super::{
@@ -29,6 +32,8 @@ pub(super) enum PendingPrefix {
     Manager(char),
     /// Window command after Ctrl+w.
     Window(WindowSequence),
+    /// First letter or bracket in a Markdown preview navigation command.
+    MarkdownNavigation(char),
 }
 
 /// The complete suffix entered after the leader, identifying the current group.
@@ -42,6 +47,8 @@ pub(super) struct LeaderAvailability {
     manager: bool,
     /// The active project pane or file picker has shortcut help.
     help: bool,
+    /// The focused editor can switch the active Markdown document's view.
+    markdown: bool,
     /// Restrict the current surface to close bindings.
     close_only: bool,
     /// File selection keeps shell actions scoped to the picker.
@@ -85,6 +92,11 @@ const LEADER_BINDINGS: &[LeaderBinding] = &[
         shortcut: None,
     },
     LeaderBinding {
+        sequence: "m",
+        description_key: "leader.markdown_group",
+        shortcut: None,
+    },
+    LeaderBinding {
         sequence: "\t",
         description_key: "leader.tabpage_group",
         shortcut: None,
@@ -118,6 +130,21 @@ const LEADER_BINDINGS: &[LeaderBinding] = &[
         sequence: "pa",
         description_key: "leader.open_start",
         shortcut: Some(ShellShortcut::OpenStart),
+    },
+    LeaderBinding {
+        sequence: "ma",
+        description_key: "leader.markdown_split",
+        shortcut: Some(ShellShortcut::SetMarkdownView(MarkdownViewMode::Split)),
+    },
+    LeaderBinding {
+        sequence: "me",
+        description_key: "leader.markdown_edit",
+        shortcut: Some(ShellShortcut::SetMarkdownView(MarkdownViewMode::Edit)),
+    },
+    LeaderBinding {
+        sequence: "mp",
+        description_key: "leader.markdown_preview",
+        shortcut: Some(ShellShortcut::SetMarkdownView(MarkdownViewMode::Preview)),
     },
     LeaderBinding {
         sequence: "\t\t",
@@ -169,6 +196,7 @@ impl LeaderPrefix {
                 _ if availability.close_only => false,
                 Some(ShellShortcut::OpenHelp) => availability.help,
                 _ if availability.choosing_file => false,
+                _ if binding.sequence.starts_with('m') => availability.markdown,
                 _ if binding.sequence.starts_with('\t') => {
                     availability.manager && availability.tabs
                 }
@@ -207,6 +235,8 @@ enum ShellShortcut {
     NewTabpage,
     /// Close the active page inside the current project.
     CloseTabpage,
+    /// Select the source and preview layout for the active Markdown document.
+    SetMarkdownView(MarkdownViewMode),
     /// Close the grid surface that owns input.
     CloseFocused,
     /// Close the selected scope of top-level tabs after resolving unsaved buffers.
@@ -299,6 +329,15 @@ impl Workspace {
             .is_some_and(|session| session.state.busy || session.state.delete.is_some());
         let project = self.projects.active_project();
         let modal_open = self.modal_open();
+        let markdown = !modal_open
+            && !self.plugins.owns_input()
+            && project.is_some_and(|project| {
+                project.focus == Focus::Editor
+                    && project.editor.vim().mode == Mode::Normal
+                    && project.editor.markdown_view_mode().is_some()
+            });
+        #[cfg(feature = "plugin-probe")]
+        let markdown = markdown && !self.probe_has_focus();
         let visual = project.is_some_and(|project| {
             project.focus == Focus::Editor
                 && matches!(
@@ -309,6 +348,7 @@ impl Workspace {
         LeaderAvailability {
             manager: self.projects.manager_available(),
             help: self.file_picker.is_some() || project.is_some(),
+            markdown,
             close_only: self.help.is_open()
                 || self.small_modal_open()
                 || project_picker
@@ -325,6 +365,27 @@ impl Workspace {
 
     /// Route committed native `text` to the active input in `window` through `cx`.
     pub(super) fn commit_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.deliver_text(text, true, window, cx);
+    }
+
+    /// Route clipboard `text` to the active input without requesting editor completion.
+    pub(super) fn commit_pasted_text(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.deliver_text(text, false, window, cx);
+    }
+
+    /// Deliver `text` to its focused surface. `typed` enables completion in the project editor.
+    fn deliver_text(
+        &mut self,
+        text: &str,
+        typed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.accepts_native_text() {
             return;
         }
@@ -352,19 +413,34 @@ impl Workspace {
             self.sync(window, cx);
             return;
         }
-        self.commit_editor_text(text, window, cx);
+        self.commit_editor_text(text, typed, window, cx);
     }
 
-    /// Deliver `text` to the active editor through `window` and `cx`, including a direct paste chord.
-    fn commit_editor_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.projects.active().editor.vim().accepts_text() {
+    /// Insert `text` in `window` through `cx`. `typed` distinguishes native input from paste.
+    fn commit_editor_text(
+        &mut self,
+        text: &str,
+        typed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let vim = self.projects.active().editor.vim();
+        if !vim.accepts_text() {
             return;
         }
+        let revision = vim.doc.revision;
+        let caret = vim.doc.cursor;
+        let suggest = typed && vim.mode.is_insert();
         self.cursor
             .update(cx, |cursor, cx| cursor.activity(window, cx));
         self.projects.active_mut().status.clear();
         let text = text.replace("\r\n", "\n");
         self.run_vim(|vim, register| vim.commit_text(&text, register), window, cx);
+        if suggest && self.projects.active().editor.vim().doc.revision != revision {
+            self.refresh_automatic_completion((revision, caret), window, cx);
+        } else {
+            self.dismiss_completion(cx);
+        }
         self.repaint_editor_input(None, None, window, cx);
         #[cfg(feature = "plugin-probe")]
         if let Some(client) = self.probe.as_ref().and_then(|probe| probe.client.as_ref()) {
@@ -429,10 +505,38 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let raw = event.keystroke.key.as_str();
+        let page = if event.keystroke.modifiers.modified() {
+            None
+        } else {
+            match raw {
+                "pageup" => Some(-1),
+                "pagedown" => Some(1),
+                _ => None,
+            }
+        };
+        if let Some(direction) = page
+            && self.scroll_definition_hover(direction, window, cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
+        if self.dismiss_definition_hover(cx)
+            && raw == "escape"
+            && !event.keystroke.modifiers.modified()
+        {
+            self.held_close_key = Some("escape".into());
+            cx.stop_propagation();
+            return;
+        }
         if self.plugins.owns_input() {
             if self.plugin_key(event, window, cx) {
                 cx.stop_propagation();
             }
+            return;
+        }
+        if !self.modal_open() && self.completion_keydown(event, window, cx) {
+            cx.stop_propagation();
             return;
         }
         if event.keystroke.key == "escape" {
@@ -450,14 +554,8 @@ impl Workspace {
         if self.probe_key(event, window, cx) {
             return;
         }
-        let raw = event.keystroke.key.as_str();
-        if !event.keystroke.modifiers.modified()
-            && let Some(delta) = match raw {
-                "pageup" => Some(-1),
-                "pagedown" => Some(1),
-                _ => None,
-            }
-            && self.page_sequence_hint(delta, cx)
+        if let Some(direction) = page
+            && self.page_sequence_hint(direction, cx)
         {
             cx.stop_propagation();
             return;
@@ -516,7 +614,7 @@ impl Workspace {
                 HelpCommand::Paste => {
                     if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                         self.help.composition.clear();
-                        self.commit_text(&text, window, cx);
+                        self.commit_pasted_text(&text, window, cx);
                     }
                 }
                 HelpCommand::DispatchChord => {
@@ -598,6 +696,7 @@ impl Workspace {
             project.focus
         };
         let mode = project.editor.vim().mode;
+        let preview_only = project.editor.markdown_view_mode() == Some(MarkdownViewMode::Preview);
         let awaiting_key = focus == Focus::Editor && project.editor.vim().awaiting_key();
         let shortcut = if awaiting_key || keyboard_help {
             None
@@ -645,6 +744,7 @@ impl Workspace {
             manager.cancel_pending_undo();
         }
         if !keyboard_help
+            && !preview_only
             && focus == Focus::Editor
             && (modifiers.control || modifiers.platform)
             && raw == "v"
@@ -654,7 +754,7 @@ impl Workspace {
                 && let Some(text) = item.text()
             {
                 self.projects.active_mut().editor.composition_mut().clear();
-                self.commit_editor_text(&text, window, cx);
+                self.commit_editor_text(&text, false, window, cx);
             }
             cx.stop_propagation();
             return;
@@ -732,9 +832,18 @@ impl Workspace {
             }
             return;
         }
+        let save = raw == "s" && (modifiers.control || modifiers.platform);
+        if preview_only && !save {
+            self.markdown_preview_key(event, character.as_deref(), prefix, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        let doc = &self.projects.active().editor.vim().doc;
+        let (revision, caret) = (doc.revision, doc.cursor);
+        let area = self.active_editor_area();
         let Some(input) = self.projects.active_mut().editor.key(
             &event.keystroke,
-            self.layout.editor,
+            area,
             &self.spacing,
             keyboard_help,
         ) else {
@@ -757,8 +866,64 @@ impl Workspace {
             );
         }
         self.apply_edit(input.edit, window, cx);
+        if mode.is_insert()
+            && raw == "backspace"
+            && !modifiers.modified()
+            && self.projects.active().editor.vim().doc.revision != revision
+        {
+            self.refresh_automatic_completion((revision, caret), window, cx);
+        }
         self.repaint_editor_input(input.view_top, input.view_left, window, cx);
         cx.stop_propagation();
+    }
+
+    /// Interpret `event` and its printable `character` as preview or file navigation.
+    /// `prefix` carries the previous key. `window` and `cx` apply the resulting action.
+    fn markdown_preview_key(
+        &mut self,
+        event: &KeyDownEvent,
+        character: Option<&str>,
+        prefix: Option<PendingPrefix>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = &event.keystroke;
+        if let Some(PendingPrefix::MarkdownNavigation(previous)) = prefix {
+            if event.is_held {
+                self.prefix = prefix;
+                return;
+            }
+            let continuation = if key.key == "tab" && !key.modifiers.modified()
+                || key.key == "i"
+                    && key.modifiers
+                        == (gpui::Modifiers {
+                            control: true,
+                            ..Default::default()
+                        }) {
+                Some("Tab")
+            } else {
+                character
+            };
+            if previous == 'g' && continuation == Some("g") {
+                self.scroll_markdown_preview(ScrollInput::Position(0), window, cx);
+                return;
+            }
+            if let Some(action) = markdown_navigation_action(previous, continuation) {
+                self.action(action, window, cx);
+                self.sync(window, cx);
+                return;
+            }
+        }
+        if let Some([character]) = character.map(str::as_bytes)
+            && matches!(*character, b'g' | b'[' | b']')
+        {
+            self.prefix = Some(PendingPrefix::MarkdownNavigation(char::from(*character)));
+            return;
+        }
+        let page_rows = self.markdown_preview_page_rows();
+        if let Some(input) = markdown_scroll_input(key, page_rows) {
+            self.scroll_markdown_preview(input, window, cx);
+        }
     }
 
     /// Honor explicit `view_top` or `view_left` targets while the help view may own repaint.
@@ -769,6 +934,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(project) = self.projects.active_project_mut() {
+            project.editor.markdown_source_takes_scroll();
+        }
         let explicit = view_top.is_some() || view_left.is_some();
         let inputs = [
             if explicit {
@@ -953,6 +1121,18 @@ impl Workspace {
                 }
             }
             ShellShortcut::OpenStart => self.open_start_tab(window, cx),
+            ShellShortcut::SetMarkdownView(mode) => {
+                if self
+                    .projects
+                    .active_mut()
+                    .editor
+                    .set_markdown_view_mode(mode)
+                {
+                    self.dismiss_completion(cx);
+                    self.last_cursor_space = None;
+                    self.sync(window, cx);
+                }
+            }
             ShellShortcut::NewTabpage | ShellShortcut::CloseTabpage => {
                 self.finish_editor_input(window, cx);
                 let action = match shortcut {
@@ -975,6 +1155,56 @@ impl Workspace {
                 self.sync(window, cx);
             }
         }
+    }
+}
+
+/// Resolve `key` after `prefix` into an existing host action that can change buffers or tabpages.
+fn markdown_navigation_action(prefix: char, key: Option<&str>) -> Option<Action> {
+    Some(match (prefix, key?) {
+        ('g', "t") => Action::TabNavigate(1, None),
+        ('g', "T") => Action::TabNavigate(-1, None),
+        ('g', "Tab") => Action::TabNavigate(0, None),
+        ('[' | ']', key @ ("b" | "B")) => Action::BracketBuffer {
+            forward: prefix == ']',
+            edge: key == "B",
+            count: None,
+        },
+        _ => return None,
+    })
+}
+
+/// Resolve the preview scroll requested by `key` given a visible page of `page_rows` grid rows.
+fn markdown_scroll_input(key: &Keystroke, page_rows: usize) -> Option<ScrollInput> {
+    let modifiers = key.modifiers;
+    if modifiers.alt || modifiers.function || modifiers.platform {
+        return None;
+    }
+    let page = page_rows as isize;
+    let half_page = (page / 2).max(1);
+    let raw = key.key.as_str();
+    if modifiers.control && !modifiers.shift {
+        return match raw {
+            "b" => Some(ScrollInput::Wheel(-page)),
+            "f" => Some(ScrollInput::Wheel(page)),
+            "u" => Some(ScrollInput::Wheel(-half_page)),
+            "d" => Some(ScrollInput::Wheel(half_page)),
+            _ => None,
+        };
+    }
+    if modifiers.shift && normal_character(key).as_deref() == Some("G") && !modifiers.control {
+        return Some(ScrollInput::Position(usize::MAX));
+    }
+    if modifiers.modified() {
+        return None;
+    }
+    match raw {
+        "k" | "up" => Some(ScrollInput::Wheel(-1)),
+        "j" | "down" => Some(ScrollInput::Wheel(1)),
+        "pageup" => Some(ScrollInput::Wheel(-page)),
+        "pagedown" => Some(ScrollInput::Wheel(page)),
+        "home" => Some(ScrollInput::Position(0)),
+        "end" => Some(ScrollInput::Position(usize::MAX)),
+        _ => None,
     }
 }
 

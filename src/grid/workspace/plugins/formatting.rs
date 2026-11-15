@@ -107,6 +107,8 @@ impl Pending {
 struct Save {
     path: Option<PathBuf>,
     quit: bool,
+    /// A write-and-close in a split applies to that editor even after the focus moves.
+    pane: Option<usize>,
 }
 
 impl Workspace {
@@ -184,7 +186,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.start_format(None, Some(Save { path, quit }), None, window, cx);
+        let project = self.projects.active();
+        let pane = (quit && project.split_count() > 1).then(|| project.active_editor_id());
+        self.start_format(None, Some(Save { path, quit, pane }), None, window, cx);
     }
 
     pub(in crate::grid::workspace) fn cancel_format(
@@ -497,13 +501,11 @@ impl Workspace {
                 .iter_mut()
                 .find(|project| project.plugin_scope == job.project)
                 .ok_or_else(|| anyhow::anyhow!("Project was closed"))?;
-            let index = project
-                .editor
-                .buffers()
-                .iter()
-                .position(|buffer| buffer.vim.doc.opening == opening)
+            let (pane, index) = project
+                .document_owner(opening)
                 .ok_or_else(|| anyhow::anyhow!("Document was closed"))?;
-            let doc = &project.editor.buffers()[index].vim.doc;
+            let editor = project.editor_by_id_mut(pane).expect("retained editor");
+            let doc = &editor.buffers()[index].vim.doc;
             anyhow::ensure!(
                 doc.path == job.document_path,
                 "Document path changed while the formatter was working"
@@ -518,7 +520,7 @@ impl Workspace {
             job.check_deadline(Instant::now())?;
             if doc.text != updated {
                 changed_path = doc.path.clone();
-                project.editor.edit_buffer(index, |vim, _| {
+                editor.edit_buffer(index, |vim, _| {
                     edits::apply(&mut vim.doc, &updated);
                     nanobug::vim::Action::None
                 });
@@ -563,16 +565,16 @@ impl Workspace {
                 return None;
             }
             project
-                .editor
-                .buffers()
-                .iter()
-                .position(|buffer| buffer.vim.doc.opening == opening)
-                .map(|buffer| (index, buffer))
+                .document_owner(opening)
+                .map(|(pane, buffer)| (index, pane, buffer))
         });
-        let Some((tab, buffer)) = target else {
+        let Some((tab, pane, buffer)) = target else {
             return;
         };
-        match self.projects.save_buffer(tab, buffer, save.path) {
+        match self
+            .projects
+            .save_editor_buffer(tab, pane, buffer, save.path)
+        {
             Ok(()) => {
                 let project = self.projects.project_mut(tab);
                 project.status = format_error.map_or_else(
@@ -583,7 +585,17 @@ impl Workspace {
                     let _ = manager.refresh();
                 }
                 if save.quit {
-                    self.request_close(super::super::editor_close::CloseTarget::Quit, window, cx);
+                    use super::super::editor_close::CloseTarget;
+                    if let Some(pane) = save.pane {
+                        if tab == self.projects.selected
+                            && self.projects.active().split_count() > 1
+                            && self.projects.active().splits().ids().contains(&pane)
+                        {
+                            self.request_close(CloseTarget::Split(pane), window, cx);
+                        }
+                    } else {
+                        self.request_close(CloseTarget::Quit, window, cx);
+                    }
                 }
             }
             Err(error) => self.projects.project_mut(tab).status = format!("{error:#}"),
@@ -627,6 +639,7 @@ mod tests {
         let save = || Save {
             path: None,
             quit: false,
+            pane: None,
         };
         let mut job = manual(requested);
         job.attach_save(save(), requested + Duration::from_secs(3));

@@ -1,11 +1,13 @@
 //! Bind native language-server sessions to authorized plugin modules and editor revisions.
 
+mod hover;
+
 use super::{Answer, CallResult, Engine, Key, ResultEvent};
 use crate::plugins::{
     package::Provider,
     query,
-    session::{DocumentDiagnostics, State},
-    tools::rust_analyzer::{self, Analyzer, Event, Request},
+    session::{DocumentDiagnostics, LanguageServerPhase, LanguageServerStatus, State},
+    tools::rust_analyzer::{self, Analyzer, Event, ProjectSettings, Request, Server},
 };
 use nanobug_plugin_sdk::{
     Diagnostic, DocumentSnapshot, Edit, Output, Permission, PluginEvent,
@@ -19,13 +21,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// One running server and its versioned documents for a live Rust module.
+/// One running server and its versioned documents for a live language module.
 pub(super) struct Binding {
     root: PathBuf,
+    /// Adapter selected by the current package manifest.
+    kind: Server,
+    /// Automatic exclusions used to initialize this server generation.
+    automatic_exclusions: Arc<[String]>,
     /// Identifies this process even if the Rust module reuses its WASM worker.
     server_id: u64,
     generation: u64,
     server: Option<Analyzer>,
+    /// Last phase of this process generation.
+    phase: LanguageServerPhase,
     documents: Vec<Arc<DocumentSnapshot>>,
     diagnostics: BTreeMap<u64, Arc<DocumentDiagnostics>>,
     calls: BTreeMap<u64, Call>,
@@ -42,7 +50,7 @@ struct Call {
 }
 
 impl Engine {
-    /// Drop servers that lost authorization and sync newly opened or edited Rust documents.
+    /// Drop servers that lost authorization and sync newly opened or edited source documents.
     pub(super) fn sync_analyzers(&mut self) {
         let keys: Vec<_> = self
             .lifecycle
@@ -53,53 +61,81 @@ impl Engine {
             .collect();
         let mut old = std::mem::take(&mut self.analyzers);
         let mut visible = BTreeMap::new();
+        let mut statuses = BTreeMap::<u64, LanguageServerStatus>::new();
         let mut errors = BTreeMap::new();
         for key in keys {
             let project = self.projects[&key.instance.project].clone();
+            let server_kind = self.analyzer_kind(&key).expect("selected language server");
             let generation = self.lifecycle.runtimes[&key.namespace].generation;
+            let starts_early = self.rules.start_language_server(&key);
+            // A different open SQL buffer may select a different dialect than the active one.
+            let overlays = (!server_kind.is_sql()).then_some(&project.open_documents);
             let documents: Vec<_> = project
                 .document
                 .iter()
-                .chain(&project.open_documents)
+                .chain(overlays.into_iter().flatten())
                 .filter(|document| {
                     document.path.as_ref().is_some_and(|path| {
                         path.starts_with(&project.root)
-                            && self.lifecycle.wanted[&key].accepts_document(Some(path))
+                            && (self.lifecycle.wanted[&key].accepts_document(Some(path))
+                                || server_kind.accepts_project_overlay(path))
                     })
                 })
                 .cloned()
                 .collect();
-            if documents.is_empty() && !old.contains_key(&key) {
+            if !starts_early && documents.is_empty() && !old.contains_key(&key) {
                 continue;
             }
-            let mut binding = old
-                .remove(&key)
-                .filter(|binding| binding.root == project.root && binding.generation == generation)
-                .unwrap_or_else(|| {
+            let automatic_exclusions = self.rules.language_server_exclude_dirs(&key);
+            let retained = old.remove(&key).filter(|binding| {
+                binding.root == project.root
+                    && binding.generation == generation
+                    && binding.kind == server_kind
+                    && binding.automatic_exclusions.as_ref() == automatic_exclusions
+            });
+            let mut binding = match retained {
+                Some(binding) => binding,
+                None => {
+                    let automatic_exclusions = Arc::from(automatic_exclusions);
+                    let settings = ProjectSettings {
+                        plugin_id: self.records[&key.namespace].release.manifest.id.clone(),
+                        automatic_exclusions: Arc::clone(&automatic_exclusions),
+                    };
                     let server_id = self.next();
                     let finish = self.finish.clone();
                     let owner = key.clone();
                     let root = project.root.clone();
                     let closed =
                         Arc::clone(self.project_flags.entry(key.instance.project).or_default());
-                    let result = Analyzer::start(root.clone(), closed, move |event| {
-                        let _ = finish.send(ResultEvent::Analyzer(owner.clone(), server_id, event));
-                    });
-                    let (server, error) = match result {
-                        Ok(server) => (Some(server), None),
-                        Err(error) => (None, Some(error.to_string())),
+                    let result = Analyzer::start(
+                        server_kind,
+                        root.clone(),
+                        Some(settings),
+                        closed,
+                        move |event| {
+                            let _ =
+                                finish.send(ResultEvent::Analyzer(owner.clone(), server_id, event));
+                        },
+                    );
+                    let (server, phase, error) = match result {
+                        Ok(server) => (Some(server), LanguageServerPhase::Starting, None),
+                        Err(error) => (None, LanguageServerPhase::Failed, Some(error.to_string())),
                     };
                     Binding {
                         root,
+                        kind: server_kind,
+                        automatic_exclusions,
                         server_id,
                         generation,
                         server,
+                        phase,
                         documents: Vec::new(),
                         diagnostics: BTreeMap::new(),
                         calls: BTreeMap::new(),
                         error,
                     }
-                });
+                }
+            };
             if !same_documents(&binding.documents, &documents) {
                 if let Some(server) = &binding.server {
                     server.sync(documents.clone());
@@ -120,7 +156,7 @@ impl Engine {
                 if Instant::now() >= call.deadline {
                     let _ = call
                         .answer
-                        .try_send(Err("rust-analyzer request timed out".into()));
+                        .try_send(Err("Language server request timed out".into()));
                     return false;
                 }
                 true
@@ -136,6 +172,27 @@ impl Engine {
             if let Some(error) = &binding.error {
                 errors.insert(key.clone(), error.clone());
             }
+            let current_document = project.document.as_ref().and_then(|document| {
+                let path = document.path.as_ref()?;
+                (path.starts_with(&project.root)
+                    && self.lifecycle.wanted[&key].accepts_document(Some(path)))
+                .then_some((document.opening, path))
+            });
+            // A server for the selected document takes priority over a project startup.
+            if (starts_early || current_document.is_some())
+                && statuses
+                    .get(&project.id)
+                    .is_none_or(|status| status.document.is_none() && current_document.is_some())
+            {
+                statuses.insert(
+                    project.id,
+                    LanguageServerStatus {
+                        document: current_document.map(|(opening, path)| (opening, path.clone())),
+                        name: binding.kind.name(),
+                        phase: binding.phase,
+                    },
+                );
+            }
             self.analyzers.insert(key, binding);
         }
         self.changed |= self.view.document_diagnostics.len() != visible.len()
@@ -146,6 +203,10 @@ impl Engine {
                     .is_none_or(|previous| !Arc::ptr_eq(previous, value))
             });
         self.view.document_diagnostics = visible;
+        if self.view.language_servers != statuses {
+            self.view.language_servers = statuses;
+            self.changed = true;
+        }
         if self.view.analyzer_errors != errors {
             self.view.analyzer_errors = errors;
             self.changed = true;
@@ -154,10 +215,7 @@ impl Engine {
 
     /// Keep native analysis within the module's grants and the project's tool execution policy.
     fn analyzer_allowed(&self, key: &Key) -> bool {
-        self.lifecycle
-            .wanted
-            .get(key)
-            .is_some_and(|module| module.rust_analyzer)
+        self.analyzer_kind(key).is_some()
             && self.view.modules.get(key) == Some(&State::Ready)
             && !self.installation.busy(&key.namespace)
             && !self.is_draining(key.instance.project)
@@ -176,6 +234,14 @@ impl Engine {
                 })
     }
 
+    /// Resolve the server declared by the current module, including the legacy Rust flag.
+    fn analyzer_kind(&self, key: &Key) -> Option<Server> {
+        let module = self.lifecycle.wanted.get(key)?;
+        module
+            .language_server
+            .or(module.rust_analyzer.then_some(Server::RustAnalyzer))
+    }
+
     /// Handle declared language queries in the host, leaving unrelated plugin events on WASM.
     pub(super) fn invoke_analyzer(
         &mut self,
@@ -189,14 +255,18 @@ impl Engine {
             PluginEvent::Definition { offset } => {
                 (Provider::Definition, Request::Definition, offset)
             }
+            PluginEvent::Hover { offset } => (Provider::Hover, Request::Hover, offset),
             _ => return false,
         };
         let Some(reply) = reply else { return false };
+        let Some(server) = self.analyzer_kind(key) else {
+            return false;
+        };
         if !self
             .lifecycle
             .wanted
             .get(key)
-            .is_some_and(|module| module.rust_analyzer && module.provides.contains(&provider))
+            .is_some_and(|module| module.provides.contains(&provider))
         {
             return false;
         }
@@ -208,45 +278,65 @@ impl Engine {
             true
         };
         if !self.analyzer_allowed(key) {
-            return fail(
-                "rust-analyzer needs project execution permission. Open the plugin's Modules page."
-                    .into(),
-            );
+            return fail(format!(
+                "{} needs project execution permission. Open the plugin's Modules page.",
+                server.name()
+            ));
         }
         self.sync_analyzers();
         let Some(document) = self.active_document(key).cloned() else {
-            return fail("Open a Rust source file to use rust-analyzer.".into());
+            return fail(format!(
+                "Open a supported source file to use {}.",
+                server.name()
+            ));
         };
         let id = self.next();
         let Some(binding) = self.analyzers.get_mut(key) else {
-            return fail("rust-analyzer is unavailable for this document.".into());
+            return fail(format!(
+                "{} is unavailable for this document.",
+                server.name()
+            ));
         };
         let Some(server) = &binding.server else {
             return fail(
                 binding
                     .error
                     .clone()
-                    .unwrap_or_else(|| "rust-analyzer has stopped.".into()),
+                    .unwrap_or_else(|| "Language server has stopped.".into()),
             );
         };
-        let Some(path) = document.path.as_ref().filter(|_| {
-            document.text.is_char_boundary(offset)
-                && binding
-                    .documents
-                    .iter()
-                    .any(|open| same_snapshot(open, &document))
-        }) else {
-            return fail("rust-analyzer needs an open Rust file in this project.".into());
+        let Some(path) = document
+            .path
+            .as_ref()
+            .filter(|_| document.text.is_char_boundary(offset))
+        else {
+            return fail("The language server needs an open file in this project.".into());
         };
         let deadline = Instant::now() + timeout;
-        if let Err(error) = server.request(
-            id,
-            request,
-            path.clone(),
-            offset,
-            version(&document),
-            deadline,
-        ) {
+        let queued = if binding
+            .documents
+            .iter()
+            .any(|open| same_snapshot(open, &document))
+        {
+            server.request(
+                id,
+                request,
+                path.clone(),
+                offset,
+                version(&document),
+                deadline,
+            )
+        } else if binding.kind == Server::RustAnalyzer
+            && !path.starts_with(&binding.root)
+            && binding.kind.language_id(path).is_some()
+            && matches!(request, Request::Definition | Request::Hover)
+        {
+            // rust-analyzer can navigate indexed dependencies without receiving an editor overlay.
+            server.request_indexed(id, request, document.clone(), offset, deadline)
+        } else {
+            return fail("The language server needs an open file in this project.".into());
+        };
+        if let Err(error) = queued {
             return fail(error);
         }
         binding.calls.insert(
@@ -276,33 +366,54 @@ impl Engine {
             return;
         };
         match event {
+            Event::Phase(phase) => binding.phase = phase,
             Event::Response { id, result } => {
                 let Some(call) = binding.calls.remove(&id) else {
                     return;
                 };
-                let response = if Instant::now() >= call.deadline
-                    || !current.as_ref().is_some_and(|doc| {
-                        version(doc) == version(&call.document) && doc.path == call.document.path
-                    }) {
-                    Err("Document changed or rust-analyzer request expired".into())
+                let now = Instant::now();
+                let current_matches = current.as_ref().is_some_and(|doc| {
+                    version(doc) == version(&call.document) && doc.path == call.document.path
+                });
+                let response = if now >= call.deadline || !current_matches {
+                    Err("Document changed or language server request expired".into())
                 } else {
-                    result.map(|value| CallResult {
+                    let output = match call.request {
+                        Request::Completion => {
+                            let items = result
+                                .ok()
+                                .map(|value| completions(&call.document.text, call.offset, &value))
+                                .unwrap_or_default();
+                            if items.is_empty() {
+                                // Diagnostic-only or failing servers leave completion to WASM.
+                                self.invoke(
+                                    key.clone(),
+                                    PluginEvent::Complete {
+                                        offset: call.offset,
+                                    },
+                                    Some(call.answer),
+                                    call.deadline.saturating_duration_since(now),
+                                );
+                                return;
+                            }
+                            Ok(Output {
+                                completion_items: items,
+                                ..Output::default()
+                            })
+                        }
+                        Request::Definition => result.map(|value| Output {
+                            definitions: definitions(&value),
+                            ..Output::default()
+                        }),
+                        Request::Hover => result.map(|value| Output {
+                            hover: hover::details(&value),
+                            ..Output::default()
+                        }),
+                    };
+                    output.map(|output| CallResult {
                         generation: binding.generation,
                         version: Some(version(&call.document)),
-                        output: match call.request {
-                            Request::Completion => Output {
-                                completion_items: completions(
-                                    &call.document.text,
-                                    call.offset,
-                                    &value,
-                                ),
-                                ..Output::default()
-                            },
-                            Request::Definition => Output {
-                                definitions: definitions(&value),
-                                ..Output::default()
-                            },
-                        },
+                        output,
                     })
                 };
                 let _ = call.answer.try_send(response);
@@ -329,6 +440,7 @@ impl Engine {
             }
             Event::Failed(error) => {
                 binding.server.take();
+                binding.phase = LanguageServerPhase::Failed;
                 binding.diagnostics.clear();
                 for (_, call) in std::mem::take(&mut binding.calls) {
                     let _ = call.answer.try_send(Err(error.clone()));
@@ -346,7 +458,7 @@ impl Drop for Binding {
         for (_, call) in std::mem::take(&mut self.calls) {
             let _ = call
                 .answer
-                .try_send(Err("rust-analyzer session closed".into()));
+                .try_send(Err("Language server session closed".into()));
         }
     }
 }
@@ -371,14 +483,26 @@ fn range(text: &str, value: &Value) -> Option<(usize, usize)> {
     (start <= end).then_some((start, end))
 }
 
-/// Keep only completion candidates the editor can apply as one plain-text edit.
+/// Rank the server's suggestions at `offset` in `text`, then keep applicable plain-text edits.
 fn completions(text: &str, offset: usize, value: &Value) -> Vec<Completion> {
-    let items = value.as_array().or_else(|| value["items"].as_array());
-    items
-        .into_iter()
-        .flatten()
-        .take(512)
+    let (Some(before), Some(after), Some(items)) = (
+        text.get(..offset),
+        text.get(offset..),
+        value.as_array().or_else(|| value["items"].as_array()),
+    ) else {
+        return Vec::new();
+    };
+    let ident = crate::plugins::completion::identifier_char;
+    let word_start = before.trim_end_matches(ident).len();
+    let word_end = text.len() - after.trim_start_matches(ident).len();
+    let prefix = &before[word_start..];
+
+    // A server can send a complete list in arbitrary order. Apply the display
+    // limits after ranking so later prefix matches still reach the editor.
+    let mut ranked: Vec<_> = items
+        .iter()
         .filter_map(|item| {
+            let label = item["label"].as_str().filter(|label| label.len() <= 2048)?;
             if item["insertTextFormat"].as_u64() == Some(2)
                 || item["additionalTextEdits"]
                     .as_array()
@@ -386,28 +510,44 @@ fn completions(text: &str, offset: usize, value: &Value) -> Vec<Completion> {
             {
                 return None;
             }
-            let label = item["label"].as_str()?;
+            let filter = item["filterText"]
+                .as_str()
+                .filter(|filter| !filter.is_empty() && filter.len() <= 2048)
+                .unwrap_or(label);
+            let order = item["sortText"].as_str().unwrap_or(label);
+            Some((
+                crate::plugins::completion::rank(prefix, filter)?,
+                order,
+                label,
+                item,
+            ))
+        })
+        .collect();
+    ranked.sort_by_key(|(rank, order, ..)| (*rank, *order));
+
+    ranked
+        .into_iter()
+        .take(512)
+        .filter_map(|(_, _, label, item)| {
             let (start, end, replacement) = if let Some(edit) = item.get("textEdit") {
                 let selection = edit.get("range").or_else(|| edit.get("replace"))?;
                 let (start, end) = range(text, selection)?;
                 (start, end, edit["newText"].as_str()?)
             } else {
-                let ident = |c: char| c.is_alphanumeric() || c == '_';
-                let before = text.get(..offset)?;
-                let after = text.get(offset..)?;
-                let start = before.trim_end_matches(ident).len();
-                let end = text.len() - after.trim_start_matches(ident).len();
-                (start, end, item["insertText"].as_str().unwrap_or(label))
+                (
+                    word_start,
+                    word_end,
+                    item["insertText"].as_str().unwrap_or(label),
+                )
             };
-            (start <= offset && offset <= end && label.len() <= 2048 && replacement.len() <= 2048)
-                .then(|| Completion {
-                    label: label.into(),
-                    edit: Edit {
-                        start,
-                        end,
-                        text: replacement.into(),
-                    },
-                })
+            (start <= offset && offset <= end && replacement.len() <= 2048).then(|| Completion {
+                label: label.into(),
+                edit: Edit {
+                    start,
+                    end,
+                    text: replacement.into(),
+                },
+            })
         })
         .take(80)
         .collect()
@@ -470,4 +610,58 @@ fn diagnostics(text: &str, items: &[Value]) -> Vec<Diagnostic> {
         })
         .take(200)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A server may send unfiltered symbols before the visible prefix match.
+    #[test]
+    fn prefix_matches_survive_completion_limits_and_replace_the_entire_token() {
+        let text = "fn example() -> Result<String, ()>";
+        let start = text.find("Result").unwrap();
+        let end = start + "Result".len();
+        let cursor = start + "Res".len();
+        let mut items: Vec<_> = (0..530)
+            .map(|n| json!({"label": format!("OtherType{n}")}))
+            .collect();
+        items.push(json!({
+            "label": "unrelated display label",
+            "filterText": "ResultAlias",
+            "sortText": "1",
+        }));
+        items.push(json!({
+            "label": "Result",
+            "filterText": "Result",
+            "sortText": "0",
+            "textEdit": {
+                "newText": "Result",
+                "insert": {
+                    "start": {"line": 0, "character": start},
+                    "end": {"line": 0, "character": cursor},
+                },
+                "replace": {
+                    "start": {"line": 0, "character": start},
+                    "end": {"line": 0, "character": end},
+                },
+            },
+        }));
+        items.push(json!({"label": "Request", "sortText": "2"}));
+        items.push(json!({"label": "REST", "sortText": "0"}));
+        items.push(json!({"label": "Register", "sortText": "0"}));
+
+        let displayed = completions(text, cursor, &json!({"items": items}));
+        let labels: Vec<_> = displayed.iter().map(|item| item.label.as_str()).collect();
+        assert!(labels.starts_with(&["Result", "unrelated display label", "REST", "Register"]));
+        assert_eq!(
+            displayed[0].edit,
+            Edit {
+                start,
+                end,
+                text: "Result".into()
+            }
+        );
+    }
 }

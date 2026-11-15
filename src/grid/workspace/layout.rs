@@ -35,7 +35,7 @@ pub(super) const FOOTER_COLUMN_DIGITS: usize = 3;
 const FOOTER_POSITION_WIDTH: usize = 12;
 
 /// Pane that owns input when shortcut help is closed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub(super) enum Focus {
     /// Arrow/Enter filesystem navigation.
     Manager,

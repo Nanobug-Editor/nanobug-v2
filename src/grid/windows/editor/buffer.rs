@@ -1,5 +1,6 @@
 //! One retained document viewport, including IME display text and measured caret positions.
 
+use super::markdown::{MarkdownHighlights, MarkdownViewport, is_markdown};
 use crate::ui::text::{TextSpacing, UNITS_PER_COLUMN};
 use nanobug::{
     animation::scroll::GridScroll,
@@ -13,6 +14,7 @@ use nanobug_plugin_sdk::{
 };
 use std::{
     borrow::Cow,
+    cell::Ref,
     ops::Range,
     sync::{
         Arc,
@@ -22,6 +24,62 @@ use std::{
 
 /// Workspace-wide buffer identity, retained when a buffer moves to another tab.
 static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+mod highlight_tests {
+    use super::*;
+    use nanobug::plugins::session::Key;
+    use nanobug_plugin_sdk::{
+        Instance,
+        language::{ByteRange, DocumentFeatures, SyntaxKind},
+    };
+
+    #[test]
+    fn typing_keeps_untouched_colors_before_the_parser_replies() {
+        let mut buffer = Buffer::new(Document::new("fn\nα\ntrue"));
+        let opening = buffer.vim.doc.opening;
+        buffer.set_presentation(Some((
+            Key {
+                namespace: "language".into(),
+                instance: Instance {
+                    project: 1,
+                    module: "language".into(),
+                },
+            },
+            Arc::new(DocumentPresentation {
+                version: (opening, 0),
+                generation: 1,
+                features: DocumentFeatures {
+                    highlights: vec![
+                        Highlight {
+                            range: ByteRange { start: 0, end: 2 },
+                            kind: SyntaxKind::Keyword,
+                        },
+                        Highlight {
+                            range: ByteRange { start: 6, end: 10 },
+                            kind: SyntaxKind::Constant,
+                        },
+                    ],
+                    ..DocumentFeatures::default()
+                },
+            }),
+        )));
+        for (start, insertion, literal_start) in [(3, "x", 7), (4, "é", 9)] {
+            buffer.vim.doc.replace(start..start, insertion, true);
+            buffer.retain_highlights();
+            let spans = buffer.highlights();
+            assert_eq!(spans[0].range, ByteRange { start: 0, end: 2 });
+            assert_eq!(spans[1].range.start, literal_start);
+            assert_eq!(
+                &buffer.vim.doc.text[spans[1].range.start..spans[1].range.end],
+                "true"
+            );
+        }
+        buffer.vim.doc.undo(false);
+        buffer.retain_highlights();
+        assert!(buffer.highlights().is_empty());
+    }
+}
 
 /// Extra text columns on either side for fractional scrolling and wide glyphs.
 pub(in crate::grid) const TEXT_OVERSCAN: usize = 4;
@@ -39,10 +97,18 @@ pub(in crate::grid) struct Buffer {
     pub(in crate::grid) scroll: GridScroll,
     /// Continuous horizontal offset in base grid columns, independent of logical text columns.
     pub(in crate::grid) columns: GridScroll,
+    /// Markdown mode and scroll position materialized from the current Tabpage.
+    pub(super) markdown: MarkdownViewport,
     /// Validated syntax data from the selected language provider for this buffer.
     presentation: Option<(nanobug::plugins::session::Key, Arc<DocumentPresentation>)>,
+    /// Unchanged syntax spans remapped to the current revision while the parser catches up.
+    retained_highlights: Option<(u64, Vec<Highlight>)>,
+    /// Native Markdown syntax cached independently of optional language providers.
+    markdown_highlights: MarkdownHighlights,
     /// Latest diagnostic sets received for this buffer from live language providers.
     diagnostics: Vec<Arc<DocumentDiagnostics>>,
+    /// SQL dialect override retained only for this open buffer.
+    sql_dialect: Option<String>,
 }
 
 impl Buffer {
@@ -58,8 +124,25 @@ impl Buffer {
             vim,
             scroll: GridScroll::default(),
             columns: GridScroll::default(),
+            markdown: MarkdownViewport::default(),
             presentation: None,
+            retained_highlights: None,
+            markdown_highlights: MarkdownHighlights::default(),
             diagnostics: Vec::new(),
+            sql_dialect: None,
+        }
+    }
+
+    /// Return the explicit SQL dialect for this buffer, if one was chosen.
+    pub(in crate::grid) fn sql_dialect(&self) -> Option<&str> {
+        self.sql_dialect.as_deref()
+    }
+
+    /// Replace the buffer's temporary SQL dialect and discard the prior provider's presentation.
+    pub(super) fn set_sql_dialect(&mut self, dialect: Option<String>) {
+        if self.sql_dialect != dialect {
+            self.sql_dialect = dialect;
+            self.set_presentation(None);
         }
     }
 
@@ -68,6 +151,7 @@ impl Buffer {
         &mut self,
         presentation: Option<(nanobug::plugins::session::Key, Arc<DocumentPresentation>)>,
     ) -> bool {
+        self.retained_highlights = None;
         if self
             .presentation
             .as_ref()
@@ -117,10 +201,83 @@ impl Buffer {
             .filter(|data| data.version == (self.vim.doc.opening, self.vim.doc.revision))
     }
 
-    /// Sorted syntax spans for the currently displayed revision.
+    /// Remap only unchanged syntax while waiting for an updated result from the same provider.
+    pub(super) fn retain_highlights(&mut self) {
+        let doc = &self.vim.doc;
+        let Some((_, data)) = self.presentation.as_ref() else {
+            return;
+        };
+        if data.version.0 != doc.opening {
+            self.retained_highlights = None;
+            return;
+        }
+        let revision = self
+            .retained_highlights
+            .as_ref()
+            .map_or(data.version.1, |(revision, _)| *revision);
+        if revision == doc.revision {
+            return;
+        }
+        let Some((old, inserted)) = doc.replacement_since(revision) else {
+            self.retained_highlights = None;
+            return;
+        };
+        let (_, mut spans) = self
+            .retained_highlights
+            .take()
+            .unwrap_or_else(|| (revision, data.features.highlights.clone()));
+        let mut split_suffix = None;
+        spans.retain_mut(|span| {
+            let range = &mut span.range;
+            if range.end <= old.start {
+                return true;
+            }
+            if range.start >= old.end {
+                range.start = range.start - old.end + old.start + inserted;
+                range.end = range.end - old.end + old.start + inserted;
+                return true;
+            }
+            if range.start < old.start {
+                if range.end > old.end {
+                    let mut suffix = *span;
+                    suffix.range.start = old.start + inserted;
+                    suffix.range.end = suffix.range.end - old.end + old.start + inserted;
+                    split_suffix = Some(suffix);
+                }
+                span.range.end = old.start;
+                return true;
+            }
+            if range.end > old.end {
+                range.start = old.start + inserted;
+                range.end = range.end - old.end + old.start + inserted;
+                return true;
+            }
+            false
+        });
+        if let Some(suffix) = split_suffix {
+            let index = spans.partition_point(|span| span.range.start < suffix.range.start);
+            spans.insert(index, suffix);
+        }
+        self.retained_highlights = Some((doc.revision, spans));
+    }
+
+    /// Sorted current syntax spans, including revalidated ranges pending a fresh parse.
     pub(super) fn highlights(&self) -> &[Highlight] {
-        self.presentation()
-            .map_or(&[], |data| &data.features.highlights)
+        if let Some(data) = self.presentation() {
+            &data.features.highlights
+        } else {
+            self.retained_highlights
+                .as_ref()
+                .filter(|(revision, _)| *revision == self.vim.doc.revision)
+                .map_or(&[], |(_, spans)| spans)
+        }
+    }
+
+    /// Return built-in syntax ranges for the current Markdown revision.
+    pub(super) fn markdown_highlights(&self) -> Option<Ref<'_, [Highlight]>> {
+        let doc = &self.vim.doc;
+        doc.path.as_deref().filter(|path| is_markdown(path))?;
+        Some(self.markdown_highlights.get(doc))
     }
 
     /// Outline entries in source order for the currently displayed revision.

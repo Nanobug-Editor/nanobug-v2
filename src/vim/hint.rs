@@ -254,6 +254,13 @@ impl Vim {
                     ],
                 )
             }
+            Pending::InsertCompletion => {
+                prefix.push_str("Ctrl+x");
+                (
+                    "vim_hint.insert_group",
+                    vec![("Ctrl+o", "vim_hint.insert_omni_completion", false)],
+                )
+            }
             Pending::ControlBackslash => {
                 prefix.push_str("Ctrl+\\");
                 (

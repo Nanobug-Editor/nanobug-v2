@@ -76,15 +76,15 @@ fn gutter_counts_visible_steps_from_the_absolute_caret_line() {
         let mut frame = Frame::viewport(6, 5, 0);
         frame.set_theme_component(ThemeComponent::Gutter);
         for (row, label) in labels.into_iter().enumerate() {
-            frame.text(0, row, label, MUTED, 6);
+            frame.text(0, row, label, MUTED, 4);
         }
-        frame.icon(4, 1, super::view::FOLD_ARROW);
+        frame.right_aligned_icon(4, 1, super::view::FOLD_ARROW, 56);
         frame.text(2, 4, "~", MUTED, 1);
         frame
     };
 
     let (gutter, _) = editor.content_frames(context, |_| None);
-    assert!(gutter == expected_gutter(["   2 │", "   1", "   5 │", "   1 │"]));
+    assert!(gutter == expected_gutter(["   2", "   1", "   5", "   1"]));
 
     for key in ["2", "k"] {
         editor
@@ -93,7 +93,7 @@ fn gutter_counts_visible_steps_from_the_absolute_caret_line() {
     }
     assert_eq!(editor.vim().doc.cursor, 0);
     let (gutter, _) = editor.content_frames(context, |_| None);
-    assert!(gutter == expected_gutter(["   1 │", "   1", "   2 │", "   3 │"]));
+    assert!(gutter == expected_gutter(["   1", "   1", "   2", "   3"]));
 
     for key in ["2", "j"] {
         editor
@@ -102,7 +102,7 @@ fn gutter_counts_visible_steps_from_the_absolute_caret_line() {
     }
     assert_eq!(editor.vim().doc.location(editor.vim().doc.cursor).0, 4);
     let (gutter, _) = editor.content_frames(context, |_| None);
-    assert!(gutter == expected_gutter(["   2 │", "   1", "   5 │", "   1 │"]));
+    assert!(gutter == expected_gutter(["   2", "   1", "   5", "   1"]));
 }
 
 /// A folded brace block retains its terminator and source syntax colors on the visible header.
@@ -134,9 +134,11 @@ fn folded_brace_blocks_render_an_inline_placeholder() {
     };
     let foreground = |byte| (byte == closing).then_some(GOLD);
     let (_, actual) = editor.content_frames(context, foreground);
-    let width = editor.text_area(context.area).w + super::TEXT_OVERSCAN;
+    let source_area = editor.text_area(context.area);
+    let width = source_area.w + super::TEXT_OVERSCAN;
     let mut expected = Frame::viewport(width, 4, 0);
     expected.set_theme_component(ThemeComponent::Editor);
+    expected.keep_whole_graphemes(source_area.x..source_area.x + source_area.w);
     let header = "\tlet 示例 = {";
     let preview = "\tlet 示例 = { ... };";
     expected.viewport_line(0, spacing.cells(preview), 0..width, 0, |byte| {
@@ -413,19 +415,17 @@ fn switching_files_retains_unsaved_text_and_failed_open_preserves_state() {
     assert_eq!(editor.vim().doc.text, "!first");
 }
 
-/// Page navigation restores each caret and scroll while sharing text, undo and the buffer ID.
+/// Buffer switches restore each document's own caret, scroll position and undo state.
 #[test]
-fn tabpages_share_edits_and_retain_independent_views() {
+fn buffer_switches_retain_independent_views() {
     let text = "甲乙\n丙丁\n最终";
     let mut editor = EditorWindow::new(Document::new(text));
     let id = editor.buffer().id;
     editor.jump_to(3);
     editor.buffers[editor.active].scroll.snap(1, 1.);
-    editor.add_tabpage(2.);
-    assert_eq!(editor.tabpage_count(), 2);
-    assert_eq!(editor.active_tabpage(), 1);
-    assert_eq!(editor.previous_tabpage(), Some(0));
-    assert_eq!(editor.buffer().id, id);
+    let other = editor.retain_document(Document::new(text));
+    let other = editor.buffers()[other].id;
+    assert!(editor.select_buffer(other, 2.));
 
     editor.edit(|vim, _| {
         let offset = vim.doc.offset(2, 0);
@@ -434,49 +434,42 @@ fn tabpages_share_edits_and_retain_independent_views() {
     });
     editor.jump_to(14);
     editor.buffers[editor.active].scroll.snap(2, 2.);
-    assert!(editor.select_tabpage(0, 3.));
+    assert!(editor.select_buffer(id, 3.));
     assert_eq!(editor.buffer().id, id);
     assert_eq!(editor.vim().doc.cursor, 3);
     assert_eq!(editor.buffer().scroll.first_cell(), 1);
+    assert_eq!(editor.vim().doc.text, text);
+    assert!(editor.select_buffer(other, 4.));
+    assert_eq!(editor.vim().doc.cursor, 14);
+    assert_eq!(editor.buffer().scroll.first_cell(), 2);
     assert_eq!(editor.vim().doc.text, "甲乙\n丙丁\n新");
     editor.edit(|vim, _| {
         vim.doc.undo(false);
         nanobug::vim::Action::None
     });
-    assert!(editor.select_tabpage(1, 4.));
-    assert_eq!(editor.vim().doc.cursor, 14);
-    assert_eq!(editor.buffer().scroll.first_cell(), 2);
     assert_eq!(editor.vim().doc.text, text);
-    assert_eq!(editor.buffers().len(), 1);
 }
 
-/// Closing a page transfers its orphaned draft to a reachable label, and removing a shared
-/// inactive label leaves the current buffer selected.
+/// Removing an inactive file label frees its buffer and leaves the active draft selected.
 #[test]
-fn closing_tabpage_keeps_drafts_and_middle_close_detaches_labels() {
+fn closing_an_inactive_buffer_preserves_the_active_draft() {
     let mut editor = EditorWindow::new(Document::new("shared"));
     let shared = editor.buffer().id;
-    editor.add_tabpage(0.);
     let index = editor.retain_document(Document::new("draft"));
     let draft = editor.buffers()[index].id;
     assert!(editor.select_buffer(draft, 0.));
     editor.edit(|vim, register| vim.text("i!", register));
     editor.finish_buffer_input();
-    assert!(editor.buffer_in_other_tabpage(shared));
     assert!(editor.remove_buffer_tab(shared, 0.));
     assert_eq!(editor.buffer().id, draft);
-    assert!(editor.buffer_index(shared).is_some());
-    assert!(editor.remove_tabpage(0.));
-    assert_eq!(editor.buffer().id, shared);
+    assert!(editor.buffer_index(shared).is_none());
     assert_eq!(
         editor
             .visible_buffers()
             .map(|buffer| buffer.id)
             .collect::<Vec<_>>(),
-        [shared, draft]
+        [draft]
     );
-    assert!(!editor.remove_tabpage(0.));
-    assert!(editor.select_buffer(draft, 0.));
     assert_eq!(editor.vim().doc.text, "!draft");
 }
 

@@ -14,9 +14,7 @@ impl Workspace {
             self.plugins.file_close = Some(target);
             return true;
         }
-        if std::mem::take(&mut self.plugins.skip_draft_close)
-            || matches!(target, CloseTarget::Editor | CloseTarget::Buffer(_))
-        {
+        if std::mem::take(&mut self.plugins.skip_draft_close) || !target.closes_project() {
             return false;
         }
         if let Some(input) = self.plugins.manager.prompt.take_if(

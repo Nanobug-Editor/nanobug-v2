@@ -45,6 +45,15 @@ pub(super) struct Session {
 }
 
 impl Vim {
+    /// Apply a validated completion edit in the current undo unit when inserting text.
+    pub fn apply_completion(&mut self, range: Range<usize>, text: &str) {
+        if self.mode == Mode::Insert {
+            self.replace_insert(range, text);
+        } else {
+            self.replace(range, text, true);
+        }
+    }
+
     /// Enter `mode` with an optional existing undo checkpoint and repeat `count`.
     pub(super) fn begin_insert(
         &mut self,

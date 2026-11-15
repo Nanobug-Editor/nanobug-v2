@@ -102,6 +102,12 @@ impl Vim {
             return self.command_key(key, register);
         }
         if self.mode.is_insert() {
+            if matches!(self.pending, Some(Pending::InsertCompletion)) {
+                self.pending = None;
+                if key == "Ctrl+o" {
+                    return Action::PluginComplete;
+                }
+            }
             if matches!(self.pending, Some(Pending::InsertControlG)) {
                 self.pending = None;
                 self.insert_control_g(key);
@@ -117,6 +123,10 @@ impl Vim {
             }
             if key == "Ctrl+r" {
                 self.pending = Some(Pending::RegisterInput { modifier: None });
+                return Action::None;
+            }
+            if key == "Ctrl+x" {
+                self.pending = Some(Pending::InsertCompletion);
                 return Action::None;
             }
             if matches!(key, "PageUp" | "PageDown") && self.scroll(key, None) {
@@ -144,7 +154,7 @@ impl Vim {
                 self.prefix_key(prefix, key, operator, count, register)
             }
             Some(Pending::GArgument(argument)) => self.g_argument(argument, key, register),
-            Some(Pending::InsertControlG) => Action::None,
+            Some(Pending::InsertControlG | Pending::InsertCompletion) => Action::None,
             Some(Pending::ControlBackslash) => Action::None,
             Some(Pending::RegisterInput { .. }) => Action::None,
             Some(Pending::ZHeight { rows, count }) => {
@@ -388,6 +398,9 @@ impl Vim {
             "gd" if operator.is_none() && self.mode == Mode::Normal => {
                 return Action::PluginDefinition;
             }
+            "gO" if operator.is_none() && self.mode == Mode::Normal => {
+                return Action::PluginOutline;
+            }
             "ZZ" => {
                 return if self.doc.modified() {
                     Action::SaveClose
@@ -532,6 +545,13 @@ impl Vim {
 
     /// Dispatch a complete Normal or Visual `key` or arm its next argument.
     fn normal_key(&mut self, key: &str, count: Option<usize>, register: &mut Register) -> Action {
+        if self.mode == Mode::Normal && !self.read_only {
+            match key {
+                "Ctrl+]" => return Action::PluginDefinition,
+                "K" => return Action::PluginHover,
+                _ => {}
+            }
+        }
         let n = count.unwrap_or(1);
         let visual = self.mode.is_visual();
         if self.mode == Mode::Normal

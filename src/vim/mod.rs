@@ -70,6 +70,8 @@ enum Pending {
     GArgument(g_commands::Argument),
     /// Insert-mode Ctrl+g awaits an undo or vertical movement command.
     InsertControlG,
+    /// Insert-mode Ctrl+x awaits a completion source.
+    InsertCompletion,
     /// Ctrl+\ awaits a mode transition key while retaining the active mode.
     ControlBackslash,
     /// Insert or command-line Ctrl+r, optionally followed by a literal insertion modifier.
@@ -248,6 +250,11 @@ impl Vim {
         let mut vim = Self::new(doc);
         vim.read_only = true;
         vim
+    }
+
+    /// Report whether this Vim model presents an immutable source snapshot.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Report a blocked edit without requesting a host action.

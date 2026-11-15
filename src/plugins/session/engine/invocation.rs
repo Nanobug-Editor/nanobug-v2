@@ -458,6 +458,8 @@ impl Engine {
                 // Definition jumps can open files outside the project. Only the native language
                 // server, under the project's execution grant, supplies locations for that action.
                 output.definitions.clear();
+                // Hover details are returned by the native language-server path for this revision.
+                output.hover = None;
                 if let Some(change) = &call.credential_read {
                     self.credential_check_finished(&key, change, output.credential_rejected);
                     // Never publish free-form text from a callback which received a credential.

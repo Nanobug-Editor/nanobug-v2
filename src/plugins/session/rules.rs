@@ -60,7 +60,13 @@ struct Entry {
     source: Source,
     grants: BTreeSet<Permission>,
     rule_paths: ApprovedRulePaths,
+    /// Saved project SQL dialect exposed to SQL rules, excluding buffer overrides.
+    project_sql_dialect: Option<String>,
     allowed: Option<bool>,
+    /// The last dependency-validated request to start this module's language server.
+    start_language_server: bool,
+    /// Directory exclusions from the most recent validated match.
+    exclude_dirs: Vec<String>,
     state: State,
     deps: Vec<Dependency>,
     dirty: Option<Instant>,
@@ -79,6 +85,8 @@ impl Entry {
 
     fn data_changed(&mut self) {
         self.allowed = None;
+        self.start_language_server = false;
+        self.exclude_dirs.clear();
         if self.compute_failures < 3 {
             self.state = State::Checking;
             self.invalidate();
@@ -86,23 +94,37 @@ impl Entry {
     }
 }
 
+/// A rule result held until host reads and their dependencies have been validated.
+#[derive(Clone)]
+struct Judgment {
+    /// Whether the plugin module matches this project.
+    matches: bool,
+    /// Whether the matching project should start its server before a document opens.
+    start_language_server: bool,
+    /// Paths to offer the language server after the match is confirmed.
+    exclude_dirs: Vec<String>,
+}
+
 struct Evaluation {
     key: Key,
     input: ContextData,
+    /// Project preference retained for this evaluation's immutable JS context.
+    project_sql_dialect: Option<String>,
     deps: Vec<Dependency>,
     sent: bool,
     cancel_sent: bool,
     pending_queries: usize,
     responses: VecDeque<Request>,
-    judgment: Option<bool>,
+    judgment: Option<Judgment>,
     validating: bool,
 }
 
 impl Evaluation {
-    fn new(key: Key, input: ContextData) -> Self {
+    fn new(key: Key, input: ContextData, project_sql_dialect: Option<String>) -> Self {
         Self {
             key,
             input,
+            project_sql_dialect,
             deps: Vec::new(),
             sent: false,
             cancel_sent: false,
@@ -120,7 +142,7 @@ enum ResultEvent {
     Started(anyhow::Result<Worker>),
     Source(u64, anyhow::Result<String>),
     Data(u64, u32, Data),
-    Validate(u64, bool, bool),
+    Validate(u64, Judgment, bool),
     Change(Key, u64, Vec<Dependency>, bool),
 }
 
@@ -160,18 +182,23 @@ impl Rules {
     /// Keep installed rules for live scopes. A changed source gets a fresh budget history.
     #[cfg(test)]
     pub(super) fn set(&mut self, key: Key, source: Source, grants: &BTreeSet<Permission>) {
-        self.set_approved(key, source, grants, &ApprovedRulePaths::default());
+        self.set_approved(key, source, grants, &ApprovedRulePaths::default(), None);
     }
 
+    /// Retain the rule for `key` and reset its evaluation when its source or context changes.
     pub(super) fn set_approved(
         &mut self,
         key: Key,
         source: Source,
         grants: &BTreeSet<Permission>,
         rule_paths: &ApprovedRulePaths,
+        project_sql_dialect: Option<&str>,
     ) {
         if self.entries.get(&key).is_some_and(|entry| {
-            entry.source.same(&source) && &entry.grants == grants && &entry.rule_paths == rule_paths
+            entry.source.same(&source)
+                && &entry.grants == grants
+                && &entry.rule_paths == rule_paths
+                && entry.project_sql_dialect.as_deref() == project_sql_dialect
         }) {
             return;
         }
@@ -182,7 +209,10 @@ impl Rules {
                 source,
                 grants: grants.clone(),
                 rule_paths: rule_paths.clone(),
+                project_sql_dialect: project_sql_dialect.map(str::to_owned),
                 allowed: None,
+                start_language_server: false,
+                exclude_dirs: Vec::new(),
                 state: State::Checking,
                 deps: Vec::new(),
                 dirty: Some(now),
@@ -204,6 +234,21 @@ impl Rules {
             .map_or((false, State::Checking), |entry| {
                 (entry.allowed.unwrap_or(false), entry.state.clone())
             })
+    }
+
+    /// Whether the dependency-validated rule for `key` matched and requested server startup.
+    pub(super) fn start_language_server(&self, key: &Key) -> bool {
+        self.entries
+            .get(key)
+            .is_some_and(|entry| entry.allowed == Some(true) && entry.start_language_server)
+    }
+
+    /// Return scan exclusions from the current dependency-validated match for `key`.
+    pub(super) fn language_server_exclude_dirs(&self, key: &Key) -> &[String] {
+        self.entries
+            .get(key)
+            .filter(|entry| entry.allowed == Some(true))
+            .map_or(&[], |entry| entry.exclude_dirs.as_slice())
     }
 
     pub(super) fn retry(&mut self, namespace: &str) {
@@ -396,6 +441,7 @@ impl Rules {
                         deadline: Instant::now() + DEADLINE,
                         cancelled: Arc::new(AtomicBool::new(false)),
                     },
+                    entry.project_sql_dialect.clone(),
                 ),
             );
         }
@@ -434,13 +480,22 @@ impl Rules {
                     });
                 }
             }
-            Reply::Rule { id, matches } => {
+            Reply::Rule {
+                id,
+                matches,
+                start_language_server,
+                exclude_dirs,
+            } => {
                 let Some(job) = self.running.get_mut(&id) else {
                     return;
                 };
                 job.sent = false;
                 job.responses.clear();
-                job.judgment = Some(matches);
+                job.judgment = Some(Judgment {
+                    matches,
+                    start_language_server,
+                    exclude_dirs,
+                });
             }
             Reply::Error { id, kind, message } => self.failed(id, kind, message),
             _ => self.lost(),
@@ -493,13 +548,17 @@ impl Rules {
                         return;
                     }
                 };
-                let context =
+                let mut context =
                     json!({ "project": job.input.root, "platform": std::env::consts::OS });
+                if let Some(dialect) = &job.project_sql_dialect {
+                    context["projectSqlDialect"] = json!(dialect);
+                }
                 if self.worker.as_ref().is_some_and(|worker| {
                     worker
                         .post(Request::Evaluate {
                             id,
                             source,
+                            module: Some(job.key.instance.module.clone()),
                             context,
                             remaining_ms: remaining.as_millis() as u64,
                         })
@@ -527,7 +586,7 @@ impl Rules {
                     }
                 }
             }
-            ResultEvent::Validate(id, matches, files_current) => {
+            ResultEvent::Validate(id, judgment, files_current) => {
                 if self
                     .running
                     .get(&id)
@@ -556,8 +615,15 @@ impl Rules {
                     && query::document_current(&job.deps, project)
                     && entry.dirty.is_none()
                 {
-                    entry.allowed = Some(matches);
-                    entry.state = if matches {
+                    entry.allowed = Some(judgment.matches);
+                    entry.start_language_server =
+                        judgment.matches && judgment.start_language_server;
+                    entry.exclude_dirs = if judgment.matches {
+                        judgment.exclude_dirs
+                    } else {
+                        Vec::new()
+                    };
+                    entry.state = if judgment.matches {
                         State::Ready
                     } else {
                         State::Unmatched
@@ -610,14 +676,14 @@ impl Rules {
             }
             if job.pending_queries == 0
                 && !job.validating
-                && let Some(matches) = job.judgment
+                && let Some(judgment) = job.judgment.clone()
             {
                 let deps = job.deps.clone();
                 let finish = self.finish.clone();
                 job.validating = pool.submit(move || {
                     let _ = finish.send(ResultEvent::Validate(
                         id,
-                        matches,
+                        judgment,
                         query::files_current(&deps),
                     ));
                 });
@@ -811,6 +877,7 @@ mod tests {
                         deadline: Instant::now() + DEADLINE,
                         cancelled: Arc::new(AtomicBool::new(false)),
                     },
+                    None,
                 ),
             );
         };
@@ -825,7 +892,18 @@ mod tests {
             assert_eq!(rules.entries[&first].compute_failures, count);
         }
         running(&mut rules, 5);
-        rules.finish_event(ResultEvent::Validate(5, true, true), &projects);
+        rules.finish_event(
+            ResultEvent::Validate(
+                5,
+                Judgment {
+                    matches: true,
+                    start_language_server: false,
+                    exclude_dirs: Vec::new(),
+                },
+                true,
+            ),
+            &projects,
+        );
         assert_eq!(rules.entries[&first].compute_failures, 0);
         assert_eq!(rules.state(&first), (true, State::Ready));
         running(&mut rules, 6);
@@ -856,7 +934,8 @@ mod tests {
                     r#"
                 const branch = await host.exists('alternate') ? 'b' : 'a';
                 const {entries} = await host.list(branch);
-                return entries.includes('ok');
+                const active = entries.includes('ok');
+                return { active, startLanguageServer: active, excludeDirs: [branch] };
             "#
                     .into(),
                 ),
@@ -876,11 +955,17 @@ mod tests {
         fs::remove_file(root.join("a/ok"))?;
         tick_until(&mut rules, &pool, &projects, |rules| {
             assert!(!rules.state(&first).0, "published a stale directory result");
+            assert!(!rules.start_language_server(&first));
+            assert!(rules.language_server_exclude_dirs(&first).is_empty());
             rules.state(&first).1 == State::Unmatched && rules.state(&second).0
         });
 
         fs::write(root.join("alternate"), "")?;
         tick_until(&mut rules, &pool, &projects, |rules| rules.state(&first).0);
+        assert!(rules.start_language_server(&first));
+        assert!(rules.start_language_server(&second));
+        assert_eq!(rules.language_server_exclude_dirs(&first), ["b"]);
+        assert_eq!(rules.language_server_exclude_dirs(&second), ["a"]);
         fs::write(root.join("a/ok"), "")?;
         let observed_until = Instant::now() + CHECK_INTERVAL * 2;
         tick_until(&mut rules, &pool, &projects, |rules| {
@@ -895,6 +980,8 @@ mod tests {
             assert!(rules.state(&second).0 && rules.running.values().all(|job| job.key != second));
             rules.state(&first).1 == State::Unmatched
         });
+        assert!(!rules.start_language_server(&first));
+        assert!(rules.language_server_exclude_dirs(&first).is_empty());
         let grants = [Permission::ReadProject].into();
         rules.set(
             first.clone(),
@@ -958,10 +1045,12 @@ mod tests {
         );
         tick_until(&mut rules, &pool, &projects, |rules| {
             assert!(!rules.state(&first).0);
-            rules
-                .running
-                .values()
-                .any(|job| job.judgment == Some(true) && job.pending_queries == 1)
+            rules.running.values().any(|job| {
+                job.judgment
+                    .as_ref()
+                    .is_some_and(|decision| decision.matches)
+                    && job.pending_queries == 1
+            })
         });
         drop(held);
         tick_until(&mut rules, &pool, &projects, |rules| rules.state(&first).0);
@@ -1038,7 +1127,10 @@ mod tests {
             source: Source::Inline("return true;".into()),
             grants: BTreeSet::new(),
             rule_paths: ApprovedRulePaths::default(),
+            project_sql_dialect: None,
             allowed: Some(true),
+            start_language_server: true,
+            exclude_dirs: vec!["coverage".into()],
             state: State::Failed("Rule paused".into()),
             deps: Vec::new(),
             dirty: None,
@@ -1049,6 +1141,8 @@ mod tests {
         };
         entry.data_changed();
         assert_eq!(entry.allowed, None);
+        assert!(!entry.start_language_server);
+        assert!(entry.exclude_dirs.is_empty());
         assert_eq!(entry.state, State::Failed("Rule paused".into()));
         assert!(entry.dirty.is_none());
     }

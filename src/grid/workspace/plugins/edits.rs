@@ -5,6 +5,7 @@ use super::{
     rows::{Row, Target, row},
 };
 use crate::grid::windows::editor::{EditReceipt, EditorWindow, TextChange, TextTarget};
+use crate::grid::workspace::editor_splits::PaneId;
 use gpui::{Context, Window};
 use nanobug::document::Document;
 use nanobug::plugins::{
@@ -25,8 +26,11 @@ pub(super) struct PlanOwner {
     pub(super) generation: u64,
 }
 
+/// Pending edit group scoped to the editor that supplied the plugin's documents.
 pub(super) struct Plan {
     owner: PlanOwner,
+    /// Editor identity inside the owner's project, stable across focus changes.
+    pane: PaneId,
     root: PathBuf,
     documents: Vec<Change>,
 }
@@ -50,9 +54,11 @@ struct Change {
     after: String,
 }
 
-/// Project identity and the editor-owned receipt for the complete edit group.
+/// Project and pane identities with the editor-owned receipt for the complete edit group.
 pub(super) struct Undo {
     scope: u64,
+    /// Editor that applied the changes and owns the undo history.
+    pane: PaneId,
     receipt: EditReceipt,
 }
 
@@ -107,6 +113,7 @@ impl Plan {
         Ok((
             Undo {
                 scope: self.owner.key.instance.project,
+                pane: self.pane,
                 receipt,
             },
             paths,
@@ -253,6 +260,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(pane) = self
+            .projects
+            .active_project()
+            .filter(|project| project.plugin_scope == key.instance.project)
+            .map(|project| project.active_editor_id())
+        else {
+            return;
+        };
         let available = self
             .plugin_command_context()
             .zip(super::shortcuts::declaration(
@@ -337,7 +352,7 @@ impl Workspace {
                         }
                         let files = std::mem::take(&mut result.output.project_file_edits);
                         workspace
-                            .edit_plan(owner, result, files.len())
+                            .edit_plan(owner, pane, result, files.len())
                             .map(|plan| plan.map(|plan| (plan, files)))
                             .map_err(|error| error.to_string())
                     });
@@ -358,9 +373,12 @@ impl Workspace {
         .detach();
     }
 
+    /// Prepare versioned replacements from `result` in `owner`'s originating `pane`.
+    /// `file_count` is the number of additional disk files to check off the UI thread.
     fn edit_plan(
         &self,
         owner: PlanOwner,
+        pane: PaneId,
         result: CallResult,
         file_count: usize,
     ) -> anyhow::Result<Option<Plan>> {
@@ -387,6 +405,9 @@ impl Workspace {
             .ordered()
             .find(|project| project.plugin_scope == owner.key.instance.project)
             .ok_or_else(|| anyhow::anyhow!("Project was closed"))?;
+        let editor = project
+            .editor_by_id(pane)
+            .ok_or_else(|| anyhow::anyhow!("Editor pane was closed"))?;
         let mut seen = BTreeSet::new();
         let mut documents = Vec::new();
         for group in groups {
@@ -394,8 +415,7 @@ impl Workspace {
                 seen.insert(group.opening),
                 "Plugin returned two groups for the same document"
             );
-            let doc = project
-                .editor
+            let doc = editor
                 .buffers()
                 .iter()
                 .find(|buffer| buffer.vim.doc.opening == group.opening)
@@ -424,6 +444,7 @@ impl Workspace {
         }
         let plan = Plan {
             owner,
+            pane,
             root: project.root.clone(),
             documents,
         };
@@ -534,7 +555,8 @@ impl Workspace {
             let overlap = self
                 .projects
                 .ordered()
-                .flat_map(|project| project.editor.buffers().iter())
+                .flat_map(|project| project.editors())
+                .flat_map(|(_, editor)| editor.buffers())
                 .any(|buffer| {
                     buffer
                         .vim
@@ -552,7 +574,10 @@ impl Workspace {
                 .iter_mut()
                 .find(|project| project.plugin_scope == scope && project.root == plan.root)
                 .ok_or_else(|| anyhow::anyhow!("Project was closed"))?;
-            let (undo, paths) = plan.apply(&mut project.editor, files)?;
+            let editor = project
+                .editor_by_id_mut(plan.pane)
+                .ok_or_else(|| anyhow::anyhow!("Editor pane was closed"))?;
+            let (undo, paths) = plan.apply(editor, files)?;
             for manager in self
                 .projects
                 .iter_mut()
@@ -590,7 +615,8 @@ impl Workspace {
             .projects
             .iter_mut()
             .find(|project| project.plugin_scope == undo.scope)
-            .is_some_and(|project| undo.apply(&mut project.editor));
+            .and_then(|project| project.editor_by_id_mut(undo.pane))
+            .is_some_and(|editor| undo.apply(editor));
         if undone {
             self.plugins.undo_edits = None;
         }
@@ -647,6 +673,7 @@ mod tests {
             .collect::<anyhow::Result<Vec<_>>>()?;
         let mut plan = Plan {
             owner: owner(),
+            pane: 0,
             root: root.to_path_buf(),
             documents: Vec::new(),
         };
@@ -672,6 +699,7 @@ mod tests {
         let make_plan = |doc: &Document| -> anyhow::Result<Plan> {
             let mut plan = Plan {
                 owner: owner(),
+                pane: 0,
                 root: root.to_path_buf(),
                 documents: vec![Change {
                     source: Source::Open {
@@ -739,7 +767,11 @@ mod tests {
             })
             .collect();
         let (receipt, _) = editor.apply_text_changes(changes)?;
-        let undo = Undo { scope: 1, receipt };
+        let undo = Undo {
+            scope: 1,
+            pane: 0,
+            receipt,
+        };
         editor.test_buffers_mut()[1]
             .vim
             .doc

@@ -506,8 +506,10 @@ fn editor(case: &Case, initial_top: usize, directory: &Path) -> State {
                 vim.doc.save(None).unwrap();
                 closed = true;
             }
-            Action::Close(true) if case.close => closed = true,
-            Action::Close(false) if case.close && !vim.doc.modified() => closed = true,
+            Action::Close(true) | Action::QuitAll(true) if case.close => closed = true,
+            Action::Close(false) | Action::QuitAll(false) if case.close && !vim.doc.modified() => {
+                closed = true;
+            }
             Action::Filter { range, command } => {
                 let output = run_filter(directory, &command, &vim.doc.text[range.clone()]).unwrap();
                 vim.apply_filter(range, &output);

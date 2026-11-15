@@ -30,7 +30,21 @@ pub fn display_width(text: &str, column: usize) -> usize {
     }) - column
 }
 
-/// The only mutable owner of a file's text; drawing caches are derived from it.
+/// Disk contents expected independently by each document that opens a named path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiskVersion {
+    /// A named buffer for a file that did not exist at open time.
+    Missing,
+    /// Exact length and fingerprint of the bytes read or written at this path.
+    Saved {
+        /// Byte length, including any BOM and the original line endings.
+        length: u64,
+        /// SHA-256 of those exact bytes.
+        digest: [u8; 32],
+    },
+}
+
+/// The mutable owner of one buffer's text; drawing caches are derived from it.
 pub struct Document {
     /// Identity of this in-memory opening, even when the same path is opened again.
     pub opening: u64,
@@ -44,6 +58,8 @@ pub struct Document {
     pub starts: Vec<usize>,
     /// Incremented for every edit or undo, used to invalidate derived text layouts.
     pub revision: u64,
+    /// Previous byte range and replacement length for the most recent single edit.
+    last_replacement: Option<(Range<usize>, usize)>,
     /// Retained fold definitions and their visible line projection.
     folds: Folds,
     /// Last successfully read or written content, for exact dirty detection.
@@ -52,8 +68,8 @@ pub struct Document {
     crlf: bool,
     /// Preserve an existing UTF-8 BOM.
     bom: bool,
-    /// Only buffers created by a plugin edit plan carry an exact disk save guard.
-    disk_guard: Option<([u8; 32], u64)>,
+    /// Baseline for detecting writes by other independent buffers before saving.
+    disk_version: Option<DiskVersion>,
     /// Bounded chronological history and the active undo/redo branch.
     history: History,
 }
@@ -69,11 +85,12 @@ impl Document {
             cursor: 0,
             starts: Vec::new(),
             revision: 0,
+            last_replacement: None,
             folds: Folds::default(),
             saved: text.into(),
             crlf: false,
             bom: false,
-            disk_guard: None,
+            disk_version: None,
             history: History::default(),
         };
         doc.reindex();
@@ -82,12 +99,16 @@ impl Document {
 
     /// Open `path` as UTF-8, or prepare a named empty buffer if it does not exist yet.
     pub fn open(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            let mut doc = Self::new("");
-            doc.path = Some(path.to_path_buf());
-            return Ok(doc);
-        }
-        let metadata = fs::metadata(path)?;
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut doc = Self::new("");
+                doc.path = Some(path.to_path_buf());
+                doc.disk_version = Some(DiskVersion::Missing);
+                return Ok(doc);
+            }
+            Err(error) => return Err(error.into()),
+        };
         if !metadata.is_file() {
             bail!(i18n::format(
                 "document.not_a_file",
@@ -99,12 +120,15 @@ impl Document {
         }
         let bytes = fs::read(path)
             .with_context(|| i18n::format("document.read_failed", &[("path", &path.display())]))?;
-        Self::from_file_bytes(fs::canonicalize(path)?, bytes, false)
+        Self::from_file_bytes(fs::canonicalize(path)?, bytes)
     }
 
     /// Open already checked UTF-8 bytes while preserving the original on-disk encoding.
-    pub(crate) fn from_file_bytes(path: PathBuf, bytes: Vec<u8>, guard_save: bool) -> Result<Self> {
-        let disk_guard = guard_save.then(|| (Sha256::digest(&bytes).into(), bytes.len() as u64));
+    pub(crate) fn from_file_bytes(path: PathBuf, bytes: Vec<u8>) -> Result<Self> {
+        let version = DiskVersion::Saved {
+            length: bytes.len() as u64,
+            digest: Sha256::digest(&bytes).into(),
+        };
         let bom = bytes.starts_with(&[0xef, 0xbb, 0xbf]);
         let text = String::from_utf8(bytes).context(i18n::text("document.requires_utf8"))?;
         if text.contains('\0') {
@@ -116,7 +140,7 @@ impl Document {
         doc.path = Some(path);
         doc.crlf = crlf;
         doc.bom = bom;
-        doc.disk_guard = disk_guard;
+        doc.disk_version = Some(version);
         Ok(doc)
     }
 
@@ -128,11 +152,25 @@ impl Document {
     /// Build a fresh document from the last loaded or saved text, retaining its path and encoding.
     pub fn saved_version(&self) -> Self {
         let mut doc = Self::new(&self.saved);
-        doc.path.clone_from(&self.path);
-        doc.crlf = self.crlf;
-        doc.bom = self.bom;
-        doc.disk_guard = self.disk_guard;
+        doc.copy_file_state(self);
         doc
+    }
+
+    /// Create a new buffer identity at the same text and cursor, with its own undo history.
+    pub fn fork(&self) -> Self {
+        let mut doc = Self::new(&self.text);
+        doc.copy_file_state(self);
+        doc.saved.clone_from(&self.saved);
+        doc.cursor = self.cursor;
+        doc
+    }
+
+    /// Inherit the filename, encoding and disk baseline from `source`.
+    fn copy_file_state(&mut self, source: &Self) {
+        self.path.clone_from(&source.path);
+        self.crlf = source.crlf;
+        self.bom = source.bom;
+        self.disk_version = source.disk_version;
     }
 
     /// Rebuild line starts after a text mutation.
@@ -230,8 +268,19 @@ impl Document {
         self.shift_folds(&range, text);
         self.text.replace_range(range.clone(), text);
         self.cursor = range.start + text.len();
+        self.last_replacement = Some((range, text.len()));
         self.revision += 1;
         self.reindex();
+    }
+
+    /// Return the old byte range and new length when one tracked edit follows `revision`.
+    pub fn replacement_since(&self, revision: u64) -> Option<(&Range<usize>, usize)> {
+        if revision.checked_add(1) != Some(self.revision) {
+            return None;
+        }
+        self.last_replacement
+            .as_ref()
+            .map(|(range, len)| (range, *len))
     }
 
     /// Restore a checkpoint from undo, or from redo when `redo` is true.
@@ -258,6 +307,7 @@ impl Document {
         self.restore_folds(&snapshot.text);
         self.text = snapshot.text;
         self.cursor = snapshot.cursor;
+        self.last_replacement = None;
         self.revision += 1;
         self.reindex();
     }
@@ -273,35 +323,42 @@ impl Document {
         } else {
             requested.to_path_buf()
         };
-        let guard = self.disk_guard.filter(|_| {
+        let expected = self.disk_version.filter(|_| {
             destination.is_none()
                 || self
                     .path
                     .as_ref()
                     .is_some_and(|prior| prior == &path || prior == requested)
         });
-        if guard.is_some() && self.path.as_ref() != Some(&path) {
-            bail!("The file location changed on disk. Reload it or save a copy.");
+        if matches!(expected, Some(DiskVersion::Saved { .. })) && self.path.as_ref() != Some(&path)
+        {
+            bail!(i18n::text("document.disk_changed"));
         }
         let parent = path
             .parent()
             .context(i18n::text("document.missing_save_directory"))?;
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let temporary = parent.join(format!(".nanobug-{}-{nonce}.tmp", std::process::id()));
-        let result = (|| -> Result<()> {
+        let result = (|| -> Result<DiskVersion> {
             let mut file = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&temporary)?;
-            if self.bom {
-                file.write_all(&[0xef, 0xbb, 0xbf])?;
-            }
+            let bom: &[u8] = if self.bom { &[0xef, 0xbb, 0xbf] } else { &[] };
+            file.write_all(bom)?;
             let text = if self.crlf {
                 self.text.replace('\n', "\r\n")
             } else {
                 self.text.clone()
             };
             file.write_all(text.as_bytes())?;
+            let mut digest = Sha256::new();
+            digest.update(bom);
+            digest.update(text.as_bytes());
+            let written = DiskVersion::Saved {
+                length: (bom.len() + text.len()) as u64,
+                digest: digest.finalize().into(),
+            };
             file.sync_all()?;
             drop(file);
             if let Ok(metadata) = fs::metadata(&path) {
@@ -313,27 +370,46 @@ impl Document {
                 }
                 fs::set_permissions(&temporary, metadata.permissions())?;
             }
-            if let Some((digest, length)) = guard {
-                let file = fs::File::open(&path)
-                    .context("The file changed on disk. Reload it or save a copy.")?;
-                let mut current = Vec::new();
-                file.take(length + 1).read_to_end(&mut current)?;
-                let actual: [u8; 32] = Sha256::digest(&current).into();
-                if current.len() as u64 != length || actual != digest {
-                    bail!("The file changed on disk. Reload it or save a copy.");
-                }
+            if let Some(expected) = expected {
+                check_disk_version(&path, expected, written)?;
             }
             fs::rename(&temporary, &path)?;
-            Ok(())
+            Ok(written)
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
         }
-        result
+        let written = result
             .with_context(|| i18n::format("document.save_failed", &[("path", &path.display())]))?;
-        self.path = Some(path);
+        self.path = Some(fs::canonicalize(&path).unwrap_or(path));
         self.saved = self.text.clone();
-        self.disk_guard = None;
+        self.disk_version = Some(written);
         Ok(())
     }
+}
+
+/// Require `path` to match the original `expected` bytes or the identical `written` bytes.
+fn check_disk_version(path: &Path, expected: DiskVersion, written: DiskVersion) -> Result<()> {
+    let disk_changed = || i18n::text("document.disk_changed");
+    let size = |version| match version {
+        DiskVersion::Missing => 0,
+        DiskVersion::Saved { length, .. } => length,
+    };
+    let actual = match fs::File::open(path) {
+        Ok(file) => {
+            let mut bytes = Vec::new();
+            file.take(size(expected).max(size(written)) + 1)
+                .read_to_end(&mut bytes)?;
+            DiskVersion::Saved {
+                length: bytes.len() as u64,
+                digest: Sha256::digest(&bytes).into(),
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DiskVersion::Missing,
+        Err(error) => return Err(error).context(disk_changed()),
+    };
+    if actual != expected && actual != written {
+        bail!(disk_changed());
+    }
+    Ok(())
 }

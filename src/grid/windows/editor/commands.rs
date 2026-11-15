@@ -21,14 +21,13 @@ impl EditorWindow {
 
     /// Open `path` at animation time `now`, reusing an existing buffer and retaining unsaved text.
     pub(in crate::grid) fn open(&mut self, path: PathBuf, now: f64) -> anyhow::Result<()> {
-        let index = self.open_buffer(path)?;
         let previous = self.buffer().id;
-        let replace_empty = self.visible_buffers().count() == 1
+        let replace_empty = self.buffers.len() == 1
             && self.buffer().vim.doc.path.is_none()
             && self.buffer().vim.doc.text.is_empty()
             && !self.buffer().vim.doc.modified();
+        let index = self.open_buffer(path)?;
         let id = self.buffers[index].id;
-        self.attach_buffer(index);
         self.select_buffer(id, now);
         if replace_empty && previous != id {
             self.remove_buffer_tab(previous, now);
@@ -37,8 +36,8 @@ impl EditorWindow {
         Ok(())
     }
 
-    /// Find or load a canonical buffer for `path` without adding it to the current page.
-    pub(super) fn open_buffer(&mut self, path: PathBuf) -> anyhow::Result<usize> {
+    /// Find or load a buffer for `path` in this window.
+    fn open_buffer(&mut self, path: PathBuf) -> anyhow::Result<usize> {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         if let Some(index) = self
             .buffers
@@ -53,12 +52,10 @@ impl EditorWindow {
         Ok(self.buffers.len() - 1)
     }
 
-    /// Retain a prepared `doc` on the current page without changing focus or doing disk I/O.
+    /// Retain a prepared `doc` in this window without changing focus or doing disk I/O.
     pub(in crate::grid) fn retain_document(&mut self, doc: Document) -> usize {
         self.buffers.push(Buffer::new(doc));
-        let index = self.buffers.len() - 1;
-        self.attach_buffer(index);
-        index
+        self.buffers.len() - 1
     }
 
     /// Move buffer `index` to another tab, retaining a valid editor in this tab.
@@ -66,7 +63,7 @@ impl EditorWindow {
         let was_active = self.buffer().id;
         let mut buffer = self.buffers.remove(index);
         buffer.vim.cancel_pending();
-        self.reconcile_tabpage_buffers(was_active, 0.);
+        self.reconcile_buffers(was_active);
         buffer
     }
 
@@ -93,7 +90,6 @@ impl EditorWindow {
         let id = buffer.id;
         *buffer = Buffer::new(buffer.vim.doc.saved_version());
         buffer.id = id;
-        self.clear_buffer_views(id);
     }
 
     /// Files with unsaved edits must not be overwritten by manager transfers.
@@ -143,7 +139,28 @@ impl EditorWindow {
             }
             false
         });
-        self.reconcile_tabpage_buffers(was_active, 0.);
+        self.reconcile_buffers(was_active);
         true
+    }
+
+    /// Remove a file label and its buffer after the caller resolves unsaved changes.
+    pub(in crate::grid) fn remove_buffer_tab(&mut self, id: u64, _now: f64) -> bool {
+        let Some(index) = self.buffer_index(id) else {
+            return false;
+        };
+        self.take_buffer(index);
+        true
+    }
+
+    /// Preserve the active buffer when possible, otherwise select its neighbor or create a blank.
+    fn reconcile_buffers(&mut self, was_active: u64) {
+        if self.buffers.is_empty() {
+            self.buffers.push(Buffer::new(Document::new("")));
+        }
+        let active = self.buffer_index(was_active);
+        self.active = active.unwrap_or_else(|| self.active.min(self.buffers.len() - 1));
+        if active.is_none() {
+            self.reset_buffer_input();
+        }
     }
 }

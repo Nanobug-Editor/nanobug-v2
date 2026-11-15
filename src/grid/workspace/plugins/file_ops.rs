@@ -349,11 +349,7 @@ impl Workspace {
             self.plugins.file_plan = Some(plan);
             return;
         };
-        let dirty = self
-            .projects
-            .ordered()
-            .flat_map(|project| project.editor.dirty_paths())
-            .collect::<BTreeSet<_>>();
+        let dirty = self.projects.dirty_paths().collect::<BTreeSet<_>>();
         if plan
             .entries
             .iter()

@@ -46,3 +46,30 @@ fn tab_range_accounts_for_hidden_counts_on_both_sides() {
     assert_eq!(hidden_columns(9), 3);
     assert_eq!(hidden_columns(10), 4);
 }
+
+/// Page hit rectangles follow right-aligned numbers and overflow, with room for project names.
+#[test]
+fn pages_use_the_right_side_of_the_caption() {
+    let spacing = TextSpacing::new(
+        std::sync::Arc::new(gpui::NoopTextSystem::new()),
+        gpui::FontId(0),
+        16.,
+        9.,
+    );
+    let cols = 40;
+    let mut frame = Frame::new(cols, 1);
+    assert!(pages::draw(&mut frame, cols, 1, 0, &spacing).is_empty());
+
+    let page_slots = |count, active| {
+        pages::draw(&mut Frame::new(cols, 1), cols, count, active, &spacing)
+            .into_iter()
+            .map(|(index, rect)| (index, rect.x..rect.x + rect.w))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(page_slots(3, 1), [(0, 31..32), (1, 35..36), (2, 39..40)]);
+    let overflow = page_slots(90, 45);
+    assert!(overflow[0].1.start >= cols / 2);
+    assert!(overflow[0].0 < 45 && overflow.last().unwrap().0 > 45);
+    assert!(overflow.iter().any(|(index, _)| *index == 45));
+    assert_eq!(overflow.last().unwrap().1.end, cols);
+}

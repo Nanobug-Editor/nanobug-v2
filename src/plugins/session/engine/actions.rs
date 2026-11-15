@@ -137,6 +137,8 @@ impl Engine {
                         module.refresh = None;
                     }
                 }
+                // Re-resolve newly installed language-server dependencies on an explicit retry.
+                self.analyzers.retain(|key, _| key.namespace != namespace);
                 self.rules.retry(&namespace);
             }
             Action::RetrySettings(key) => {
@@ -166,6 +168,20 @@ impl Engine {
             }
             Action::RetryBackgroundTool(key, tool) => self.retry_background_tool(key, tool),
             Action::ReviewToolOperations(namespace) => self.review_tool_operations(namespace),
+            Action::SetProjectSqlDialect {
+                project,
+                dialect,
+                reply,
+            } => {
+                let result = self
+                    .sql_dialects
+                    .set(project, dialect)
+                    .map_err(|error| error.to_string());
+                if result.is_ok() {
+                    self.reconcile();
+                }
+                let _ = reply.try_send(result);
+            }
             Action::SetProjectExecution(id, allow) => {
                 let Some(project) = self.projects.get(&id) else {
                     return;

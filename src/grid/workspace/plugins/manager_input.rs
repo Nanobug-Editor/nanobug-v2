@@ -223,6 +223,30 @@ impl Workspace {
         }
         let command = normal_character(key);
         let printable = command.as_deref().unwrap_or_default();
+        let completing = self
+            .plugins
+            .language
+            .as_ref()
+            .is_some_and(|results| results.is_completion());
+        let completion_key = if completing && raw == "tab" && !key.modifiers.modified() {
+            "enter"
+        } else if completing
+            && key.modifiers.control
+            && !key.modifiers.shift
+            && !key.modifiers.alt
+            && !key.modifiers.platform
+            && !key.modifiers.function
+        {
+            match raw {
+                "n" => "down",
+                "p" => "up",
+                "y" => "enter",
+                "e" => "escape",
+                _ => raw,
+            }
+        } else {
+            raw
+        };
         if self.plugins.manager.help {
             if matches!(raw, "escape" | "q") || printable == "?" {
                 self.plugins.manager.help = false;
@@ -249,7 +273,7 @@ impl Workspace {
             let count = self
                 .plugin_manager_view()
                 .plugin_row_count(self.plugin_manager_area());
-            match (raw, printable) {
+            match (completion_key, printable) {
                 ("escape", _) if !event.is_held => self.plugin_back(),
                 (_, "q") => self.plugin_back(),
                 (_, "?") => self.plugins.manager.help = true,

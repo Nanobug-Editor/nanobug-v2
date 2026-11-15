@@ -134,18 +134,25 @@ impl Engine {
                     ));
                 })
             }
-            Service::Rustfmt => {
-                let (root, path, document) = match self.rustfmt_source(&pending, document) {
-                    Ok(source) => source,
-                    Err(error) => {
-                        pending.fail(&error.to_string());
-                        return true;
-                    }
+            Service::Rustfmt | Service::FormatLanguage { .. } => {
+                let tool = match operation {
+                    Service::FormatLanguage { tool } => tool,
+                    _ => "rustfmt".to_owned(),
                 };
+                let native = tool != "sqlformat";
+                let (root, path, document) =
+                    match self.format_source(&pending, document, &tool, native) {
+                        Ok(source) => source,
+                        Err(error) => {
+                            pending.fail(&error.to_string());
+                            return true;
+                        }
+                    };
                 let closed =
                     Arc::clone(self.project_flags.entry(key.instance.project).or_default());
                 self.tool_io.submit(move || {
-                    let result = tools::format_rust(&root, &path, &document, deadline, &closed);
+                    let result =
+                        tools::format_language(&tool, &root, &path, &document, deadline, &closed);
                     let _ = finish.send(ResultEvent::LanguageService(
                         pending,
                         result
@@ -167,29 +174,32 @@ impl Engine {
         submitted
     }
 
-    /// Authorize only a format-kind invocation for the exact active Rust document it was given.
-    fn rustfmt_source(
+    /// Authorize formatting for the exact snapshot, applying native execution grants when needed.
+    fn format_source(
         &self,
         pending: &Pending,
         document: Option<Arc<DocumentSnapshot>>,
+        tool: &str,
+        native: bool,
     ) -> anyhow::Result<(PathBuf, PathBuf, Arc<DocumentSnapshot>)> {
         let key = &pending.key;
-        let document = document.context("Open a Rust file to format it")?;
+        let document = document.context("Open a file to format it")?;
         let path = pending
             .format_path
             .as_deref()
             .or(document.path.as_deref())
-            .context("Open a Rust file to format it")?;
+            .context("Open a file to format it")?;
         ensure!(
             pending.kind == CallKind::Format
                 && pending.reply.is_some()
                 && pending.version == Some((document.opening, document.revision))
-                && Path::extension(path).is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+                && (tool != "rustfmt"
+                    || Path::extension(path).is_some_and(|ext| ext.eq_ignore_ascii_case("rs")))
                 && self.lifecycle.wanted.get(key).is_some_and(|module| {
                     module.provides.contains(&Provider::Format)
                         && module.accepts_document(Some(path))
                 }),
-            "rustfmt requires an active Rust format request"
+            "The formatter requires an active request for a supported file"
         );
         let record = self
             .records
@@ -197,23 +207,21 @@ impl Engine {
             .context("Plugin is unavailable")?;
         ensure!(
             record.enabled
-                && [
-                    Permission::ReadDocument,
-                    Permission::EditDocument,
-                    Permission::RunTool
-                ]
-                .iter()
-                .all(|permission| record.grants.contains(permission)),
-            "rustfmt requires document editing and native tool permissions"
+                && record.grants.contains(&Permission::ReadDocument)
+                && record.grants.contains(&Permission::EditDocument)
+                && (!native || record.grants.contains(&Permission::RunTool)),
+            "The formatter is missing required permissions"
         );
         let project = self
             .projects
             .get(&key.instance.project)
             .context("Project was closed")?;
         ensure!(
-            self.project_execution
-                .get(&query::project_key(&project.root))
-                == Some(&true),
+            !native
+                || self
+                    .project_execution
+                    .get(&query::project_key(&project.root))
+                    == Some(&true),
             "Project execution is blocked. Choose Allow project execution in Modules."
         );
         Ok((project.root.clone(), path.to_owned(), document))

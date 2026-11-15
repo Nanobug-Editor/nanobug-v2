@@ -158,7 +158,11 @@ fn commands_produce_explicit_file_actions_with_space_containing_paths() {
     assert_eq!(vim.key("Enter", &mut register), Action::Close(true));
     for command in [":qa", ":qall"] {
         vim.text(command, &mut register);
-        assert_eq!(vim.key("Enter", &mut register), Action::Close(false));
+        assert_eq!(vim.key("Enter", &mut register), Action::QuitAll(false));
+    }
+    for command in [":qa!", ":qall!"] {
+        vim.text(command, &mut register);
+        assert_eq!(vim.key("Enter", &mut register), Action::QuitAll(true));
     }
 }
 
@@ -188,6 +192,31 @@ fn failed_save_keeps_original_content_and_dirty_state() {
     assert_eq!(fs::read_to_string(&path).unwrap(), "original");
     assert!(doc.modified());
     fs::remove_dir_all(dir).unwrap();
+}
+
+/// Independent drafts cannot replace a newer write from another opening of the same file.
+#[test]
+fn saving_an_independent_draft_checks_the_latest_disk_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shared.txt");
+    fs::write(&path, "original").unwrap();
+    let mut original = Document::open(&path).unwrap();
+    original.replace(0..8, "draft", true);
+    let mut fork = original.fork();
+    assert_ne!(fork.opening, original.opening);
+    assert!(fork.modified());
+
+    original.save(None).unwrap();
+    fork.save(None).unwrap();
+    original.replace(0..5, "another", true);
+    original.save(None).unwrap();
+    fork.replace(0..5, "stale", true);
+    assert!(fork.save(None).is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "another");
+    assert!(fork.modified());
+    let copy = dir.path().join("copy.txt");
+    fork.save(Some(&copy)).unwrap();
+    assert_eq!(fs::read_to_string(copy).unwrap(), "stale");
 }
 
 #[test]

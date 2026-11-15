@@ -2,21 +2,28 @@
 
 mod buffer;
 mod commands;
+mod completion;
 mod header;
+mod hover;
 mod input;
+mod markdown;
 mod pointer;
 mod presentation;
+mod project_session;
 mod session;
 pub(in crate::grid) mod shortcuts;
-mod tabpages;
 mod transactions;
 mod view;
 mod viewport;
 pub(in crate::grid) use transactions::{EditReceipt, TextChange, TextTarget};
 
 pub(in crate::grid) use buffer::{Buffer, TEXT_OVERSCAN};
+pub(in crate::grid) use completion::CompletionMenu;
 pub(in crate::grid) use header::HeaderTarget;
+pub(in crate::grid) use hover::{DefinitionHoverContent, DefinitionHoverPopup};
 pub(in crate::grid) use input::EditResult;
+pub(in crate::grid) use markdown::{MarkdownCache, MarkdownPreview, MarkdownViewMode};
+pub(in crate::grid) use project_session::EditorSnapshot;
 
 use crate::ui::ime::Composition;
 use gpui::{Pixels, Point};
@@ -25,14 +32,12 @@ use nanobug::{
     vim::{Register, Vim},
 };
 
-/// The editor window owns shared document state and the editing views for each project page.
+/// One editor pane owns its buffers, input state and viewports.
 pub(in crate::grid) struct EditorWindow {
-    /// Canonical buffers shared by all pages, including documents retained without a visible view.
+    /// Buffers shown in order in this window's file labels.
     buffers: Vec<Buffer>,
     /// Buffer displayed in this window.
     active: usize,
-    /// Page-local buffer order and views, with the current view materialized in the active buffer.
-    tabpages: tabpages::Tabpages,
     /// Text registers and recorded macros shared across the window's buffers.
     register: Register,
     /// Native preedit text, committed to the document only once.
@@ -56,11 +61,9 @@ impl EditorWindow {
 
     /// Display a retained buffer, including its edits, undo state and viewport.
     pub(in crate::grid) fn with_buffer(buffer: Buffer) -> Self {
-        let tabpages = tabpages::Tabpages::new(buffer.id);
         Self {
             buffers: vec![buffer],
             active: 0,
-            tabpages,
             register: Register::default(),
             composition: Composition::default(),
             dragging: None,

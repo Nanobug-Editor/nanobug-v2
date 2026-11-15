@@ -212,6 +212,10 @@ pub enum PluginEvent {
     Definition {
         offset: usize,
     },
+    /// Request details for the symbol at the active document's UTF-8 byte offset.
+    Hover {
+        offset: usize,
+    },
     Diagnose,
     Ui {
         action: String,
@@ -277,6 +281,9 @@ pub struct Output {
     /// Host-populated definition locations, with LSP line and UTF-16 column coordinates.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub definitions: Vec<language::Definition>,
+    /// Host-populated signature and documentation as bounded Markdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hover: Option<String>,
     pub diagnostics: Vec<Diagnostic>,
     /// Presentation data for the document revision supplied with this call.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -331,6 +338,11 @@ pub enum Service {
     /// Format the active Rust snapshot with the project's native rustfmt, returning a UTF-8 string.
     /// Available during an awaited Format invocation with native execution granted for this project.
     Rustfmt,
+    /// Format the active snapshot using a host-supported tool and return UTF-8 text.
+    /// Accepted only during an awaited Format invocation.
+    FormatLanguage {
+        tool: String,
+    },
     MeasureText {
         lines: Vec<canvas::MeasureText>,
     },
@@ -369,6 +381,7 @@ impl std::fmt::Debug for Service {
             Self::ReadProjectText { .. } => "ReadProjectText",
             Self::ReadProjectAncestors { .. } => "ReadProjectAncestors",
             Self::Rustfmt => "Rustfmt",
+            Self::FormatLanguage { .. } => "FormatLanguage",
             Self::MeasureText { .. } => "MeasureText",
             Self::StageSettings { .. } => "StageSettings",
             Self::RunTool { .. } => "RunTool",
@@ -482,6 +495,9 @@ pub enum Request {
     Evaluate {
         id: u64,
         source: String,
+        /// Module ID selected from a shared rule file's default export.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        module: Option<String>,
         context: Value,
         remaining_ms: u64,
     },
@@ -537,6 +553,12 @@ pub enum Reply {
     Rule {
         id: u64,
         matches: bool,
+        /// An activated rule requested native language-server startup for its project.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        start_language_server: bool,
+        /// Workspace-relative scan exclusions proposed by the matching language rule.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        exclude_dirs: Vec<String>,
     },
     RuleChecked {
         id: u64,
@@ -578,6 +600,8 @@ pub enum Query {
     Document,
     /// Active document path, tracked independently from its text revision.
     DocumentPath,
+    /// Active document extension, tracked independently from its name and text.
+    DocumentExtension,
     List,
 }
 

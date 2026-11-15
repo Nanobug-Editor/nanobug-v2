@@ -18,7 +18,7 @@ use windows_sys::Win32::{
     },
 };
 
-/// Identity of the subclass that observes presses on the project strip.
+/// Identity of the subclass that observes presses on the shared caption strip.
 const TAB_SUBCLASS: usize = 1;
 
 /// State shared by a caption press and any messages sent by the native move loop.

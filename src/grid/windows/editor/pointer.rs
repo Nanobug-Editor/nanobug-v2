@@ -19,12 +19,12 @@ impl EditorWindow {
         spacing: &TextSpacing,
     ) -> bool {
         let text = self.text_area(area);
-        let body = Self::body(area);
+        let body = self.source_body(area);
         let gutter = text.x - body.x;
         let origin = metrics.at(body.x as f32, text.y as f32);
         let x = f32::from(position.x - origin.x) / metrics.cw;
         let y = f32::from(position.y - origin.y) / metrics.lh;
-        if !(0.0..body.w as f32).contains(&x) || !(0.0..text.h as f32).contains(&y) {
+        if !(0.0..(gutter + text.w) as f32).contains(&x) || !(0.0..text.h as f32).contains(&y) {
             return false;
         }
         let buffer = &mut self.buffers[self.active];
@@ -95,6 +95,19 @@ impl EditorWindow {
         metrics: Metrics,
         spacing: &TextSpacing,
     ) {
+        let (x, y) = metrics.cell(position);
+        if self
+            .markdown_view_mode()
+            .is_some_and(|mode| mode != super::MarkdownViewMode::Edit)
+        {
+            let text = self.text_area(area);
+            // The split's empty strip can focus the editor but has no text hit target.
+            if !self.source_body(area).contains(x, y) || x >= text.x + text.w {
+                self.dragging = None;
+                return;
+            }
+        }
+        self.markdown_source_takes_scroll();
         if self.open_fold_at_position(position, area, metrics, spacing) {
             self.dragging = None;
             return;
@@ -122,6 +135,10 @@ impl EditorWindow {
             < 4.
         {
             return false;
+        }
+        let mut position = position;
+        if self.markdown_view_mode() == Some(super::MarkdownViewMode::Split) {
+            position.x = position.x.min(self.text_area(area).pixels(metrics).right());
         }
         let at = self.offset(position, area, metrics, spacing);
         let vim = &mut self.buffers[self.active].vim;

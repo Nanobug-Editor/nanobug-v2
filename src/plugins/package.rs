@@ -102,6 +102,9 @@ pub struct Module {
     /// Use the host's persistent rust-analyzer for Rust language queries and live diagnostics.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rust_analyzer: bool,
+    /// Use a host-supported language server for this module's document extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_server: Option<crate::plugins::tools::rust_analyzer::Server>,
     #[serde(default)]
     pub provides: BTreeSet<Provider>,
     /// Document features apply to these extensions. An empty set matches any document.
@@ -131,6 +134,8 @@ pub enum Provider {
     Complete,
     Diagnose,
     Definition,
+    /// Provide symbol details from a native language server.
+    Hover,
     /// Receive document changes and supply highlighting, folds and outline entries.
     Document,
 }
@@ -348,10 +353,38 @@ impl Manifest {
                         && module.document_extensions == BTreeSet::from(["rs".into()])
                         && self.permissions.contains(&Permission::ReadDocument)
                         && self.permissions.contains(&Permission::RunTool)
-                        && [Provider::Complete, Provider::Diagnose, Provider::Definition]
-                            .iter()
-                            .any(|provider| module.provides.contains(provider)),
+                        && [
+                            Provider::Complete,
+                            Provider::Diagnose,
+                            Provider::Definition,
+                            Provider::Hover,
+                        ]
+                        .iter()
+                        .any(|provider| module.provides.contains(provider)),
                 "rust-analyzer requires a Rust language module with document and native tool access"
+            );
+            ensure!(
+                module.language_server.is_none()
+                    || !module.rust_analyzer
+                        && module.wasm.is_some()
+                        && !module.document_extensions.is_empty()
+                        && self.permissions.contains(&Permission::ReadDocument)
+                        && self.permissions.contains(&Permission::RunTool)
+                        && [
+                            Provider::Complete,
+                            Provider::Diagnose,
+                            Provider::Definition,
+                            Provider::Hover,
+                        ]
+                        .iter()
+                        .any(|provider| module.provides.contains(provider)),
+                "Language servers require a document module with native tool access"
+            );
+            ensure!(
+                !module.provides.contains(&Provider::Hover)
+                    || module.rust_analyzer
+                    || module.language_server.is_some(),
+                "Hover details require a native language server"
             );
             ensure!(
                 !module.settings_ui || module.interactive && module.wasm.is_some(),

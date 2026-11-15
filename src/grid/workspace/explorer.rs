@@ -11,11 +11,7 @@ use std::time::Duration;
 impl Workspace {
     /// Apply manager transfer `key`, guarding and updating buffers across all projects.
     pub(super) fn transfer(&mut self, key: &str) {
-        let dirty_paths = self
-            .projects
-            .ordered()
-            .flat_map(|project| project.editor.dirty_paths())
-            .collect::<Vec<_>>();
+        let dirty_paths = self.projects.dirty_paths().collect::<Vec<_>>();
         let active = self.projects.active_mut();
         let Some(manager) = &mut active.manager else {
             return;

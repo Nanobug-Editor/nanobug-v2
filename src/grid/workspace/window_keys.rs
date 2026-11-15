@@ -60,12 +60,14 @@ impl WindowSequence {
 enum WindowCommand {
     /// Move to an adjacent pane along the requested direction.
     Direction(&'static str),
-    /// Cycle to the other pane, or focus the numbered pane.
-    Cycle,
+    /// Cycle toward the next or previous pane, or focus a numbered pane.
+    Cycle { reverse: bool },
     /// Focus the first or last visible pane.
     Edge(bool),
     /// Restore the last focused visible pane.
     Previous,
+    /// Open a second editor along the requested split axis.
+    Split { stacked: bool },
     /// Close an optionally numbered pane, or quit when the last one is closed.
     Close { quit: bool },
     /// Close the other pane and keep an optionally numbered pane.
@@ -84,6 +86,8 @@ enum WindowCommand {
     Tab(i32),
     /// Open the file under the cursor in a separate editor-only tab.
     OpenFile { line: bool },
+    /// Show the current buffer's diagnostic at the caret.
+    Diagnostic,
     /// Wait for a second subcommand key.
     TabPrefix,
     /// End the pending sequence without an action.
@@ -116,6 +120,18 @@ struct Binding {
 /// Prefix table used by both dispatch and the localized hint.
 const WINDOW_BINDINGS: &[Binding] = &[
     Binding {
+        keys: &["s", "S"],
+        label: "s/S",
+        caption: "vim_window.split_stacked",
+        action: WindowCommand::Split { stacked: true },
+    },
+    Binding {
+        keys: &["v"],
+        label: "v",
+        caption: "vim_window.split_side_by_side",
+        action: WindowCommand::Split { stacked: false },
+    },
+    Binding {
         keys: &["h", "left", "backspace"],
         label: "h ←",
         caption: "vim_window.left",
@@ -140,10 +156,16 @@ const WINDOW_BINDINGS: &[Binding] = &[
         action: WindowCommand::Direction("l"),
     },
     Binding {
-        keys: &["w", "W"],
-        label: "w W",
+        keys: &["w"],
+        label: "w",
         caption: "vim_window.cycle",
-        action: WindowCommand::Cycle,
+        action: WindowCommand::Cycle { reverse: false },
+    },
+    Binding {
+        keys: &["W"],
+        label: "W",
+        caption: "vim_window.cycle_reverse",
+        action: WindowCommand::Cycle { reverse: true },
     },
     Binding {
         keys: &["t"],
@@ -295,6 +317,12 @@ const WINDOW_BINDINGS: &[Binding] = &[
         caption: "vim_window.tabs",
         action: WindowCommand::TabPrefix,
     },
+    Binding {
+        keys: &["d"],
+        label: "d",
+        caption: "vim_window.diagnostic",
+        action: WindowCommand::Diagnostic,
+    },
 ];
 
 /// Ctrl+w g entries implemented by the tab host.
@@ -356,8 +384,8 @@ fn window_key(key: &Keystroke) -> Option<String> {
         if !key.modifiers.shift {
             return match key.key.as_str() {
                 "c" | "[" => Some("escape".into()),
-                "b" | "g" | "h" | "j" | "k" | "l" | "o" | "p" | "q" | "r" | "t" | "w" | "x"
-                | "tab" => Some(key.key.clone()),
+                "b" | "g" | "h" | "j" | "k" | "l" | "o" | "p" | "q" | "r" | "s" | "t" | "v"
+                | "w" | "x" | "tab" => Some(key.key.clone()),
                 "_" => Some("_".into()),
                 _ => None,
             };
@@ -520,6 +548,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let WindowCommand::Split { stacked } = command {
+            if self.projects.active().focus == Focus::Editor {
+                self.open_editor_split(stacked, None, window, cx);
+            }
+            return;
+        }
+        if self.apply_split_window_command(command, count, window, cx) {
+            self.sync(window, cx);
+            return;
+        }
         let project = self.projects.active();
         let focus = project.focus;
         let first = if project.editor_first {
@@ -543,7 +581,7 @@ impl Workspace {
             WindowCommand::Direction(key) => {
                 target = direction_target(focus, split, key).filter(|_| both)
             }
-            WindowCommand::Cycle => {
+            WindowCommand::Cycle { .. } => {
                 target =
                     Some(count.map_or_else(|| if both { focus.other() } else { focus }, numbered))
             }
@@ -603,6 +641,19 @@ impl Workspace {
             WindowCommand::OpenFile { line } if focus == Focus::Editor => {
                 self.open_window_file_tab(line, window, cx)
             }
+            WindowCommand::Diagnostic if focus == Focus::Editor => {
+                let message = project
+                    .editor
+                    .buffer()
+                    .caret_diagnostic()
+                    .unwrap_or_else(|| i18n::text("editor.no_diagnostics"))
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                self.set_status(message);
+                return;
+            }
             WindowCommand::Cancel => return,
             _ => {}
         }
@@ -614,6 +665,56 @@ impl Workspace {
             project.focus_pane(pane);
         }
         self.sync(window, cx);
+    }
+
+    /// Give `command` and `count` to the editor splits before the outer panes handle them.
+    /// Return whether a split or the pane order handled the command in `window` through `cx`.
+    fn apply_split_window_command(
+        &mut self,
+        command: WindowCommand,
+        count: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match command {
+            WindowCommand::Cycle { reverse } => self.cycle_editor_split(reverse, count, window, cx),
+            WindowCommand::Edge(start) => {
+                self.cycle_editor_split(false, Some(if start { 1 } else { usize::MAX }), window, cx)
+            }
+            _ if self.projects.active().focus != Focus::Editor => false,
+            WindowCommand::Direction(key) => {
+                let (horizontal, vertical) = match key {
+                    "h" => (-1, 0),
+                    "j" => (0, 1),
+                    "k" => (0, -1),
+                    "l" => (1, 0),
+                    _ => unreachable!("window bindings only contain cardinal directions"),
+                };
+                self.focus_editor_split(horizontal, vertical, window, cx)
+            }
+            WindowCommand::Previous => self.focus_previous_editor_split(window, cx),
+            WindowCommand::Close { .. } => self.close_editor_split(count, window, cx),
+            WindowCommand::Only => self.only_editor_split(window, cx),
+            WindowCommand::Resize { stacked, amount } => {
+                let area = self.active_editor_area();
+                let (current, total) = if stacked {
+                    (area.h, self.layout.editor.h)
+                } else {
+                    (area.w, self.layout.editor.w)
+                };
+                let size = count.unwrap_or(1).min(isize::MAX as usize) as isize;
+                let delta = match amount {
+                    Resize::Grow => size,
+                    Resize::Shrink => -size,
+                    Resize::Set => {
+                        count.unwrap_or(total).min(isize::MAX as usize) as isize - current as isize
+                    }
+                };
+                self.resize_editor_split(!stacked, delta, window, cx)
+            }
+            WindowCommand::Equalize => self.equalize_editor_splits(window, cx),
+            _ => false,
+        }
     }
 
     /// Resize the focused pane along the `stacked` axis according to `amount` and `count`.
@@ -699,21 +800,31 @@ impl Workspace {
 /// Whether `command` has a target within the current `project` and its layout.
 fn window_binding_available(project: &Project, command: WindowCommand) -> bool {
     let both = project.manager.is_some() && project.hidden_pane.is_none();
+    let split = project.split_count() > 1;
+    let editor = project.focus == Focus::Editor;
     match command {
-        WindowCommand::OpenFile { .. } => project.focus == Focus::Editor,
+        WindowCommand::OpenFile { .. }
+        | WindowCommand::Diagnostic
+        | WindowCommand::Split { .. } => editor,
         WindowCommand::Direction(key) => {
-            both && direction_target(project.focus, (project.stacked, project.editor_first), key)
-                .is_some()
+            (split && editor)
+                || (both
+                    && direction_target(
+                        project.focus,
+                        (project.stacked, project.editor_first),
+                        key,
+                    )
+                    .is_some())
         }
-        WindowCommand::Cycle
+        WindowCommand::Cycle { .. }
         | WindowCommand::Edge(_)
         | WindowCommand::Only
-        | WindowCommand::Rotate
-        | WindowCommand::Exchange
-        | WindowCommand::Move { .. }
-        | WindowCommand::Equalize => both,
-        WindowCommand::Previous => both && project.previous_focus.is_some(),
-        WindowCommand::Resize { stacked, .. } => both && stacked == project.stacked,
+        | WindowCommand::Equalize => both || split,
+        WindowCommand::Rotate | WindowCommand::Exchange | WindowCommand::Move { .. } => both,
+        WindowCommand::Previous => (split && editor) || (both && project.previous_focus.is_some()),
+        WindowCommand::Resize { stacked, .. } => {
+            (split && editor) || (both && stacked == project.stacked)
+        }
         _ => true,
     }
 }
@@ -730,7 +841,11 @@ mod tests {
             ("ctrl-h", WindowCommand::Direction("h")),
             ("backspace", WindowCommand::Direction("h")),
             ("down", WindowCommand::Direction("j")),
-            ("ctrl-w", WindowCommand::Cycle),
+            ("ctrl-w", WindowCommand::Cycle { reverse: false }),
+            ("shift-w", WindowCommand::Cycle { reverse: true }),
+            ("shift-s", WindowCommand::Split { stacked: true }),
+            ("ctrl-s", WindowCommand::Split { stacked: true }),
+            ("ctrl-v", WindowCommand::Split { stacked: false }),
             (
                 "shift-k",
                 WindowCommand::Move {
@@ -800,7 +915,7 @@ mod tests {
     #[test]
     #[ignore = "requires Windows DirectWrite and DirectX"]
     fn native_window_keys_reorder_and_resize_panes() -> anyhow::Result<()> {
-        use super::super::native_test;
+        use super::super::{native_test, tabs::CaptionTarget};
         use anyhow::ensure;
         use gpui::{AppContext, EntityInputHandler, MouseButton, MouseDownEvent};
         use nanobug::plugins::session::Options;
@@ -811,6 +926,7 @@ mod tests {
         fs::create_dir(&project)?;
         fs::write(project.join("README.md"), "second.txt:2")?;
         fs::write(project.join("second.txt"), "one\ntwo")?;
+        fs::write(project.join("split.txt"), "split file")?;
         let options = Options::take(
             &mut vec![
                 "--plugin-profile".into(),
@@ -869,36 +985,31 @@ mod tests {
                         send(workspace, &["ctrl-w", "shift-k"], window, cx)?;
                         ensure!(workspace.layout.editor.y < workspace.layout.tree.y);
                         send(workspace, &["g", "shift-t"], window, cx)?;
-                        ensure!(workspace.projects.active().editor.active_tabpage() == 0);
+                        ensure!(workspace.projects.active().active_page() == 0);
                         ensure!(workspace.layout.editor == original);
                         send(workspace, &["i"], window, cx)?;
                         workspace.replace_and_mark_text_in_range(None, "中国", None, window, cx);
                         ensure!(workspace.projects.active().editor.composition().text == "中国");
-                        let area = workspace.layout.editor;
-                        let header = workspace.projects.active().editor.header(
-                            area,
-                            &workspace.spacing,
-                            workspace.layout.visible_cols,
-                        );
-                        let page = (area.x..area.x + area.w)
-                            .find(|&x| {
-                                header.target_at(x, area.y)
-                                    == Some(crate::grid::windows::editor::HeaderTarget::Tabpage(1))
-                            })
-                            .ok_or_else(|| anyhow::anyhow!("Second page label must be visible"))?;
-                        workspace.mouse_down(
-                            &MouseDownEvent {
-                                button: MouseButton::Left,
-                                position: workspace
-                                    .metrics
-                                    .at(page as f32 + 0.5, area.y as f32 + 0.5),
-                                click_count: 1,
-                                ..Default::default()
-                            },
-                            window,
-                            cx,
-                        );
-                        ensure!(workspace.projects.active().editor.active_tabpage() == 1);
+                        let caption = |target| {
+                            workspace
+                                .tabs
+                                .click_targets(workspace.tab_metrics())
+                                .find_map(|(candidate, bounds)| {
+                                    (candidate == target).then_some(bounds)
+                                })
+                                .ok_or_else(|| anyhow::anyhow!("Missing caption target {target:?}"))
+                        };
+                        let project = caption(CaptionTarget::Project(0))?;
+                        let first_page = caption(CaptionTarget::Page(0))?;
+                        let second_page = caption(CaptionTarget::Page(1))?;
+                        ensure!(project.origin.y == second_page.origin.y);
+                        ensure!(project.right() < first_page.origin.x);
+                        let position = second_page.center();
+                        let press = workspace.caption_tab_press(position).ok_or_else(|| {
+                            anyhow::anyhow!("Second page must accept a caption press")
+                        })?;
+                        workspace.finish_caption_tab_click(press, position, window, cx);
+                        ensure!(workspace.projects.active().active_page() == 1);
                         ensure!(
                             workspace
                                 .projects
@@ -935,38 +1046,34 @@ mod tests {
                                         buffer,
                                     ))
                             })
-                            .ok_or_else(|| anyhow::anyhow!("Shared file label must be visible"))?;
-                        workspace.middle_mouse_down(
-                            &MouseDownEvent {
-                                button: MouseButton::Middle,
-                                position: workspace
-                                    .metrics
-                                    .at(file as f32 + 0.5, area.y as f32 + 0.5),
-                                click_count: 1,
-                                ..Default::default()
-                            },
-                            window,
-                            cx,
-                        );
+                            .ok_or_else(|| anyhow::anyhow!("File label must be visible"))?;
+                        let close_file = MouseDownEvent {
+                            button: MouseButton::Middle,
+                            position: workspace.metrics.at(file as f32 + 0.5, area.y as f32 + 0.5),
+                            click_count: 1,
+                            ..Default::default()
+                        };
+                        workspace.middle_mouse_down(&close_file, window, cx);
+                        ensure!(workspace.editor_close.is_some());
+                        send(workspace, &["escape", "u"], window, cx)?;
+                        workspace.middle_mouse_down(&close_file, window, cx);
                         ensure!(workspace.editor_close.is_none());
                         ensure!(workspace.projects.active().editor.vim().doc.path.is_none());
                         workspace.select_editor_page(0, window, cx);
                         ensure!(
-                            workspace
-                                .projects
-                                .active()
-                                .editor
-                                .vim()
-                                .doc
-                                .text
-                                .starts_with("中")
+                            workspace.projects.active().editor.vim().doc.text == "second.txt:2"
                         );
-                        send(workspace, &["u"], window, cx)?;
                         workspace.select_editor_page(1, window, cx);
                         ensure!(workspace.layout.editor.y < workspace.layout.tree.y);
                         ensure!(workspace.projects.active_mut().close_page(now));
                         workspace.sync(window, cx);
                         ensure!(workspace.layout.editor == original);
+                        ensure!(
+                            workspace
+                                .tabs
+                                .click_targets(workspace.tab_metrics())
+                                .all(|(target, _)| matches!(target, CaptionTarget::Project(_)))
+                        );
                         send(workspace, &["ctrl-w", "r"], window, cx)?;
                         ensure!(workspace.layout.editor.x < workspace.layout.tree.x);
                         send(workspace, &["ctrl-w", "x"], window, cx)?;
@@ -985,6 +1092,84 @@ mod tests {
                         ensure!(workspace.projects.active().manager.is_some());
                         send(workspace, &["ctrl-w", "o"], window, cx)?;
                         ensure!(workspace.projects.active().hidden_pane == Some(Focus::Manager));
+
+                        let original = workspace.active_editor_area();
+                        let right_id = workspace.projects.active().active_editor_id();
+                        let hint = workspace
+                            .window_sequence_hint(WindowSequence::default())
+                            .ok_or_else(|| anyhow::anyhow!("Missing window command hint"))?;
+                        ensure!(hint.continuations.contains(&(
+                            "s/S",
+                            "vim_window.split_stacked",
+                            false
+                        )));
+                        ensure!(hint.continuations.contains(&(
+                            "v",
+                            "vim_window.split_side_by_side",
+                            false
+                        )));
+                        send(workspace, &["ctrl-w", "v"], window, cx)?;
+                        let left = workspace.active_editor_area();
+                        let left_id = workspace.projects.active().active_editor_id();
+                        ensure!(left_id != right_id);
+                        ensure!(
+                            left.x == original.x && left.w < original.w && left.h == original.h
+                        );
+                        let path = workspace.projects.active().root.join("split.txt");
+                        workspace.open(path, window, cx);
+                        workspace.sync(window, cx);
+                        ensure!(workspace.projects.active().editor.vim().doc.text == "split file");
+                        send(workspace, &["ctrl-w", "l"], window, cx)?;
+                        ensure!(workspace.projects.active().active_editor_id() == right_id);
+                        ensure!(
+                            workspace.projects.active().editor.vim().doc.text == "second.txt:2"
+                        );
+                        let right = workspace.active_editor_area();
+                        ensure!(right.x > left.x && right.y == left.y);
+
+                        send(workspace, &["ctrl-w", "s"], window, cx)?;
+                        let upper = workspace.active_editor_area();
+                        ensure!(workspace.projects.active().split_count() == 3);
+                        ensure!(upper.y == right.y && upper.h < right.h && upper.x == right.x);
+                        send(workspace, &["ctrl-w", "2", "+"], window, cx)?;
+                        ensure!(workspace.active_editor_area().h == upper.h + 2);
+                        send(workspace, &["i"], window, cx)?;
+                        workspace.replace_text_in_range(None, "中", window, cx);
+                        send(workspace, &["escape", "ctrl-w", "c"], window, cx)?;
+                        ensure!(workspace.editor_close.is_some());
+                        ensure!(workspace.projects.active().split_count() == 3);
+                        send(workspace, &["escape", "u", "ctrl-w", "c"], window, cx)?;
+                        ensure!(workspace.editor_close.is_none());
+                        ensure!(workspace.projects.active().split_count() == 2);
+
+                        workspace.projects.active_mut().open_page(None, now)?;
+                        workspace.sync(window, cx);
+                        ensure!(workspace.projects.active().split_count() == 1);
+                        send(workspace, &["g", "shift-t"], window, cx)?;
+                        ensure!(workspace.projects.active().split_count() == 2);
+                        send(workspace, &["ctrl-w", "h"], window, cx)?;
+                        ensure!(workspace.projects.active().active_editor_id() == left_id);
+                        ensure!(workspace.projects.active().editor.vim().doc.text == "split file");
+
+                        send(workspace, &[":"], window, cx)?;
+                        ensure!(workspace.accepts_native_text());
+                        workspace.replace_text_in_range(None, "vsplit README.md", window, cx);
+                        send(workspace, &["enter"], window, cx)?;
+                        ensure!(workspace.projects.active().split_count() == 3);
+                        ensure!(
+                            workspace.projects.active().editor.vim().doc.text == "second.txt:2"
+                        );
+                        ensure!(
+                            workspace
+                                .projects
+                                .active()
+                                .editor_by_id(left_id)
+                                .unwrap()
+                                .vim()
+                                .doc
+                                .text
+                                == "split file"
+                        );
                         Ok(())
                     })
                 })?

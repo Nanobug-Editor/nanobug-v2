@@ -42,11 +42,17 @@ impl Icon {
         Self { source, aspect }
     }
 
+    /// Return the device-pixel width and height when the longer side is `edge`.
+    pub(crate) fn raster_dimensions(self, edge: i32) -> (i32, i32) {
+        let width = (edge as f32 * self.aspect.min(1.)).round().max(1.) as i32;
+        let height = (edge as f32 / self.aspect.max(1.)).round().max(1.) as i32;
+        (width, height)
+    }
+
     /// Rasterize with `svg`, fitting the original colors within `edge` device pixels.
     pub(crate) fn rasterize(self, svg: &SvgRenderer, edge: i32) -> Option<Arc<RenderImage>> {
         let parsed = svg.parse_svg(self.source).ok()?;
-        let width = (edge as f32 * self.aspect.min(1.)).round().max(1.) as i32;
-        let height = (edge as f32 / self.aspect.max(1.)).round().max(1.) as i32;
+        let (width, height) = self.raster_dimensions(edge);
         svg.render_parsed(
             &parsed,
             SvgSize::ExactSize(size(DevicePixels(width), DevicePixels(height))),

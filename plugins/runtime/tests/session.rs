@@ -10,6 +10,8 @@ mod canvas_cases;
 mod resource_lifecycle;
 #[path = "session/rule_paths.rs"]
 mod rule_paths;
+#[path = "session/sql_dialect.rs"]
+mod sql_dialect;
 
 use nanobug::plugins::{
     package::{InstallStore, UI_CONTRACT},

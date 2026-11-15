@@ -204,7 +204,11 @@ impl Workspace {
             return None;
         }
         if let Some(PendingPrefix::Leader(prefix)) = self.prefix {
-            return Some(ActiveHint::Leader(prefix, self.leader_availability()));
+            let availability = self.leader_availability();
+            return prefix
+                .bindings(availability)
+                .next()
+                .map(|_| ActiveHint::Leader(prefix, availability));
         }
         if let Some(PendingPrefix::Window(sequence)) = self.prefix {
             return self.window_sequence_hint(sequence).map(ActiveHint::Pane);
@@ -403,7 +407,7 @@ impl Workspace {
         {
             self.file_picker_layout().preview_editor_area()
         } else {
-            self.layout.editor
+            self.active_editor_area()
         };
         let mut rows = hint.len().max(1);
         let mut columns = HINT_COLUMNS;
@@ -472,7 +476,10 @@ impl Workspace {
         self.hint_delay = HintDelay::Idle;
         if matches!(self.prefix, Some(PendingPrefix::Leader(_))) {
             self.dismiss_leader_hint(cx);
-        } else if matches!(self.prefix, Some(PendingPrefix::Window(_))) {
+        } else if matches!(
+            self.prefix,
+            Some(PendingPrefix::Window(_) | PendingPrefix::MarkdownNavigation(_))
+        ) {
             self.prefix = None;
             cx.notify();
         } else if matches!(self.prefix, Some(PendingPrefix::Manager(_))) {
@@ -538,7 +545,9 @@ impl Workspace {
                 ));
             }
         } else if self.projects.active_project().is_some() {
-            for pane in [self.layout.tree, self.layout.editor] {
+            for pane in std::iter::once(self.layout.tree)
+                .chain(self.editor_rects().into_iter().map(|(_, area)| area))
+            {
                 cuts.extend(border_gaps(pane.pixels(metrics), popup, metrics, metrics));
             }
             // The footer can start within the bottom border row, below its visible stroke.

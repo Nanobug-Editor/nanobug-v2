@@ -1,6 +1,14 @@
 //! Project state and the ordered workspace tabs that retain it.
 
-use super::{Workspace, editor_close::CloseTarget, layout::Focus};
+mod session;
+
+use super::{
+    Workspace,
+    editor_close::CloseTarget,
+    editor_splits::{EditorSplits, PaneId, SplitAxis},
+    layout::Focus,
+};
+use crate::grid::render::Rect;
 use crate::grid::windows::{
     PathChange, editor::EditorWindow, manager::ManagerWindow, start::StartPage,
 };
@@ -8,13 +16,14 @@ use gpui::{Context, Window};
 use nanobug::{animation::cursor::CursorConfig, document::Document, i18n};
 use std::{
     borrow::Cow,
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
 /// Pane geometry and focus to restore when a project tabpage is selected.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 struct PageLayout {
     /// Focused and previously focused panes.
     focus: Focus,
@@ -43,6 +52,14 @@ impl Default for PageLayout {
     }
 }
 
+/// A project's tabpage retains its outer layout and its tree of independent editors.
+struct EditorPage {
+    /// Explorer and editor-group geometry when this page is selected again.
+    layout: PageLayout,
+    /// Editor pane placement and the last active pane on this page.
+    splits: EditorSplits,
+}
+
 /// Retained state of a project or standalone file tab.
 pub(super) struct Project {
     /// Unique opening used to bind plugin state to this tab's lifetime.
@@ -53,7 +70,7 @@ pub(super) struct Project {
     pub(super) focus: Focus,
     /// Previously focused pane, retained while both panes are visible.
     pub(super) previous_focus: Option<Focus>,
-    /// The project's open buffers, cursor positions and scroll state.
+    /// The focused editor, or the last editor focused before entering Explorer.
     pub(super) editor: EditorWindow,
     /// Explorer state, present only when the tab represents a directory.
     pub(super) manager: Option<ManagerWindow>,
@@ -67,8 +84,15 @@ pub(super) struct Project {
     pub(super) editor_first: bool,
     /// Preferred Explorer height in grid rows when the panes are stacked.
     pub(super) manager_height: Option<usize>,
-    /// Saved pane state in editor tabpage order. The active page uses the fields above.
-    page_layouts: Vec<PageLayout>,
+    /// Ordered tabpages, each with its own pane topology.
+    pages: Vec<EditorPage>,
+    /// Current and most recently departed tabpage indices.
+    active_page: usize,
+    previous_page: Option<usize>,
+    /// Every editor except the one materialized in `editor`, indexed by stable pane ID.
+    inactive_editors: HashMap<PaneId, EditorWindow>,
+    /// Next available pane ID within this project's lifetime.
+    next_pane: PaneId,
     /// Last feedback shown in the status line.
     pub(super) status: String,
     /// Validated project-local cursor settings.
@@ -115,7 +139,14 @@ impl Project {
             stacked: false,
             editor_first: false,
             manager_height: None,
-            page_layouts: vec![PageLayout::default()],
+            pages: vec![EditorPage {
+                layout: PageLayout::default(),
+                splits: EditorSplits::new(0),
+            }],
+            active_page: 0,
+            previous_page: None,
+            inactive_editors: HashMap::new(),
+            next_pane: 1,
             status,
             cursor_config,
         }
@@ -144,7 +175,7 @@ impl Project {
             manager_height,
             stacked,
             editor_first,
-        } = self.page_layouts[self.editor.active_tabpage()];
+        } = self.pages[self.active_page].layout;
         self.focus = focus;
         self.previous_focus = previous_focus;
         self.hidden_pane = hidden_pane;
@@ -155,48 +186,238 @@ impl Project {
     }
 
     /// Select page `index`, retaining the departing page's panes and editor view at `now`.
-    pub(super) fn select_page(&mut self, index: usize, now: f64) -> bool {
-        let previous = self.editor.active_tabpage();
-        if !self.editor.select_tabpage(index, now) {
+    pub(super) fn select_page(&mut self, index: usize, _now: f64) -> bool {
+        let previous = self.active_page;
+        if previous == index || index >= self.pages.len() {
             return false;
         }
-        self.page_layouts[previous] = self.page_layout();
+        self.pages[previous].layout = self.page_layout();
+        let old_editor = self.active_editor_id();
+        self.active_page = index;
+        self.previous_page = Some(previous);
+        self.install_editor(old_editor);
         self.restore_page_layout();
         true
     }
 
     /// Insert a page at `now` for an optional `path`, using the current layout with editor focus.
     pub(super) fn open_page(&mut self, path: Option<PathBuf>, now: f64) -> anyhow::Result<()> {
-        let previous = self.editor.active_tabpage();
+        let editor = self.new_editor(path, now)?;
+        let pane = self.allocate_editor(editor);
         let layout = self.page_layout();
-        if let Some(path) = path {
-            self.editor.open_tabpage(path, now)?;
-        } else {
-            self.editor.add_tabpage(now);
-        }
-        self.page_layouts[previous] = layout;
-        self.page_layouts.insert(
-            self.editor.active_tabpage(),
-            PageLayout {
-                focus: Focus::Editor,
-                previous_focus: None,
-                hidden_pane: layout.hidden_pane.filter(|&pane| pane != Focus::Editor),
-                ..layout
+        let next = self.active_page + 1;
+        self.pages.insert(
+            next,
+            EditorPage {
+                layout: PageLayout {
+                    focus: Focus::Editor,
+                    previous_focus: None,
+                    hidden_pane: layout.hidden_pane.filter(|&pane| pane != Focus::Editor),
+                    ..layout
+                },
+                splits: EditorSplits::new(pane),
             },
         );
-        self.restore_page_layout();
+        self.select_page(next, now);
         Ok(())
     }
 
     /// Close the active page at `now` and restore the neighboring page if one exists.
     pub(super) fn close_page(&mut self, now: f64) -> bool {
-        let previous = self.editor.active_tabpage();
-        if !self.editor.remove_tabpage(now) {
+        if self.pages.len() == 1 {
             return false;
         }
-        self.page_layouts.remove(previous);
-        self.restore_page_layout();
+        let closed = self.active_page;
+        let previous = self.previous_page;
+        let next = if closed + 1 < self.pages.len() {
+            closed + 1
+        } else {
+            closed - 1
+        };
+        self.select_page(next, now);
+        for id in self.pages.remove(closed).splits.ids() {
+            self.inactive_editors.remove(&id);
+        }
+        self.active_page -= usize::from(self.active_page > closed);
+        self.previous_page = previous
+            .filter(|&index| index != closed)
+            .map(|index| index - usize::from(index > closed))
+            .filter(|&index| index != self.active_page);
         true
+    }
+
+    /// Count the project's tabpages for the caption and tab commands.
+    pub(super) fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Return the current tabpage's zero-based caption index.
+    pub(super) fn active_page(&self) -> usize {
+        self.active_page
+    }
+
+    /// Return the previously selected tabpage, if it remains open.
+    pub(super) fn previous_page(&self) -> Option<usize> {
+        self.previous_page
+    }
+
+    /// Access the current page's split geometry and pane order.
+    pub(super) fn splits(&self) -> &EditorSplits {
+        &self.pages[self.active_page].splits
+    }
+
+    /// Change current split geometry without changing buffer ownership.
+    pub(super) fn splits_mut(&mut self) -> &mut EditorSplits {
+        &mut self.pages[self.active_page].splits
+    }
+
+    /// Count the editor panes on the current page, including compacted panes.
+    pub(super) fn split_count(&self) -> usize {
+        self.splits().ids().len()
+    }
+
+    /// Identify the editor currently receiving workspace commands.
+    pub(super) fn active_editor_id(&self) -> PaneId {
+        self.splits().active()
+    }
+
+    /// Read editor `id` from any page of this project.
+    pub(super) fn editor_by_id(&self, id: PaneId) -> Option<&EditorWindow> {
+        if id == self.active_editor_id() {
+            Some(&self.editor)
+        } else {
+            self.inactive_editors.get(&id)
+        }
+    }
+
+    /// Update editor `id` without changing which pane receives input.
+    pub(super) fn editor_by_id_mut(&mut self, id: PaneId) -> Option<&mut EditorWindow> {
+        if id == self.active_editor_id() {
+            Some(&mut self.editor)
+        } else {
+            self.inactive_editors.get_mut(&id)
+        }
+    }
+
+    /// Visit all editors in tabpage and split order for document-wide operations.
+    pub(super) fn editors(&self) -> impl Iterator<Item = (PaneId, &EditorWindow)> {
+        self.pages
+            .iter()
+            .flat_map(|page| page.splits.ids())
+            .filter_map(|id| self.editor_by_id(id).map(|editor| (id, editor)))
+    }
+
+    /// Visit the selected page's editors in split order for drawing and closing.
+    pub(super) fn page_editors(&self) -> impl Iterator<Item = (PaneId, &EditorWindow)> {
+        self.splits()
+            .ids()
+            .into_iter()
+            .filter_map(|id| self.editor_by_id(id).map(|editor| (id, editor)))
+    }
+
+    /// Resolve an asynchronous document result to its originating pane and buffer index.
+    pub(super) fn document_owner(&self, opening: u64) -> Option<(PaneId, usize)> {
+        self.editors().find_map(|(id, editor)| {
+            editor
+                .buffers()
+                .iter()
+                .position(|buffer| buffer.vim.doc.opening == opening)
+                .map(|index| (id, index))
+        })
+    }
+
+    /// Focus editor `id`, selecting its tabpage first if needed.
+    pub(super) fn focus_editor_by_id(&mut self, id: PaneId, now: f64) -> bool {
+        let Some(index) = self
+            .pages
+            .iter()
+            .position(|page| page.splits.ids().contains(&id))
+        else {
+            return false;
+        };
+        let switched = self.select_page(index, now);
+        let old = self.active_editor_id();
+        let changed = self.splits_mut().focus(id);
+        if changed {
+            self.install_editor(old);
+            if !switched && self.focus == Focus::Editor {
+                self.previous_focus = Some(Focus::Editor);
+            }
+        }
+        let focused = self.focus == Focus::Editor && self.hidden_pane != Some(Focus::Editor);
+        self.hidden_pane = self.hidden_pane.filter(|&pane| pane != Focus::Editor);
+        self.focus_pane(Focus::Editor);
+        switched || changed || !focused
+    }
+
+    /// Split the current editor along `axis` in `area`, optionally loading `path` at `now`.
+    /// A failed load or a layout with too little space leaves the previous state intact.
+    pub(super) fn open_split(
+        &mut self,
+        axis: SplitAxis,
+        path: Option<PathBuf>,
+        area: Rect,
+        now: f64,
+    ) -> anyhow::Result<bool> {
+        let editor = self.new_editor(path, now)?;
+        let old = self.active_editor_id();
+        let id = self.next_pane;
+        if !self.splits_mut().split(id, axis, true, area) {
+            return Ok(false);
+        }
+        self.allocate_editor(editor);
+        self.install_editor(old);
+        self.focus_pane(Focus::Editor);
+        Ok(true)
+    }
+
+    /// Close the focused split after its buffers have been resolved, restoring its neighbor.
+    pub(super) fn close_split(&mut self) -> bool {
+        let closed = self.active_editor_id();
+        if !self.splits_mut().close_active() {
+            return false;
+        }
+        self.install_editor(closed);
+        self.inactive_editors.remove(&closed);
+        true
+    }
+
+    /// Keep the focused split after the caller resolves all sibling buffers.
+    pub(super) fn only_split(&mut self) {
+        let active = self.active_editor_id();
+        for id in self.splits().ids().into_iter().filter(|&id| id != active) {
+            self.inactive_editors.remove(&id);
+        }
+        self.splits_mut().retain_active();
+    }
+
+    /// Build a clean editor around `path`, or fork just the current document into a new buffer.
+    fn new_editor(&self, path: Option<PathBuf>, now: f64) -> anyhow::Result<EditorWindow> {
+        if let Some(path) = path {
+            let mut editor = EditorWindow::new(Document::new(""));
+            editor.open(path, now)?;
+            Ok(editor)
+        } else {
+            Ok(EditorWindow::new(self.editor.vim().doc.fork()))
+        }
+    }
+
+    /// Assign a stable ID to a new editor before putting it in a page's tree.
+    fn allocate_editor(&mut self, editor: EditorWindow) -> PaneId {
+        let id = self.next_pane;
+        self.next_pane += 1;
+        self.inactive_editors.insert(id, editor);
+        id
+    }
+
+    /// Exchange the active editor with the pane just selected by the current page's tree.
+    fn install_editor(&mut self, previous: PaneId) {
+        let editor = self
+            .inactive_editors
+            .remove(&self.active_editor_id())
+            .expect("a selected editor is retained by its project");
+        let outgoing = std::mem::replace(&mut self.editor, editor);
+        self.inactive_editors.insert(previous, outgoing);
     }
 
     /// Focus `pane` and remember the old pane for Ctrl+w p.
@@ -292,15 +513,24 @@ pub(crate) struct WorkspaceTabs {
     pub(super) selected: usize,
     /// Invalidates the rendered strip and orders tab activations.
     pub(super) revision: u64,
+    /// Local Session store for directory projects.
+    sessions: session::ProjectSessions,
 }
 
 impl WorkspaceTabs {
-    /// Load explicit startup `paths` in order, or create a start page for an empty list.
+    /// Load the test fixture's startup `paths` without reading or writing local Sessions.
+    #[cfg(test)]
     pub(crate) fn new(paths: Vec<PathBuf>) -> Self {
+        Self::with_project_sessions(paths, false)
+    }
+
+    /// Open startup `paths` in order, restoring Sessions when `enabled` for the profile.
+    pub(crate) fn with_project_sessions(paths: Vec<PathBuf>, enabled: bool) -> Self {
         let mut tabs = Self {
             tabs: Vec::new(),
             selected: 0,
             revision: 0,
+            sessions: session::ProjectSessions::for_profile(enabled),
         };
         for (root, file) in paths.into_iter().map(project_path) {
             tabs.add(root, file);
@@ -392,6 +622,13 @@ impl WorkspaceTabs {
         self.tabs.iter().filter_map(Tab::project)
     }
 
+    /// Visit every dirty named buffer, including editors on inactive pages and projects.
+    pub(super) fn dirty_paths(&self) -> impl Iterator<Item = PathBuf> + '_ {
+        self.ordered()
+            .flat_map(Project::editors)
+            .flat_map(|(_, editor)| editor.dirty_paths())
+    }
+
     /// Visit projects for shared filesystem effects.
     pub(super) fn iter_mut(&mut self) -> impl Iterator<Item = &mut Project> {
         self.tabs.iter_mut().filter_map(Tab::project_mut)
@@ -415,7 +652,8 @@ impl WorkspaceTabs {
         if let Some(index) = self.project_index(&root) {
             return (index, false);
         }
-        let index = self.push(TabContent::Project(Box::new(Project::new(root, file))));
+        let project = self.sessions.open(root, file);
+        let index = self.push(TabContent::Project(Box::new(project)));
         (index, true)
     }
 
@@ -426,12 +664,10 @@ impl WorkspaceTabs {
             .map(|(index, _)| index)
     }
 
-    /// Find an editor-only tab displaying this file.
+    /// Find an editor-only tab retaining `path` in any of its panes.
     pub(super) fn file_index(&self, path: &Path) -> Option<usize> {
         self.indexed()
-            .find(|(_, tab)| {
-                tab.manager.is_none() && tab.editor.vim().doc.path.as_deref() == Some(path)
-            })
+            .find(|(_, tab)| tab.manager.is_none() && find_open_buffer(tab, path).is_some())
             .map(|(index, _)| index)
     }
 
@@ -443,17 +679,16 @@ impl WorkspaceTabs {
         let existing = self
             .indexed()
             .filter_map(|(tab, project)| {
-                let buffer = project
-                    .editor
-                    .buffers()
-                    .iter()
-                    .position(|buffer| buffer.vim.doc.path.as_deref() == Some(path))?;
-                let modified = project.editor.buffers()[buffer].vim.doc.modified();
-                Some((tab, buffer, modified))
+                let (pane, buffer, modified) = find_open_buffer(project, path)?;
+                Some((tab, pane, buffer, modified))
             })
-            .max_by_key(|&(tab, _, modified)| (modified, tab == self.selected));
-        let editor = if let Some((tab, buffer, _)) = existing {
-            EditorWindow::with_buffer(self.project_mut(tab).editor.take_buffer(buffer))
+            .max_by_key(|&(tab, _, _, modified)| (modified, tab == self.selected));
+        let editor = if let Some((tab, pane, buffer, _)) = existing {
+            let owner = self
+                .project_mut(tab)
+                .editor_by_id_mut(pane)
+                .expect("open editor is retained");
+            EditorWindow::with_buffer(owner.take_buffer(buffer))
         } else {
             EditorWindow::new(Document::open(path)?)
         };
@@ -473,7 +708,7 @@ impl WorkspaceTabs {
             target -= usize::from(index < target);
             self.tabs.remove(index).content
         } else {
-            TabContent::Project(Box::new(Project::new(root, None)))
+            TabContent::Project(Box::new(self.sessions.open(root, None)))
         };
         self.tabs[target].content = content;
         self.activate(target);
@@ -543,7 +778,7 @@ impl WorkspaceTabs {
         }
         debug_assert!(
             self.active_project()
-                .is_none_or(|project| !project.editor.modified())
+                .is_none_or(|project| project.editors().all(|(_, editor)| !editor.modified()))
         );
         self.tabs.remove(self.selected);
         if self.tabs.is_empty() {
@@ -560,7 +795,11 @@ impl WorkspaceTabs {
 
     /// Replace all resolved tabs with one fresh start page.
     fn close_all_tabs(&mut self) {
-        debug_assert!(self.ordered().all(|project| !project.editor.modified()));
+        debug_assert!(
+            self.ordered()
+                .flat_map(Project::editors)
+                .all(|(_, editor)| !editor.modified())
+        );
         self.tabs.clear();
         let start = self.add_start();
         self.activate(start);
@@ -576,16 +815,47 @@ impl WorkspaceTabs {
             .0
     }
 
-    /// Save buffer `index` from project `tab` to `path` or its filename and invalidate transfers.
+    /// Save buffer `index` in project `tab`'s focused editor to `path` or its filename.
+    #[cfg(test)]
     pub(super) fn save_buffer(
         &mut self,
         tab: usize,
         index: usize,
         path: Option<PathBuf>,
     ) -> anyhow::Result<()> {
+        let pane = self.project(tab).active_editor_id();
+        self.save_editor_buffer(tab, pane, index, path)
+    }
+
+    /// Save buffer `index` from editor `pane` in project `tab` and invalidate transfers.
+    /// If supplied, `path` cannot overwrite another open buffer's file by changing this buffer's name.
+    pub(super) fn save_editor_buffer(
+        &mut self,
+        tab: usize,
+        pane: usize,
+        index: usize,
+        path: Option<PathBuf>,
+    ) -> anyhow::Result<()> {
+        if let Some(path) = &path {
+            let target = path.canonicalize().unwrap_or_else(|_| path.clone());
+            let owner = self
+                .project(tab)
+                .editor_by_id(pane)
+                .expect("open editor is retained");
+            if owner.buffers()[index].vim.doc.path.as_ref() != Some(&target)
+                && self
+                    .ordered()
+                    .any(|project| find_open_buffer(project, &target).is_some())
+            {
+                anyhow::bail!(i18n::text("editor_close.path_open"));
+            }
+        }
         let project = self.project_mut(tab);
-        if let Some(path) = project.editor.save(index, path)? {
-            if project.manager.is_none() {
+        let editor = project
+            .editor_by_id_mut(pane)
+            .expect("open editor is retained");
+        if let Some(path) = editor.save(index, path)? {
+            if project.manager.is_none() && pane == project.active_editor_id() {
                 project.sync_file_root();
                 self.revision += 1;
             }
@@ -605,7 +875,13 @@ impl WorkspaceTabs {
         for project in self.iter_mut() {
             let file = project.manager.is_none();
             let previous = file.then(|| project.editor.vim().doc.path.clone());
-            project.editor.apply_path_changes(changes);
+            let panes = project.editors().map(|(pane, _)| pane).collect::<Vec<_>>();
+            for pane in panes {
+                project
+                    .editor_by_id_mut(pane)
+                    .expect("open editor is retained")
+                    .apply_path_changes(changes);
+            }
             if let Some(previous) = previous
                 && project.editor.vim().doc.path != previous
             {
@@ -615,6 +891,21 @@ impl WorkspaceTabs {
         }
         self.revision += u64::from(labels_changed);
     }
+}
+
+/// Find the pane and buffer index for `path`, preferring a dirty draft then the focused pane.
+fn find_open_buffer(project: &Project, path: &Path) -> Option<(PaneId, usize, bool)> {
+    project
+        .editors()
+        .filter_map(|(pane, editor)| {
+            let (index, buffer) = editor
+                .buffers()
+                .iter()
+                .enumerate()
+                .find(|(_, buffer)| buffer.vim.doc.path.as_deref() == Some(path))?;
+            Some((pane, index, buffer.vim.doc.modified()))
+        })
+        .max_by_key(|&(pane, _, dirty)| (dirty, pane == project.active_editor_id()))
 }
 
 /// Canonicalize a startup `path` and split a file argument into its root and initial file.
@@ -664,8 +955,25 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if target.closes_project() && !self.save_closing_project_sessions(target) {
+            self.warn_project_session_close(target, window, cx);
+            return;
+        }
+        self.finish_close_after_session(target, window, cx);
+    }
+
+    /// Release the confirmed close `target` after completing the Session write or warning.
+    fn finish_close_after_session(
+        &mut self,
+        target: CloseTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match target {
             CloseTarget::Editor => self.hide_pane(Focus::Editor),
+            CloseTarget::Split(pane) => self.finish_close_editor_split(pane, window, cx),
+            CloseTarget::Page => self.finish_close_editor_page(window, cx),
+            CloseTarget::OtherSplits => self.finish_only_editor_split(window, cx),
             CloseTarget::Buffer(id) => {
                 let now = self.scroll_epoch.elapsed().as_secs_f64();
                 if self.projects.active_mut().editor.remove_buffer_tab(id, now) {
@@ -715,25 +1023,22 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
-        // A file already open in a project keeps its shared document and page memberships.
-        let existing =
-            self.projects
-                .indexed()
-                .filter_map(|(index, project)| {
-                    project.manager.as_ref()?;
-                    let buffer =
-                        project.editor.buffers().iter().find(|buffer| {
-                            buffer.vim.doc.path.as_deref() == Some(path.as_path())
-                        })?;
-                    Some((index, buffer.vim.doc.modified()))
-                })
-                .max_by_key(|&(index, modified)| (modified, index == self.projects.selected));
-        if let Some((index, _)) = existing {
+        // Opening globally returns to an existing pane, preferring project drafts.
+        let existing = self
+            .projects
+            .indexed()
+            .filter_map(|(index, project)| {
+                let (pane, _, modified) = find_open_buffer(project, &path)?;
+                Some((index, pane, modified, project.manager.is_some()))
+            })
+            .max_by_key(|&(index, _, modified, is_project)| {
+                (is_project, modified, index == self.projects.selected)
+            });
+        if let Some((index, pane, _, _)) = existing {
             let now = self.scroll_epoch.elapsed().as_secs_f64();
             let project = self.projects.project_mut(index);
+            project.focus_editor_by_id(pane, now);
             project.editor.open(path, now)?;
-            project.hidden_pane = project.hidden_pane.filter(|&pane| pane != Focus::Editor);
-            project.focus_pane(Focus::Editor);
             project.status.clear();
             self.select_tab(index, window, cx);
             self.last_cursor_space = None;

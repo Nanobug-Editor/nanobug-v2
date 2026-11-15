@@ -2,16 +2,109 @@
 
 use super::{
     Workspace,
+    editor_splits::PaneId,
     layout::{Focus, ShellWindow, near_corner_controls},
 };
-use crate::grid::windows::editor::{EditorWindow, HeaderTarget};
+use crate::grid::windows::editor::{EditorWindow, HeaderTarget, MarkdownPreview};
 use gpui::{
-    ClickEvent, Context, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollEvent,
-    Window, px,
+    Bounds, ClickEvent, Context, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    ScrollEvent, Window, px,
 };
 use nanobug::animation::scroll::ScrollInput;
 
+/// Tracks Markdown links in the final painted preview and the current left-button gesture.
+#[derive(Default)]
+pub(super) struct MarkdownPointer {
+    /// Geometry for the frame currently shown to the user.
+    painted: Vec<PaintedMarkdownLinks>,
+    /// Source identity, destination and position at the start of a click.
+    pressed: Option<(u64, String, Point<Pixels>)>,
+    /// Whether the most recent render assigned the pointing-hand cursor.
+    hovering: bool,
+}
+
+/// A preview and the overlay bounds that can cover its links.
+struct PaintedMarkdownLinks {
+    /// Pane whose buffer produced the preview.
+    pane: PaneId,
+    /// Opening identity of the source buffer.
+    document: u64,
+    /// Layout used to paint this frame, including the fractional scroll position.
+    preview: MarkdownPreview,
+    /// Bounds of contextual overlays above the preview.
+    blockers: [Option<Bounds<Pixels>>; 3],
+}
+
 impl Workspace {
+    /// Publish the visible preview and its overlays. Return whether to paint a hand cursor.
+    pub(super) fn set_painted_markdown_preview(
+        &mut self,
+        previews: Vec<(PaneId, MarkdownPreview)>,
+        blockers: [Option<Bounds<Pixels>>; 3],
+        window: &Window,
+    ) -> bool {
+        self.markdown_pointer.painted = previews
+            .into_iter()
+            .filter_map(|(pane, preview)| {
+                let editor = self.projects.active_project()?.editor_by_id(pane)?;
+                Some(PaintedMarkdownLinks {
+                    pane,
+                    document: editor.vim().doc.opening,
+                    preview,
+                    blockers,
+                })
+            })
+            .collect();
+        let hovering =
+            window.is_window_hovered() && self.markdown_link_at(window.mouse_position()).is_some();
+        self.markdown_pointer.hovering = hovering;
+        hovering
+    }
+
+    /// Request a frame when the pointer enters or leaves a visible link.
+    pub(super) fn update_markdown_pointer(
+        &self,
+        position: Option<Point<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        let hovering = position.is_some_and(|position| self.markdown_link_at(position).is_some());
+        if hovering != self.markdown_pointer.hovering {
+            cx.notify();
+        }
+    }
+
+    /// Resolve a painted link at `position` when its preview still owns that area.
+    pub(super) fn markdown_link_at(&self, position: Point<Pixels>) -> Option<(u64, &str)> {
+        if self.modal_open() {
+            return None;
+        }
+        let (x, y) = self.metrics.cell(position);
+        let (pane, area) = self.editor_at(x, y)?;
+        let painted = self
+            .markdown_pointer
+            .painted
+            .iter()
+            .find(|painted| painted.pane == pane)?;
+        let editor = self.projects.active_project()?.editor_by_id(pane)?;
+        if editor.vim().doc.opening != painted.document
+            || !editor
+                .markdown_preview_area(area)?
+                .pixels(self.metrics)
+                .contains(&position)
+            || painted
+                .blockers
+                .iter()
+                .flatten()
+                .any(|bounds| bounds.contains(&position))
+        {
+            return None;
+        }
+        painted
+            .preview
+            .link_at(position)
+            .map(|link| (painted.document, link))
+    }
+
     /// Find the visible window whose corner controls are near the window-local pointer `position`.
     pub(super) fn corner_controls_at(&self, position: Point<Pixels>) -> Option<ShellWindow> {
         if self.small_modal_open() {
@@ -84,6 +177,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.markdown_pointer.pressed = None;
+        self.dismiss_definition_hover(cx);
+        if let Some((menu, ..)) = self.completion_menu(window)
+            && let Some(index) = menu.hit(event.position, self.metrics)
+        {
+            self.accept_completion_at(index, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        self.dismiss_completion(cx);
         if self.plugin_click(event, window, cx) {
             cx.stop_propagation();
             return;
@@ -139,10 +242,12 @@ impl Workspace {
             return;
         }
         let (x, y) = self.metrics.cell(event.position);
-        if let Some(target) = self.editor_header_target(x, y) {
+        if let Some((pane, target)) = self.editor_header_target(x, y) {
             match target {
                 HeaderTarget::Buffer(id) | HeaderTarget::Overflow(id) => {
-                    self.finish_editor_input(window, cx);
+                    if !self.focus_editor_pane(pane, window, cx) {
+                        self.finish_editor_input(window, cx);
+                    }
                     let now = self.scroll_epoch.elapsed().as_secs_f64();
                     let project = self.projects.active_mut();
                     project.editor.select_buffer(id, now);
@@ -151,11 +256,11 @@ impl Workspace {
                     self.last_cursor_space = None;
                     self.sync(window, cx);
                 }
-                HeaderTarget::Tabpage(index) => self.select_editor_page(index, window, cx),
             }
             cx.stop_propagation();
             return;
         }
+        let editor_hit = self.editor_at(x, y);
         let Some(project) = self.projects.active_project_mut() else {
             self.press_start_page(event, window, cx);
             cx.stop_propagation();
@@ -206,33 +311,49 @@ impl Workspace {
                 );
                 return;
             }
-        } else if self.layout.editor.contains(x, y) {
-            project.focus_pane(Focus::Editor);
-            if y == self.layout.editor.y || y == self.layout.editor.y + self.layout.editor.h - 1 {
+        } else if let Some((pane, area)) = editor_hit {
+            self.focus_editor_pane(pane, window, cx);
+            if y == area.y || y == area.y + area.h - 1 {
                 self.sync(window, cx);
                 return;
             }
-            project.editor.press(
-                event.position,
-                self.layout.editor,
-                self.metrics,
-                &self.spacing,
-            );
+            if self
+                .projects
+                .active()
+                .editor
+                .markdown_preview_area(area)
+                .is_some_and(|area| area.contains(x, y))
+            {
+                if event.click_count == 1
+                    && let Some((document, destination)) = self.markdown_link_at(event.position)
+                {
+                    self.markdown_pointer.pressed =
+                        Some((document, destination.to_owned(), event.position));
+                }
+            } else {
+                self.projects.active_mut().editor.press(
+                    event.position,
+                    area,
+                    self.metrics,
+                    &self.spacing,
+                );
+            }
         }
         self.sync(window, cx);
     }
 
     /// Identify a visible editor title entry at the same grid cells used to draw it.
-    fn editor_header_target(&self, x: usize, y: usize) -> Option<HeaderTarget> {
-        let area = self.layout.editor;
-        if y != area.y || !area.contains(x, y) {
+    fn editor_header_target(&self, x: usize, y: usize) -> Option<(PaneId, HeaderTarget)> {
+        let (pane, area) = self.editor_at(x, y)?;
+        if y != area.y {
             return None;
         }
         self.projects
             .active_project()?
-            .editor
+            .editor_by_id(pane)?
             .header(area, &self.spacing, self.layout.visible_cols)
             .target_at(x, y)
+            .map(|target| (pane, target))
     }
 
     /// Remove a file label on middle-click, while preserving Canvas input and modal ownership.
@@ -242,6 +363,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.dismiss_definition_hover(cx);
+        self.dismiss_completion(cx);
         if self.plugin_canvas_down(event) {
             cx.stop_propagation();
             return;
@@ -250,8 +373,10 @@ impl Workspace {
             return;
         }
         let (x, y) = self.metrics.cell(event.position);
-        if let Some(HeaderTarget::Buffer(id)) = self.editor_header_target(x, y) {
-            self.finish_editor_input(window, cx);
+        if let Some((pane, HeaderTarget::Buffer(id))) = self.editor_header_target(x, y) {
+            if !self.focus_editor_pane(pane, window, cx) {
+                self.finish_editor_input(window, cx);
+            }
             self.request_close(super::editor_close::CloseTarget::Buffer(id), window, cx);
             self.sync(window, cx);
             cx.stop_propagation();
@@ -265,6 +390,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.update_markdown_pointer(Some(event.position), cx);
         if self.file_picker.is_some() {
             if !self.help.is_open() && !self.small_modal_open() {
                 let area = self.file_picker_layout().preview_editor_area();
@@ -288,6 +414,7 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
+        let active_area = self.active_editor_area();
         let Some(project) = self.projects.active_project_mut() else {
             return;
         };
@@ -313,12 +440,10 @@ impl Workspace {
                 };
             }
         } else if project.editor.is_dragging() {
-            if !project.editor.drag(
-                event.position,
-                self.layout.editor,
-                self.metrics,
-                &self.spacing,
-            ) {
+            if !project
+                .editor
+                .drag(event.position, active_area, self.metrics, &self.spacing)
+            {
                 return;
             }
         } else {
@@ -348,7 +473,18 @@ impl Workspace {
         if let Some(project) = self.projects.active_project_mut() {
             native_drag |= project.editor.stop_drag();
         }
-        if !native_drag {
+        let pressed = self.markdown_pointer.pressed.take();
+        if !native_drag
+            && let Some((document, destination, position)) = pressed
+            && f32::from(position.x - event.position.x)
+                .abs()
+                .max(f32::from(position.y - event.position.y).abs())
+                < 4.
+            && self.markdown_link_at(event.position) == Some((document, destination.as_str()))
+        {
+            self.open_markdown_link(&destination, window, cx);
+            cx.stop_propagation();
+        } else if !native_drag {
             self.plugin_canvas_up(event, window, cx);
         }
     }
@@ -361,6 +497,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.dismiss_completion(cx);
         if self.small_modal_open() {
             cx.stop_propagation();
             return;
@@ -369,15 +506,33 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
+        if self.wheel_definition_hover(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         self.cursor
             .update(cx, |cursor, cx| cursor.activity(window, cx));
         let (x, y) = self.metrics.cell(event.position);
         let delta = event.delta.pixel_delta(px(self.metrics.cw));
         let horizontal = event.modifiers.shift || (delta.x != px(0.) && delta.y == px(0.));
+        let preview_delta = event.delta.pixel_delta(px(self.metrics.lh)).y;
+        if self.wheel_markdown_preview(event.position, preview_delta, horizontal, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.file_picker.is_none()
+            && !self.help.is_open()
+            && let Some((pane, area)) = self.editor_at(x, y)
+            && pane != self.projects.active().active_editor_id()
+        {
+            self.wheel_inactive_editor(pane, area, event, horizontal, window, cx);
+            cx.stop_propagation();
+            return;
+        }
         let horizontal_area = if self.file_picker.is_some() {
             EditorWindow::body(self.file_picker_layout().preview_editor_area())
         } else {
-            self.layout.editor
+            self.active_editor_area()
         };
         if !self.help.is_open()
             && horizontal
@@ -433,7 +588,7 @@ impl Workspace {
         }
         let inputs = if self.layout.tree.contains(x, y) {
             [wheel, ScrollInput::Advance, ScrollInput::Advance]
-        } else if self.layout.editor.contains(x, y)
+        } else if self.active_editor_area().contains(x, y)
             && self.projects.active().editor.composition().is_empty()
         {
             [ScrollInput::Advance, wheel, ScrollInput::Advance]
@@ -441,5 +596,46 @@ impl Workspace {
             return;
         };
         self.scroll_frame(inputs, window, cx);
+    }
+
+    /// Scroll an unfocused editor's own viewport while keeping keyboard input in the active pane.
+    fn wheel_inactive_editor(
+        &mut self,
+        pane: PaneId,
+        area: crate::grid::render::Rect,
+        event: &ScrollEvent,
+        horizontal: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = self
+            .projects
+            .active_mut()
+            .editor_by_id_mut(pane)
+            .expect("visible editor");
+        let now = self.scroll_epoch.elapsed().as_secs_f64();
+        let inputs = if horizontal {
+            let delta = event.delta.pixel_delta(px(self.metrics.cw));
+            let delta = if delta.x != px(0.) { delta.x } else { delta.y };
+            let columns = editor.wheel_columns(f32::from(delta) / self.metrics.cw);
+            [
+                ScrollInput::Advance,
+                ScrollInput::Wheel(columns.saturating_neg()),
+            ]
+        } else {
+            self.wheel +=
+                f32::from(event.delta.pixel_delta(px(self.metrics.lh)).y) / self.metrics.lh;
+            let rows = self.wheel.trunc() as isize;
+            self.wheel -= rows as f32;
+            [
+                ScrollInput::Wheel(rows.saturating_neg()),
+                ScrollInput::Advance,
+            ]
+        };
+        let (changed, _, _) = editor.track_view(area, false, &self.spacing, inputs, now);
+        if changed {
+            self.refresh_panels(cx);
+        }
+        self.scroll_frame([ScrollInput::Advance; 3], window, cx);
     }
 }

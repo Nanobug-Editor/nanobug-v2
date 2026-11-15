@@ -1,6 +1,9 @@
 //! Exercise the sequence popup through the native workspace keyboard dispatcher.
 
+mod markdown;
+
 use super::super::{Workspace, layout::Focus, native_test};
+use crate::grid::windows::editor::MarkdownViewMode;
 use anyhow::{Context as _, Result, ensure};
 use gpui::{AppContext, Context, KeyDownEvent, Keystroke, Window, px, size};
 use nanobug::plugins::session::Options;
@@ -72,6 +75,130 @@ fn change_dpi(window: &Window, dpi: usize) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The native dispatcher changes Markdown views only while the Markdown editor owns input.
+#[test]
+#[ignore = "requires the Windows DirectWrite and DirectX renderer"]
+fn native_markdown_leader_scopes_the_view_to_the_focused_editor() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let project = temp.path().join("project");
+    fs::create_dir(&project)?;
+    let mut original = String::from(concat!(
+        "# Markdown preview\n\n",
+        "**Bold text**, <em>HTML emphasis</em>, and `inline code`.\n\n",
+        "## Checklist\n\n",
+        "- [x] GitHub-style task list\n",
+        "- [ ] Another item\n\n",
+        "| View | Key |\n| --- | --- |\n| Edit + Preview | `a` |\n| Preview only | `p` |\n\n",
+        "> Preview content scrolls independently of the Markdown source.\n\n",
+        "```rust\nlet preview = true;\n```\n\n",
+    ));
+    original.push_str(&"A paragraph below the first preview page.\n\n".repeat(50));
+    fs::write(project.join("README.md"), &original)?;
+    let plain_file = project.join("plain.txt");
+    fs::write(&plain_file, "Plain text")?;
+    let options = Options::take(
+        &mut vec![
+            "--plugin-profile".into(),
+            temp.path().join("profile").into_os_string(),
+            "--no-plugins".into(),
+        ],
+        temp.path(),
+    )?;
+    native_test::run_async_visible(
+        project,
+        options,
+        |_| {},
+        async move |handle, app| {
+            let mode =
+                |workspace: &Workspace| workspace.projects.active().editor.markdown_view_mode();
+            let shows_markdown = |workspace: &Workspace| {
+                workspace
+                    .active_sequence_hint()
+                    .is_some_and(|hint| hint.rows().iter().any(|(key, _, _)| *key == "m"))
+            };
+            app.update(|app| {
+                handle.update(app, |workspace, window, cx| -> Result<()> {
+                    workspace.sync(window, cx);
+                    ensure!(mode(workspace) == Some(MarkdownViewMode::Split));
+                    for key in ["space", "m", "e"] {
+                        press(workspace, key, window, cx)?;
+                    }
+                    ensure!(mode(workspace) == Some(MarkdownViewMode::Edit));
+                    press(workspace, "space", window, cx)?;
+                    ensure!(shows_markdown(workspace));
+                    press(workspace, "m", window, cx)?;
+                    let hint = workspace.active_sequence_hint().context("Markdown hint")?;
+                    ensure!(
+                        hint.rows().iter().map(|row| row.0).collect::<Vec<_>>() == ["a", "e", "p"]
+                    );
+                    press(workspace, "a", window, cx)?;
+                    ensure!(mode(workspace) == Some(MarkdownViewMode::Split));
+                    Ok(())
+                })
+            })??;
+            if let Some(capture) = std::env::var_os("NANOBUG_MARKDOWN_TEST_CAPTURE") {
+                let split = app.update_window(handle.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.render_to_image()
+                })??;
+                split.save(capture)?;
+            }
+            app.update(|app| {
+                handle.update(app, |workspace, window, cx| -> Result<()> {
+                    for key in ["space", "m", "p"] {
+                        press(workspace, key, window, cx)?;
+                    }
+                    ensure!(mode(workspace) == Some(MarkdownViewMode::Preview));
+                    Ok(())
+                })
+            })??;
+            app.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))?;
+            app.update(|app| {
+                handle.update(app, |workspace, window, cx| -> Result<()> {
+                    let caret = workspace.projects.active().editor.vim().doc.cursor;
+                    for key in ["i", "o", "x", "pagedown"] {
+                        press(workspace, key, window, cx)?;
+                    }
+                    let editor = &workspace.projects.active().editor;
+                    ensure!(editor.markdown_scroll_active(workspace.layout.editor));
+                    ensure!(editor.vim().doc.cursor == caret);
+                    for key in ["g", "g", "end", "home"] {
+                        press(workspace, key, window, cx)?;
+                    }
+                    ensure!(!workspace.accepts_native_text());
+                    ensure!(workspace.projects.active().editor.vim().doc.text == original);
+
+                    for key in ["space", "m", "e", "ctrl-h"] {
+                        press(workspace, key, window, cx)?;
+                    }
+                    ensure!(mode(workspace) == Some(MarkdownViewMode::Edit));
+                    ensure!(workspace.projects.active().focus == Focus::Manager);
+                    press(workspace, "space", window, cx)?;
+                    ensure!(!shows_markdown(workspace));
+                    press(workspace, "m", window, cx)?;
+                    ensure!(workspace.active_sequence_hint().is_none());
+
+                    press(workspace, "ctrl-l", window, cx)?;
+                    let now = workspace.scroll_epoch.elapsed().as_secs_f64();
+                    workspace
+                        .projects
+                        .active_mut()
+                        .editor
+                        .open(plain_file, now)?;
+                    workspace.sync(window, cx);
+                    ensure!(mode(workspace).is_none());
+                    press(workspace, "space", window, cx)?;
+                    ensure!(!shows_markdown(workspace));
+                    press(workspace, "m", window, cx)?;
+                    ensure!(workspace.active_sequence_hint().is_none());
+                    Ok(())
+                })
+            })??;
+            Ok(())
+        },
+    )
 }
 
 /// Showing the hint leaves the visible editor text at its original pixel positions.
@@ -317,14 +444,18 @@ fn native_key_sequences_update_the_workspace_hint() -> Result<()> {
                     );
                     ensure!(!workspace.accepts_native_text());
                     press(workspace, "tab", window, cx)?;
-                    ensure!(workspace.projects.active().editor.tabpage_count() == 2);
-                    ensure!(workspace.projects.active().editor.active_tabpage() == 1);
+                    ensure!(workspace.projects.active().page_count() == 2);
+                    ensure!(workspace.projects.active().active_page() == 1);
                     ensure!(workspace.active_sequence_hint().is_none());
-                    for _ in 0..2 {
+                    for closing_draft in [true, false] {
                         for key in ["space", "tab", "d"] {
                             press(workspace, key, window, cx)?;
                         }
-                        ensure!(workspace.projects.active().editor.tabpage_count() == 1);
+                        if closing_draft {
+                            ensure!(workspace.editor_close.is_some(), "closing an unsaved page");
+                            press(workspace, "n", window, cx)?;
+                        }
+                        ensure!(workspace.projects.active().page_count() == 1);
                         ensure!(workspace.active_sequence_hint().is_none());
                     }
 

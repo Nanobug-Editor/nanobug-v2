@@ -61,6 +61,7 @@ pub(super) const G_MOTIONS: &[Continuation] = &[
 
 /// Additional Normal and Visual g commands.
 pub(super) const G_CONTINUATIONS: &[Continuation] = &[
+    ("O", "vim_g.outline", false),
     ("u", "vim_g.lower", true),
     ("U", "vim_g.upper", true),
     ("~", "vim_g.swap", true),

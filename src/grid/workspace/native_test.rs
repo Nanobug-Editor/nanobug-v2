@@ -16,6 +16,27 @@ pub(super) fn run_async(
     initialize: impl FnOnce(&mut Workspace) + 'static,
     test: impl AsyncFnOnce(WindowHandle<Workspace>, &mut AsyncApp) -> Result<()> + 'static,
 ) -> Result<()> {
+    run_async_with_visibility(project, options, initialize, test, false)
+}
+
+/// Let Windows deliver real client geometry for tests that assert painted positions.
+pub(super) fn run_async_visible(
+    project: PathBuf,
+    options: Options,
+    initialize: impl FnOnce(&mut Workspace) + 'static,
+    test: impl AsyncFnOnce(WindowHandle<Workspace>, &mut AsyncApp) -> Result<()> + 'static,
+) -> Result<()> {
+    run_async_with_visibility(project, options, initialize, test, true)
+}
+
+/// Build the same native workspace with an optionally visible, unfocused window.
+fn run_async_with_visibility(
+    project: PathBuf,
+    options: Options,
+    initialize: impl FnOnce(&mut Workspace) + 'static,
+    test: impl AsyncFnOnce(WindowHandle<Workspace>, &mut AsyncApp) -> Result<()> + 'static,
+    show: bool,
+) -> Result<()> {
     use gpui::Platform;
 
     let settings_dir = tempfile::tempdir()?;
@@ -47,7 +68,7 @@ pub(super) fn run_async(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 focus: false,
-                show: false,
+                show,
                 ..WindowOptions::default()
             },
             move |window, cx| {
@@ -86,5 +107,5 @@ pub(super) fn run_async(
     result
         .borrow_mut()
         .take()
-        .context("GPUI did not open the hidden workspace")?
+        .context("GPUI did not open the native test workspace")?
 }

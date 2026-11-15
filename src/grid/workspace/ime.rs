@@ -4,7 +4,10 @@
 mod windows;
 
 use super::{Workspace, layout::Focus};
-use crate::{grid::windows::start::StartPage, ui::ime::Composition};
+use crate::{
+    grid::windows::{editor::MarkdownViewMode, start::StartPage},
+    ui::ime::Composition,
+};
 use gpui::{
     Bounds, ClipboardItem, Context, EntityInputHandler, Pixels, Point, UTF16Selection, Window, px,
     size,
@@ -74,6 +77,9 @@ impl Workspace {
         } else {
             self.projects
                 .active_project()
+                .filter(|project| {
+                    project.editor.markdown_view_mode() != Some(MarkdownViewMode::Preview)
+                })
                 .map(|project| project.editor.composition())
         }
     }
@@ -115,6 +121,9 @@ impl Workspace {
         } else {
             self.projects
                 .active_project_mut()
+                .filter(|project| {
+                    project.editor.markdown_view_mode() != Some(MarkdownViewMode::Preview)
+                })
                 .map(|project| project.editor.composition_mut())
         }
     }
@@ -143,7 +152,9 @@ impl Workspace {
                 .is_some_and(|picker| picker.filter_focused())
         } else {
             self.projects.active_project().is_some_and(|project| {
-                project.focus == Focus::Editor && project.editor.vim().accepts_text()
+                project.focus == Focus::Editor
+                    && project.editor.markdown_view_mode() != Some(MarkdownViewMode::Preview)
+                    && project.editor.vim().accepts_text()
             })
         }
     }
@@ -229,6 +240,10 @@ impl EntityInputHandler for Workspace {
             && let Some(composition) = self.composition_mut()
         {
             composition.mark(range, text, selection);
+            // Keep candidate navigation with the OS while it owns a preedit.
+            if !text.is_empty() {
+                self.dismiss_completion(cx);
+            }
             self.trace_plugin_preedit(text.encode_utf16().count());
             #[cfg(feature = "plugin-probe")]
             if self.probe_has_focus()
@@ -299,7 +314,7 @@ impl EntityInputHandler for Workspace {
             && let Some(composition) = self.composition_mut()
         {
             composition.clear();
-            self.commit_text(&text, window, cx);
+            self.commit_pasted_text(&text, window, cx);
         }
     }
 }

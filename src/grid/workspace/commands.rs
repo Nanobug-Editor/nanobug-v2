@@ -20,7 +20,12 @@ impl Workspace {
     /// Open `path` in the current project or in its own standalone tab.
     pub(super) fn open(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let path = path.canonicalize().unwrap_or(path);
-        if !self.projects.manager_available() || self.projects.file_index(&path).is_some() {
+        if !self
+            .projects
+            .active_project()
+            .is_some_and(|project| project.split_count() > 1)
+            && (!self.projects.manager_available() || self.projects.file_index(&path).is_some())
+        {
             if let Err(error) = self.open_standalone_file(path, window, cx) {
                 self.set_status(format!("{error:#}"));
             }
@@ -93,14 +98,14 @@ impl Workspace {
             }
             Action::TabNew(file) => self.open_editor_page(file, window, cx),
             Action::TabClose => {
-                let now = self.scroll_epoch.elapsed().as_secs_f64();
-                if self.projects.active_mut().close_page(now) {
-                    self.projects.active_mut().status.clear();
-                    self.reset_tab_view(window, cx);
+                if self.projects.active().page_count() > 1 {
+                    self.finish_editor_input(window, cx);
+                    self.request_close(CloseTarget::Page, window, cx);
                 } else {
                     self.set_status(i18n::text("editor.last_tabpage").into());
                 }
             }
+            Action::Split { stacked, file } => self.open_editor_split(stacked, file, window, cx),
             Action::BracketBuffer {
                 forward,
                 edge,
@@ -137,6 +142,9 @@ impl Workspace {
             }
             Action::SaveClose => self.save_with_plugins(None, true, window, cx),
             Action::Format(selection) => self.manual_format(selection, window, cx),
+            Action::SqlDialect { buffer_only, name } => {
+                self.set_sql_dialect(buffer_only, name, window, cx);
+            }
             Action::CancelFormat => self.cancel_format(window, cx),
             Action::UndoPlugin => self.undo_plugin_edits(window, cx),
             Action::PluginComplete => {
@@ -148,6 +156,7 @@ impl Workspace {
             Action::PluginDefinition => {
                 self.plugin_language(nanobug::plugins::package::Provider::Definition, window, cx)
             }
+            Action::PluginHover => self.plugin_definition_hover(window, cx),
             Action::PluginOutline => self.plugin_outline(window, cx),
             Action::PluginFold => self.plugin_fold(window, cx),
             Action::PluginCommand(id) => self.plugin_command_by_id(&id, window, cx),
@@ -158,8 +167,27 @@ impl Workspace {
                     self.set_status(i18n::text("editor.appearance_usage").into());
                 }
             }
-            Action::Close(false) => self.request_close(CloseTarget::Quit, window, cx),
-            Action::Close(true) => window.remove_window(),
+            Action::Close(force) => {
+                let project = self.projects.active();
+                if project.split_count() > 1 && project.focus == Focus::Editor {
+                    if force {
+                        self.finish_close_editor_split(project.active_editor_id(), window, cx);
+                    } else {
+                        self.close_editor_split(None, window, cx);
+                    }
+                } else if force {
+                    self.finish_close(CloseTarget::Quit, window, cx);
+                } else {
+                    self.request_close(CloseTarget::Quit, window, cx);
+                }
+            }
+            Action::QuitAll(force) => {
+                if force {
+                    self.finish_close(CloseTarget::Quit, window, cx);
+                } else {
+                    self.request_close(CloseTarget::Quit, window, cx);
+                }
+            }
             Action::Filter { range, command } => self.filter_lines(range, command, window, cx),
         }
     }
@@ -195,11 +223,10 @@ impl Workspace {
         if let Some(project) = self.projects.active_project()
             && project.manager.is_some()
         {
-            let editor = &project.editor;
             if let Some(index) = tab_destination(
-                editor.active_tabpage(),
-                editor.tabpage_count(),
-                editor.previous_tabpage(),
+                project.active_page(),
+                project.page_count(),
+                project.previous_page(),
                 direction,
                 count,
             ) {
@@ -230,7 +257,7 @@ impl Workspace {
     ) {
         if self.modal_open()
             || self.projects.active_project().is_none_or(|project| {
-                index == project.editor.active_tabpage() || index >= project.editor.tabpage_count()
+                index == project.active_page() || index >= project.page_count()
             })
         {
             return;
@@ -331,20 +358,15 @@ impl Workspace {
                 view.update(cx, |workspace, cx| {
                     let mut changed_path = None;
                     for project in workspace.projects.iter_mut() {
-                        let Some(index) = project
-                            .editor
-                            .buffers()
-                            .iter()
-                            .position(|buffer| buffer.id == id)
-                        else {
+                        let Some((pane, index)) = project.editors().find_map(|(pane, editor)| {
+                            editor.buffer_index(id).map(|index| (pane, index))
+                        }) else {
                             continue;
                         };
+                        let editor = project.editor_by_id_mut(pane).expect("retained editor");
                         project.status = match result {
-                            Ok(output)
-                                if project.editor.buffers()[index].vim.doc.revision == revision =>
-                            {
-                                changed_path = project
-                                    .editor
+                            Ok(output) if editor.buffers()[index].vim.doc.revision == revision => {
+                                changed_path = editor
                                     .edit_buffer(index, |vim, _| {
                                         vim.apply_filter(range, &output);
                                         nanobug::vim::Action::None
@@ -427,7 +449,7 @@ impl Workspace {
             if page.picker.take().is_some() {
                 page.status.clear();
             }
-        } else {
+        } else if !self.close_editor_split(None, window, cx) {
             self.close_grid_window(ShellWindow::Pane(self.projects.active().focus), window, cx);
         }
         self.sync(window, cx);

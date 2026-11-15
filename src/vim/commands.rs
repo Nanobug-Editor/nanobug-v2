@@ -42,12 +42,28 @@ pub enum Action {
     TabNew(Option<String>),
     /// Close the current project tabpage.
     TabClose,
-    /// Close the app, optionally discarding unsaved buffers.
+    /// Open another editor window in the current tabpage.
+    Split {
+        /// Place the new editor above or below the current editor when true.
+        stacked: bool,
+        /// File to open in the split, or the current file when omitted.
+        file: Option<String>,
+    },
+    /// Close the active editor, optionally discarding its unsaved buffers.
     Close(bool),
-    /// Save the active file, then request closing the app.
+    /// Quit the application, optionally discarding every unsaved buffer.
+    QuitAll(bool),
+    /// Save the active file, then request closing its editor.
     SaveClose,
     /// Format the current document through its selected plugin provider.
     Format(Option<Range<usize>>),
+    /// Select the project SQL dialect or override it for the current buffer.
+    SqlDialect {
+        /// An Ex bang limits the selection to the open buffer.
+        buffer_only: bool,
+        /// Manifest ID, `auto` to reset, or empty for the command usage.
+        name: String,
+    },
     /// Cancel the current manual format request.
     CancelFormat,
     UndoPlugin,
@@ -55,6 +71,8 @@ pub enum Action {
     PluginDiagnose,
     /// Find the definition of the symbol at the cursor.
     PluginDefinition,
+    /// Show the signature, type and documentation for the symbol at the cursor.
+    PluginHover,
     /// Show the document symbols contributed by the active language plugin.
     PluginOutline,
     /// Toggle the fold at the cursor in the current editor viewport.
@@ -137,7 +155,12 @@ impl Vim {
                         return Action::None;
                     }
                     let action = self.ex(&command, selection);
-                    if self.g.ex_mode && !matches!(&action, Action::Close(_) | Action::SaveClose) {
+                    if self.g.ex_mode
+                        && !matches!(
+                            &action,
+                            Action::Close(_) | Action::QuitAll(_) | Action::SaveClose
+                        )
+                    {
                         self.open_prompt(':', 1);
                     }
                     return action;
@@ -195,12 +218,18 @@ impl Vim {
             "w" | "write" | "w!" | "write!" => {
                 Action::Save((!args.is_empty()).then(|| args.into()))
             }
-            "q" | "quit" | "qa" | "qall" => Action::Close(false),
-            "q!" | "quit!" | "qa!" | "qall!" => Action::Close(true),
+            "q" | "quit" => Action::Close(false),
+            "q!" | "quit!" => Action::Close(true),
+            "qa" | "qall" => Action::QuitAll(false),
+            "qa!" | "qall!" => Action::QuitAll(true),
             "wq" => Action::SaveClose,
             "x" | "exit" if self.doc.modified() => Action::SaveClose,
             "x" | "exit" => Action::Close(false),
             "format" => Action::Format(selection),
+            "sqldialect" | "sqldialect!" => Action::SqlDialect {
+                buffer_only: name == "sqldialect!",
+                name: args.to_ascii_lowercase(),
+            },
             "formatcancel" => Action::CancelFormat,
             "undo-plugin" => Action::UndoPlugin,
             "complete" => Action::PluginComplete,
@@ -213,10 +242,44 @@ impl Vim {
             "e" | "edit" if !args.is_empty() => Action::Open(args.into()),
             "tabnew" | "tabedit" => Action::TabNew((!args.is_empty()).then(|| args.into())),
             "tabclose" if args.is_empty() => Action::TabClose,
+            "sp" | "split" | "vs" | "vsplit" => Action::Split {
+                stacked: matches!(name, "sp" | "split"),
+                file: (!args.is_empty()).then(|| args.into()),
+            },
             _ => {
                 self.message = i18n::format("editor.unsupported_command", &[("command", &text)]);
                 Action::None
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::Document;
+
+    /// Preserve the optional filename after either form of a split command.
+    #[test]
+    fn split_commands_keep_axis_and_filename() {
+        let mut vim = Vim::new(Document::new(""));
+        for name in ["sp", "split"] {
+            assert_eq!(
+                vim.ex(name, None),
+                Action::Split {
+                    stacked: true,
+                    file: None
+                },
+            );
+        }
+        for name in ["vs", "vsplit"] {
+            assert_eq!(
+                vim.ex(&format!("{name}  another file.txt"), None),
+                Action::Split {
+                    stacked: false,
+                    file: Some("another file.txt".into())
+                },
+            );
         }
     }
 }

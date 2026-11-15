@@ -5,7 +5,9 @@
 mod alt_escape;
 mod commands;
 mod dpi;
+mod editing_panes;
 mod editor_close;
+mod editor_splits;
 mod explorer;
 mod file_picker;
 mod frames;
@@ -14,6 +16,7 @@ mod keyboard;
 mod language;
 mod layout;
 mod leader_hint;
+mod markdown;
 #[cfg(all(test, windows))]
 mod native_test;
 mod plugins;
@@ -31,6 +34,7 @@ mod window_keys;
 use crate::grid::{
     render::{Cursor, Metrics, Panel, PopupBackdrop, Rect},
     windows::{
+        editor::MarkdownCache,
         help::HelpWindow,
         start::{RemoveProject, StartPage},
     },
@@ -83,7 +87,7 @@ pub(crate) struct Workspace {
     language_selection: Option<Locale>,
     /// Retained choices positioned between the language picker's two half-row gaps.
     language_list: Entity<Panel>,
-    /// Cached cells for key sequence hints, language picker chrome or a confirmation dialog.
+    /// Cached cells for workspace popup chrome.
     popup_panel: Entity<Panel>,
     /// Opening timer and visibility of the current key sequence hint.
     hint_delay: HintDelay,
@@ -116,6 +120,12 @@ pub(crate) struct Workspace {
     panels: [Entity<Panel>; 3],
     /// Independently clipped file rows, line numbers and text, in draw order.
     bodies: [Entity<Panel>; 3],
+    /// Retained render layers and preview caches for the other visible editors.
+    inactive_editor_panels: Vec<frames::EditorPanePanels>,
+    /// UI-thread text and image layout for the last rendered Markdown document.
+    markdown_cache: MarkdownCache,
+    /// Hover and click state for the preview links painted in this window.
+    markdown_pointer: pointer::MarkdownPointer,
     /// One label painted above both panes when the selected name overflows Explorer.
     tree_name_preview: Entity<Panel>,
     /// Preview bounds in grid cells before applying Explorer's fractional scroll offset.
@@ -164,6 +174,7 @@ impl Workspace {
         let (metrics, spacing) = dpi::measure(window, &glyphs, appearance);
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
+        Self::start_project_sessions(&projects, window, cx);
         #[cfg(windows)]
         Self::install_caption_tabs(window, cx);
         let weak = cx.entity().downgrade();
@@ -184,6 +195,9 @@ impl Workspace {
                 }
                 if workspace.begin_close(CloseTarget::Quit) {
                     workspace.sync(window, cx);
+                    false
+                } else if !workspace.save_closing_project_sessions(CloseTarget::Quit) {
+                    workspace.warn_project_session_close(CloseTarget::Quit, window, cx);
                     false
                 } else {
                     true
@@ -262,6 +276,9 @@ impl Workspace {
                 cx.new(|_| Panel::new(metrics)),
                 cx.new(|_| Panel::new(metrics)),
             ],
+            inactive_editor_panels: Vec::new(),
+            markdown_cache: MarkdownCache::default(),
+            markdown_pointer: pointer::MarkdownPointer::default(),
             tree_name_preview: cx.new(|_| Panel::new(metrics)),
             tree_name_preview_rect: None,
             scroll_epoch: Instant::now(),

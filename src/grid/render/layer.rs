@@ -22,12 +22,22 @@ impl GridLayer {
         fraction: f32,
         metrics: Metrics,
     ) -> Self {
-        let clip = rect.pixels(metrics);
+        Self::scrolled_bounds(panel, rect.pixels(metrics), fraction, metrics.lh)
+    }
+
+    /// Shift `panel` by `fraction` of `row_height` through the window-local `clip`.
+    /// The panel retains one extra row below that viewport.
+    pub(in crate::grid) fn scrolled_bounds(
+        panel: &Entity<Panel>,
+        clip: Bounds<Pixels>,
+        fraction: f32,
+        row_height: f32,
+    ) -> Self {
         Self {
             panel: panel.clone(),
             bounds: Bounds::new(
-                clip.origin - point(px(0.), px(fraction * metrics.lh)),
-                size(clip.size.width, px((rect.h + 1) as f32 * metrics.lh)),
+                clip.origin - point(px(0.), px(fraction * row_height)),
+                size(clip.size.width, clip.size.height + px(row_height)),
             ),
             clip: Some(clip),
         }

@@ -21,6 +21,30 @@ impl EditorWindow {
     ) -> (bool, f32, f32) {
         let [rows, columns] = inputs;
         let text = self.text_area(area);
+        if self.markdown_view_mode() == Some(super::MarkdownViewMode::Preview) {
+            return (false, 0., 0.);
+        }
+        let source_request = match rows {
+            ScrollInput::Wheel(delta) if self.source_follows_markdown_preview(area) => {
+                let top = self.buffer().scroll.target();
+                let maximum = self.vim().doc.display_rows().saturating_sub(text.h.max(1));
+                top.saturating_add_signed(delta).min(maximum) != top
+            }
+            ScrollInput::Wheel(_) | ScrollInput::Position(_) | ScrollInput::PositionWithTail(_) => {
+                true
+            }
+            _ => false,
+        };
+        if source_request
+            || self
+                .buffer()
+                .markdown
+                .preview_caret
+                .is_some_and(|caret| caret != self.vim().doc.cursor)
+        {
+            self.markdown_source_takes_scroll();
+        }
+        let preview_leads = self.source_follows_markdown_preview(area);
         let composition = if focused {
             self.composition.text.as_str()
         } else {
@@ -30,10 +54,13 @@ impl EditorWindow {
         let before = (buffer.scroll.first_cell(), buffer.columns.first_cell());
         let row = (!matches!(buffer.vim.mode, Mode::Command | Mode::Search))
             .then(|| buffer.vim.doc.display_row(buffer.cursor_row()));
-        let (next, mut row_delta) =
+        let (next, mut row_delta) = if preview_leads {
+            (row, 0.)
+        } else {
             buffer
                 .scroll
-                .track_rows(rows, row, text.h, buffer.vim.doc.display_rows(), now);
+                .track_rows(rows, row, text.h, buffer.vim.doc.display_rows(), now)
+        };
         let moved = next != row;
         let next = next.map(|row| buffer.vim.doc.document_row(row));
         if let Some(row) = next.filter(|_| moved) {
@@ -95,15 +122,20 @@ impl EditorWindow {
     ) -> [GridLayer; 2] {
         let buffer = &self.buffers[self.active];
         let body = self.text_area(area);
-        let gutter = Self::body(area);
+        let source = self.source_body(area);
         let gutter = Rect {
-            w: body.x - gutter.x,
+            w: body.x - source.x,
             h: body.h,
-            ..gutter
+            ..source
         };
         let fraction = buffer.scroll.fraction();
         let mut text = GridLayer::scrolled(text, body, fraction, metrics);
         if body.w > 0 {
+            // Leave half the divider-side gap clear beside the tint, including the rule itself.
+            if let Some(clip) = &mut text.clip {
+                let divider_padding = source.x + source.w - (body.x + body.w);
+                clip.size.width += px(divider_padding as f32 * metrics.cw * 0.5);
+            }
             text.bounds.origin.x -= px(buffer.text_displacement() * metrics.cw);
             text.bounds.size.width +=
                 px((buffer.left_padding() + TEXT_OVERSCAN) as f32 * metrics.cw);

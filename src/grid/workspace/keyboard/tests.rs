@@ -19,6 +19,7 @@ fn shell_shortcut(
         LeaderAvailability {
             manager: true,
             help: true,
+            markdown: false,
             close_only: false,
             choosing_file: false,
             grid_window: true,
@@ -165,6 +166,7 @@ fn leader_letter_case_requires_shift() {
             LeaderAvailability {
                 manager: true,
                 help: true,
+                markdown: false,
                 close_only: false,
                 choosing_file: false,
                 grid_window: true,
@@ -213,6 +215,7 @@ fn question_mark_requires_the_leader_and_a_help_target() {
                 LeaderAvailability {
                     manager: false,
                     help,
+                    markdown: false,
                     close_only: false,
                     choosing_file: false,
                     grid_window: help,
@@ -268,6 +271,7 @@ fn popup_leader_only_closes_the_popup() {
     let availability = LeaderAvailability {
         manager: true,
         help: true,
+        markdown: false,
         close_only: true,
         choosing_file: false,
         grid_window: true,
@@ -314,6 +318,7 @@ fn project_and_close_actions_resolve_in_panes_and_on_the_start_page() {
                 LeaderAvailability {
                     manager: focus.is_some(),
                     help: focus.is_some(),
+                    markdown: false,
                     close_only: false,
                     choosing_file: false,
                     grid_window: focus.is_some(),
@@ -356,6 +361,7 @@ fn standalone_editor_omits_explorer_bindings() {
     let availability = LeaderAvailability {
         manager: false,
         help: true,
+        markdown: false,
         close_only: false,
         choosing_file: false,
         grid_window: true,
@@ -407,6 +413,148 @@ fn backspace_returns_to_the_parent_leader_group() {
         Some(ShellShortcut::CancelLeader)
     );
     assert_eq!(command(None), None);
+}
+
+/// The Markdown submenu and dispatch use the same surface-specific binding table.
+#[test]
+fn markdown_view_bindings_require_a_markdown_editor() {
+    let availability = LeaderAvailability {
+        manager: true,
+        help: true,
+        markdown: true,
+        close_only: false,
+        choosing_file: false,
+        grid_window: true,
+        tabs: true,
+    };
+    let group = LeaderPrefix("m");
+    let root = LeaderPrefix::ROOT;
+    let command = |mode, availability, prefix, key| {
+        let key = Keystroke::parse(key).unwrap();
+        ShellShortcut::resolve(
+            Some(Focus::Editor),
+            mode,
+            None,
+            (false, false),
+            availability,
+            Some(PendingPrefix::Leader(prefix)),
+            &key,
+            normal_character(&key).as_deref(),
+        )
+    };
+    assert!(root.bindings(availability).any(|(key, _)| key == "m"));
+    assert_eq!(
+        command(Mode::Normal, availability, root, "m"),
+        Some(ShellShortcut::AwaitLeader(group))
+    );
+    assert_eq!(
+        group
+            .bindings(availability)
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>(),
+        ["a", "e", "p"]
+    );
+    for (key, mode) in [
+        ("a", MarkdownViewMode::Split),
+        ("e", MarkdownViewMode::Edit),
+        ("p", MarkdownViewMode::Preview),
+    ] {
+        assert_eq!(
+            command(Mode::Normal, availability, group, key),
+            Some(ShellShortcut::SetMarkdownView(mode))
+        );
+    }
+    for availability in [
+        LeaderAvailability {
+            markdown: false,
+            ..availability
+        },
+        LeaderAvailability {
+            close_only: true,
+            ..availability
+        },
+        LeaderAvailability {
+            choosing_file: true,
+            ..availability
+        },
+    ] {
+        assert!(!root.bindings(availability).any(|(key, _)| key == "m"));
+        assert!(group.bindings(availability).next().is_none());
+        assert_eq!(command(Mode::Normal, availability, root, "m"), None);
+        assert_eq!(command(Mode::Normal, availability, group, "a"), None);
+    }
+    for mode in [Mode::Visual, Mode::Command, Mode::Insert] {
+        assert_eq!(command(mode, availability, root, "m"), None);
+    }
+}
+
+/// Preview navigation maps to wheel and endpoint requests without reaching Vim.
+#[test]
+fn markdown_preview_uses_row_and_page_scroll_requests() {
+    for (key, rows) in [
+        ("j", 1),
+        ("down", 1),
+        ("k", -1),
+        ("up", -1),
+        ("pageup", -9),
+        ("pagedown", 9),
+        ("ctrl-b", -9),
+        ("ctrl-f", 9),
+        ("ctrl-u", -4),
+        ("ctrl-d", 4),
+    ] {
+        assert!(matches!(
+            markdown_scroll_input(&Keystroke::parse(key).unwrap(), 9),
+            Some(ScrollInput::Wheel(delta)) if delta == rows
+        ));
+    }
+    assert!(matches!(
+        markdown_scroll_input(&Keystroke::parse("home").unwrap(), 9),
+        Some(ScrollInput::Position(0))
+    ));
+    for key in ["end", "shift-g"] {
+        assert!(matches!(
+            markdown_scroll_input(&Keystroke::parse(key).unwrap(), 9),
+            Some(ScrollInput::Position(usize::MAX))
+        ));
+    }
+    for key in ["i", "x", "ctrl-shift-d", "shift-down"] {
+        assert!(markdown_scroll_input(&Keystroke::parse(key).unwrap(), 9).is_none());
+    }
+}
+
+/// Preview prefixes preserve file and tab navigation without dispatching source edits.
+#[test]
+fn markdown_preview_preserves_buffer_and_tab_navigation() {
+    assert_eq!(
+        markdown_navigation_action('g', Some("t")),
+        Some(Action::TabNavigate(1, None))
+    );
+    assert_eq!(
+        markdown_navigation_action('g', Some("T")),
+        Some(Action::TabNavigate(-1, None))
+    );
+    assert_eq!(
+        markdown_navigation_action('g', Some("Tab")),
+        Some(Action::TabNavigate(0, None))
+    );
+    assert_eq!(
+        markdown_navigation_action('[', Some("b")),
+        Some(Action::BracketBuffer {
+            forward: false,
+            edge: false,
+            count: None
+        })
+    );
+    assert_eq!(
+        markdown_navigation_action(']', Some("B")),
+        Some(Action::BracketBuffer {
+            forward: true,
+            edge: true,
+            count: None
+        })
+    );
+    assert_eq!(markdown_navigation_action(']', Some("p")), None);
 }
 
 /// The editor's close gesture leaves plain Escape and macro keys to the modal editor.

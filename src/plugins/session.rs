@@ -13,6 +13,7 @@ pub use engine::config::{
     Config, ConfigEdit, ConfigScope, ConfigView, Formatting, PluginValues, Rule,
 };
 pub use engine::developer::DeveloperSettings;
+pub use engine::sql_dialect::{is_generic_sql, is_sql_dialect};
 pub use trace::Trace;
 
 use super::package::{Identity, Installed, Manifest, Release};
@@ -163,6 +164,30 @@ pub struct DocumentDiagnostics {
     pub diagnostics: Vec<nanobug_plugin_sdk::Diagnostic>,
 }
 
+/// The native language server's lifecycle, independent of its plugin module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanguageServerPhase {
+    /// The server is being launched or its LSP handshake is pending.
+    Starting,
+    /// The server reports that it is loading or indexing the project.
+    Indexing,
+    /// Server initialization and any reported initial indexing are complete.
+    Ready,
+    /// The native server could not start or its transport failed.
+    Failed,
+}
+
+/// A language server associated with the current document or its open project.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LanguageServerStatus {
+    /// Opening identity and path of the selected file. A project startup has no document.
+    pub document: Option<(u64, PathBuf)>,
+    /// Display name of the server that owns the status.
+    pub name: &'static str,
+    /// Latest lifecycle phase reported by that server session.
+    pub phase: LanguageServerPhase,
+}
+
 /// Read-only state published as a whole. The native renderer never waits for a reply.
 #[derive(Clone, Default)]
 pub struct View {
@@ -195,6 +220,8 @@ pub struct View {
     pub document_presentations: BTreeMap<Key, Arc<DocumentPresentation>>,
     /// Revision-matched diagnostics from the project language server.
     pub document_diagnostics: BTreeMap<Key, Arc<DocumentDiagnostics>>,
+    /// Language server for each selected document, or a server started for the project.
+    pub language_servers: BTreeMap<u64, LanguageServerStatus>,
     /// Latest language-server startup or transport failure for each interested module.
     pub analyzer_errors: BTreeMap<Key, String>,
     pub workers: BTreeMap<String, u32>,
@@ -245,6 +272,15 @@ pub enum Action {
     SampleRuntime(String, bool),
     TextMeasured(u64, serde_json::Value),
     SetProjectExecution(u64, bool),
+    /// Save or clear the preferred SQL language plugin for one project root.
+    SetProjectSqlDialect {
+        /// Open project scope to resolve to a profile-local preference file.
+        project: u64,
+        /// Manifest ID, or no value for automatic selection.
+        dialect: Option<String>,
+        /// Reports whether the preference reached disk.
+        reply: async_channel::Sender<Result<(), String>>,
+    },
     RetryBackgroundTool(Key, String),
     ReviewToolOperations(String),
     SetEnabled(String, bool),
@@ -310,7 +346,7 @@ pub enum Action {
     },
 }
 
-type Projects = (Option<u64>, Vec<Project>);
+type Projects = (Option<u64>, Vec<Project>, BTreeMap<u64, String>);
 type SharedProjects = Arc<Mutex<Arc<Projects>>>;
 type SharedView = Arc<Mutex<Arc<View>>>;
 type SharedDrafts = Arc<Mutex<BTreeMap<Key, String>>>;
@@ -370,7 +406,17 @@ impl Session {
 
     /// Replace the latest project state. Transient typing updates never build up in a queue.
     pub fn projects(&self, active: Option<u64>, projects: Vec<Project>) {
-        *self.projects.lock().unwrap() = Arc::new((active, projects));
+        self.projects_with_sql_dialects(active, projects, BTreeMap::new());
+    }
+
+    /// Publish project snapshots and the active buffer's SQL override for each project.
+    pub fn projects_with_sql_dialects(
+        &self,
+        active: Option<u64>,
+        projects: Vec<Project>,
+        dialects: BTreeMap<u64, String>,
+    ) {
+        *self.projects.lock().unwrap() = Arc::new((active, projects, dialects));
         self.wake.unpark();
     }
 

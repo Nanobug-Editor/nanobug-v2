@@ -71,7 +71,7 @@ pub(super) fn cell_center_bounds(grid: Bounds<Pixels>, metrics: Metrics) -> Boun
 
 /// Build a `style` stroke along `bounds`, scaling the solid weight with `font_size`.
 /// The `top` and `bottom` ranges are gaps in logical x coordinates.
-pub(super) fn outline_path(
+pub(in crate::grid) fn outline_path(
     bounds: Bounds<Pixels>,
     style: OutlineStyle,
     font_size: f32,

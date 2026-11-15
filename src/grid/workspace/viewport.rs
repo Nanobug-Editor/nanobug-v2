@@ -3,6 +3,7 @@
 use crate::grid::{
     render::{CursorCell, Rect},
     windows::{
+        editor::MarkdownViewMode,
         help::HelpWindow,
         manager::ManagerWindow,
         start::{StartFocus, StartPage},
@@ -158,7 +159,9 @@ impl Workspace {
                 true,
             );
         }
-        project.editor.body_caret(self.layout.editor, &self.spacing)
+        project
+            .editor
+            .body_caret(self.active_editor_area(), &self.spacing)
     }
 
     /// Coordinate system that should move with a scrolling viewport.
@@ -230,6 +233,7 @@ impl Workspace {
         if self.file_picker.is_some() {
             return self.advance_file_preview([inputs[1], inputs[2]], cx);
         }
+        let area = self.active_editor_area();
         let Some(project) = self.projects.active_project_mut() else {
             return false;
         };
@@ -248,12 +252,15 @@ impl Workspace {
         });
 
         let (document_changed, document_delta, column_delta) = project.editor.track_view(
-            self.layout.editor,
+            area,
             project.focus == Focus::Editor,
             &self.spacing,
             [document_input, column_input],
             now,
         );
+        let (preview_source_changed, preview_source_delta) = project
+            .editor
+            .advance_markdown_preview(&self.markdown_cache, area, now);
 
         let space = self.cursor_space();
         let project = self.projects.active();
@@ -266,7 +273,7 @@ impl Workspace {
                     .map(|manager| (manager.scroll(), tree_delta, None)),
                 CursorSpace::Document(_) => Some((
                     &buffer.scroll,
-                    document_delta,
+                    document_delta + preview_source_delta,
                     Some((&buffer.columns, column_delta)),
                 )),
                 CursorSpace::Start(_)
@@ -289,13 +296,15 @@ impl Workspace {
                 self.follow_cursor_scroll(rows, delta, columns, cx);
             }
         }
-        tree_changed
+        let changed = tree_changed
             || document_changed
+            || preview_source_changed
             || first_tree_row
                 != project
                     .manager
                     .as_ref()
-                    .map_or(0, |manager| manager.scroll().first_cell())
+                    .map_or(0, |manager| manager.scroll().first_cell());
+        self.advance_inactive_editor_scrolling() || changed
     }
 
     /// Keep the animated cursor in its scrolling viewport through `cx`.
@@ -381,7 +390,10 @@ impl Workspace {
             }),
             CursorSpace::Document(_) => Some((
                 &self.bodies[2],
-                self.projects.active().editor.text_area(self.layout.editor),
+                self.projects
+                    .active()
+                    .editor
+                    .text_area(self.active_editor_area()),
                 &self.projects.active().editor.buffer().scroll,
                 self.projects.active().editor.vim().line_count(),
                 self.projects.active().editor.buffer().text_displacement(),
@@ -653,6 +665,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.advance_definition_hover_scroll();
         if self.help.is_open() {
             if self.advance_help_scrolling(ScrollInput::Advance, cx) {
                 self.refresh_help_panels(cx);
@@ -671,7 +684,7 @@ impl Workspace {
     }
 
     /// Animate body transforms in `window` through `cx`, retaining cells between grid steps.
-    fn schedule_scroll(&mut self, window: &Window, cx: &mut Context<Self>) {
+    pub(super) fn schedule_scroll(&mut self, window: &Window, cx: &mut Context<Self>) {
         let active = if let Some(list) = &self.help.list {
             list.scroll.is_active()
         } else if let Some(session) = &self.file_picker {
@@ -685,12 +698,16 @@ impl Workspace {
                 .manager
                 .as_ref()
                 .is_some_and(|manager| manager.scroll().is_active())
-                || buffer.scroll.is_active()
-                || buffer.columns.is_active()
+                || project.editor.markdown_view_mode() != Some(MarkdownViewMode::Preview)
+                    && (buffer.scroll.is_active() || buffer.columns.is_active())
+                || project
+                    .editor
+                    .markdown_scroll_active(self.active_editor_area())
+                || self.inactive_editor_scroll_active()
         } else {
             false
         };
-        if self.scroll_scheduled || !active {
+        if self.scroll_scheduled || !(active || self.definition_hover_scroll_active()) {
             return;
         }
         self.scroll_scheduled = true;

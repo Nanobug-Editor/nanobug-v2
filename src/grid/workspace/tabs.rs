@@ -1,5 +1,6 @@
 //! Character layout, shortcuts, pointer gestures and animated selection for the workspace tab strip.
 
+mod pages;
 #[cfg(windows)]
 mod windows;
 
@@ -33,16 +34,27 @@ const TAB_SETTLE: f64 = 0.24;
 #[cfg(windows)]
 const TAB_CLICK_TOLERANCE: f64 = 4.;
 
+/// Click destinations in the shared row, with zero-based indices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CaptionTarget {
+    /// A top-level project or start page.
+    Project(usize),
+    /// A page within the selected project.
+    Page(usize),
+}
+
 /// A click candidate recorded before Windows processes a caption press.
 #[cfg(windows)]
 #[derive(Clone, Copy)]
-struct TabPress {
+pub(super) struct TabPress {
     /// Initial pointer position in window-local pixels.
     position: Point<Pixels>,
-    /// Visible tab under the press.
-    index: usize,
+    /// Visible label under the press.
+    target: CaptionTarget,
     /// Tab revision that the index refers to.
     revision: u64,
+    /// Page count and selection when the press was captured.
+    pages: (usize, usize),
 }
 
 /// Keyboard actions that operate on tab order without focusing the strip.
@@ -91,21 +103,28 @@ impl Workspace {
 
     /// Capture the tab at window-local `position` before the native caption handles the press.
     #[cfg(windows)]
-    fn caption_tab_press(&self, position: Point<Pixels>) -> Option<TabPress> {
+    pub(super) fn caption_tab_press(&self, position: Point<Pixels>) -> Option<TabPress> {
         if self.modal_open() {
             return None;
         }
-        let index = self.tabs.tab_at(position, self.tab_metrics())?;
-        (index != self.projects.selected).then_some(TabPress {
+        let target = self.tabs.tab_at(position, self.tab_metrics())?;
+        let pages = self.tabpage_selection();
+        if target == CaptionTarget::Project(self.projects.selected)
+            || target == CaptionTarget::Page(pages.1)
+        {
+            return None;
+        }
+        Some(TabPress {
             position,
-            index,
+            target,
             revision: self.projects.revision,
+            pages,
         })
     }
 
     /// Switch a caption `press` released at `position` over the same tab in `window` through `cx`.
     #[cfg(windows)]
-    fn finish_caption_tab_click(
+    pub(super) fn finish_caption_tab_click(
         &mut self,
         press: TabPress,
         position: Point<Pixels>,
@@ -113,11 +132,32 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if press.revision == self.projects.revision
+            && press.pages == self.tabpage_selection()
             && (position - press.position).magnitude() <= TAB_CLICK_TOLERANCE
-            && self.tabs.tab_at(position, self.tab_metrics()) == Some(press.index)
+            && self.tabs.tab_at(position, self.tab_metrics()) == Some(press.target)
         {
-            self.activate_project_tab(press.index, window, cx);
+            self.activate_caption_target(press.target, window, cx);
         }
+    }
+
+    /// Activate a caption `target` in `window` through `cx` using its existing command path.
+    pub(super) fn activate_caption_target(
+        &mut self,
+        target: CaptionTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            CaptionTarget::Project(index) => self.activate_project_tab(index, window, cx),
+            CaptionTarget::Page(index) => self.select_editor_page(index, window, cx),
+        }
+    }
+
+    /// Return the active project's ordered page count and selected index.
+    fn tabpage_selection(&self) -> (usize, usize) {
+        self.projects.active_project().map_or((0, 0), |project| {
+            (project.page_count(), project.active_page())
+        })
     }
 
     /// Activate the tab at `index` in `window` and refresh its layout through `cx`.
@@ -162,19 +202,29 @@ impl Workspace {
 
     /// Refresh the strip from the current grid and open tabs in `cx`.
     pub(super) fn refresh_tab_bar(&mut self, cx: &mut Context<Self>) {
-        self.tabs
-            .update(self.layout.cols, &self.projects, &self.spacing, cx);
+        let pages = self.tabpage_selection();
+        self.tabs.update(
+            self.layout.visible_cols,
+            &self.projects,
+            pages,
+            &self.spacing,
+            cx,
+        );
     }
 }
 
 /// Two retained text layers and a moving block that masks their contrasting inks.
 pub(super) struct TabBar {
-    /// The column count, tab revision and locale at the last layout.
-    layout: Option<(usize, u64, Locale)>,
+    /// Width, project revision, page state, selected standalone buffer and locale at the last layout.
+    layout: Option<(usize, u64, (usize, usize), Option<u64>, Locale)>,
     /// Index of the first visible tab, retained until the selected tab needs room.
     first: usize,
     /// Visible tab rectangles in order, excluding separators and overflow indicators.
     targets: Vec<Rect>,
+    /// Page labels and overflow targets in their painted caption cells.
+    page_targets: Vec<(usize, Rect)>,
+    /// Width available to the project selection animation, excluding page numbers.
+    project_cols: usize,
     /// Normal text layer for the full strip.
     labels: Entity<Panel>,
     /// Dark text shown only inside the selection block.
@@ -204,6 +254,8 @@ impl TabBar {
             layout: None,
             first: 0,
             targets: Vec::new(),
+            page_targets: Vec::new(),
+            project_cols: 0,
             labels: cx.new(|_| Panel::new(metrics)),
             covered: cx.new(|_| Panel::new(metrics)),
             target: [0.; 2],
@@ -212,20 +264,40 @@ impl TabBar {
         }
     }
 
-    /// Fit `projects` into `cols`, using `spacing` for actual glyph positions and `cx` for panels.
+    /// Fit `projects` and their active `pages` into `cols`, measuring labels with `spacing`.
+    /// Publish the normal and selected text panels through `cx`.
     fn update(
         &mut self,
         cols: usize,
         projects: &WorkspaceTabs,
+        pages: (usize, usize),
         spacing: &TextSpacing,
         cx: &mut App,
     ) {
-        let key = (cols, projects.revision, i18n::locale());
+        let standalone_buffer = projects
+            .active_project()
+            .filter(|project| project.manager.is_none())
+            .map(|project| project.editor.buffer().id);
+        let key = (
+            cols,
+            projects.revision,
+            pages,
+            standalone_buffer,
+            i18n::locale(),
+        );
         if self.layout == Some(key) {
             return;
         }
         let names: Vec<_> = projects.names().collect();
         let widths: Vec<_> = names.iter().map(|name| spacing.columns(name)).collect();
+        let mut labels = Frame::new(cols, 1);
+        let mut covered = Frame::new(cols, 1);
+        self.page_targets = pages::draw(&mut labels, cols, pages.0, pages.1, spacing);
+        let cols = self
+            .page_targets
+            .first()
+            .map_or(cols, |(_, bounds)| bounds.x.saturating_sub(pages::PAGE_GAP));
+        self.project_cols = cols;
         let visible = visible_tabs(&widths, cols, self.first, projects.selected);
         self.first = visible.start;
         self.targets.clear();
@@ -233,9 +305,8 @@ impl TabBar {
         let hidden_right = names.len() - visible.end;
         let mut column = hidden_columns(hidden_left);
         let limit = cols.saturating_sub(hidden_columns(hidden_right));
-        let mut labels = Frame::new(cols, 1);
-        let mut covered = Frame::new(cols, 1);
         let mut label = |slot: Range<usize>, text: &str, color| {
+            let slot = slot.start..slot.end.min(cols);
             labels.label(0, slot.clone(), text, color, spacing);
             covered.label(0, slot, text, CURSOR_TEXT, spacing);
         };
@@ -270,7 +341,7 @@ impl TabBar {
             self.targets.push(Rect {
                 x: column,
                 y: 0,
-                w: next - column,
+                w: next.min(cols).saturating_sub(column),
                 h: 1,
             });
             column = next;
@@ -287,23 +358,30 @@ impl TabBar {
         self.covered.update(cx, |panel, cx| panel.set(covered, cx));
     }
 
-    /// Return the index of the visible tab containing `position` in the tab row's `metrics`.
+    /// Return the visible project or page hit by `position` in the caption row's `metrics`.
     #[cfg(windows)]
-    fn tab_at(&self, position: Point<Pixels>, metrics: Metrics) -> Option<usize> {
+    fn tab_at(&self, position: Point<Pixels>, metrics: Metrics) -> Option<CaptionTarget> {
         self.click_targets(metrics)
             .find(|(_, bounds)| bounds.contains(&position))
             .map(|(index, _)| index)
     }
 
-    /// Iterate visible tab indices and hit bounds in the row's `metrics`.
+    /// Iterate visible project and page hit bounds using the caption row's `metrics`.
     pub(super) fn click_targets(
         &self,
         metrics: Metrics,
-    ) -> impl Iterator<Item = (usize, Bounds<Pixels>)> + '_ {
+    ) -> impl Iterator<Item = (CaptionTarget, Bounds<Pixels>)> + '_ {
         self.targets
             .iter()
             .enumerate()
-            .map(move |(offset, target)| (self.first + offset, target.pixels(metrics)))
+            .map(move |(offset, target)| (CaptionTarget::Project(self.first + offset), *target))
+            .chain(
+                self.page_targets
+                    .iter()
+                    .map(|&(index, target)| (CaptionTarget::Page(index), target)),
+            )
+            .filter(|(_, target)| target.w > 0)
+            .map(move |(target, rect)| (target, rect.pixels(metrics)))
     }
 
     /// Draw the block and masked text at `metrics`, advancing animation in `window` through `cx`.
@@ -339,8 +417,10 @@ impl TabBar {
             h: 1,
         }
         .pixels(metrics);
-        let left = self.edges[0].value.clamp(0., cols as f64) as f32;
-        let right = self.edges[1].value.clamp(left as f64, cols as f64) as f32;
+        let left = self.edges[0].value.clamp(0., self.project_cols as f64) as f32;
+        let right = self.edges[1]
+            .value
+            .clamp(left as f64, self.project_cols as f64) as f32;
         let block = Bounds::<Pixels>::from_corners(metrics.at(left, 0.), metrics.at(right, 1.));
         let masked = Bounds::new(header.origin - block.origin, header.size);
         div()

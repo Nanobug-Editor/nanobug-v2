@@ -39,10 +39,13 @@ pub(crate) fn run() {
         }
     };
     let paths: Vec<_> = args.into_iter().map(|path| cwd.join(path)).collect();
+    let restore_sessions = !plugins.isolated();
+    #[cfg(feature = "plugin-probe")]
+    let restore_sessions = restore_sessions && probe.is_none();
     // The initial documents and Explorer rows use no native window state.
     let projects = std::thread::spawn(move || {
         crate::ui::theme::load_for_editor();
-        WorkspaceTabs::new(paths)
+        WorkspaceTabs::with_project_sessions(paths, restore_sessions)
     });
     #[cfg(windows)]
     let platform: std::rc::Rc<dyn gpui::Platform> = std::rc::Rc::new(

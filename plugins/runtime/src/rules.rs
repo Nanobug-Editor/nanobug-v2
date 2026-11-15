@@ -1,8 +1,11 @@
 //! Independent QuickJS rules with cumulative execution and overall deadlines.
 
 use crate::Output;
-use nanobug_plugin_sdk::{ErrorKind, Query, Reply, Request, receive};
-use rquickjs::{CaughtError, Context, Ctx, Function, Object, Promise, Runtime};
+use nanobug_plugin_sdk::{ErrorKind, MAX_MESSAGE, Query, Reply, Request, receive};
+use rquickjs::{
+    CaughtError, Context, Ctx, Function, Module, Object, Runtime, module::Declared,
+    promise::MaybePromise,
+};
 use serde_json::Value;
 use std::{
     cell::Cell,
@@ -19,10 +22,22 @@ use std::{
 
 const LIMIT: usize = 4;
 const MAX_QUERIES: usize = 32;
+/// Bound the number of array elements decoded from one rule result.
+const MAX_EXCLUDED_DIRS: usize = 128;
+/// Keep the encoded rule reply below the wire limit even after JSON escaping.
+const MAX_EXCLUSION_BYTES: usize = MAX_MESSAGE / 8;
 const COMPUTE: Duration = Duration::from_millis(20);
 const DEADLINE: Duration = Duration::from_secs(5);
 type RuleError = (ErrorKind, String);
 type Data = (u32, Result<Value, String>);
+
+/// A compiled rule body or a shared ES module with named activation functions.
+enum CompiledRule<'js> {
+    /// The legacy asynchronous function body.
+    Body(Function<'js>),
+    /// The ES module, compiled without executing its top-level code.
+    Shared(Module<'js, Declared>),
+}
 
 /// Each evaluation counts time spent in QuickJS separately from host waits.
 struct Budget {
@@ -83,10 +98,113 @@ fn js_error(error: rquickjs::Error) -> RuleError {
     (ErrorKind::Invalid, error.to_string())
 }
 
-/// Run a rule body with the declared async host API, or only compile its syntax.
+/// Decode the activation flag, startup request and scan exclusions from the rule's `value`.
+fn rule_result(value: rquickjs::Value<'_>) -> rquickjs::Result<(bool, bool, Vec<String>)> {
+    if let Some(active) = value.as_bool() {
+        return Ok((active, false, Vec::new()));
+    }
+    let object = value.as_object().ok_or_else(|| {
+        rquickjs::Error::new_from_js_message(
+            "JavaScript rule return value",
+            "boolean or rule object",
+            "Expected a boolean or an object with an active boolean",
+        )
+    })?;
+    let active = object.get::<_, bool>("active")?;
+    let startup = object.get::<_, rquickjs::Value>("startLanguageServer")?;
+    let requested = if startup.is_undefined() {
+        false
+    } else {
+        startup
+            .as_bool()
+            .ok_or_else(|| rquickjs::Error::new_from_js("startLanguageServer", "boolean"))?
+    };
+    let exclude_dirs = rule_exclude_dirs(object.get("excludeDirs")?)?;
+    Ok((
+        active,
+        active && requested,
+        if active { exclude_dirs } else { Vec::new() },
+    ))
+}
+
+/// Decode the optional exclusion array `value` within the rule reply's transport budget.
+fn rule_exclude_dirs(value: rquickjs::Value<'_>) -> rquickjs::Result<Vec<String>> {
+    if value.is_undefined() {
+        return Ok(Vec::new());
+    }
+    let array = value
+        .as_array()
+        .ok_or_else(|| rquickjs::Error::new_from_js("excludeDirs", "array of strings"))?;
+    if array.len() > MAX_EXCLUDED_DIRS {
+        return Err(rquickjs::Error::new_from_js_message(
+            "excludeDirs",
+            "array of strings",
+            format!("Expected at most {MAX_EXCLUDED_DIRS} entries"),
+        ));
+    }
+    let mut remaining = MAX_EXCLUSION_BYTES;
+    array
+        .iter::<String>()
+        .map(|entry| {
+            let path = entry?;
+            remaining = remaining.checked_sub(path.len()).ok_or_else(|| {
+                rquickjs::Error::new_from_js_message(
+                    "excludeDirs",
+                    "array of strings",
+                    "Exclusion paths exceed the rule reply size limit",
+                )
+            })?;
+            Ok(path)
+        })
+        .collect()
+}
+
+/// Select the own callable property of a shared module's default export by `id`.
+fn activation_function<'js>(
+    module: Module<'js, Declared>,
+    id: &str,
+) -> rquickjs::Result<Function<'js>> {
+    let (module, ready) = module.eval()?;
+    ready.finish::<()>()?;
+    let rules: Object = module.get("default")?;
+    if rules
+        .keys::<String>()
+        .any(|key| key.is_ok_and(|key| key == id))
+    {
+        let value: rquickjs::Value = rules.get(id)?;
+        if let Some(function) = value.into_function() {
+            return Ok(function);
+        }
+    }
+    Err(rquickjs::Error::new_from_js_message(
+        "shared rule default export",
+        "function",
+        format!("No activation function for module '{id}'"),
+    ))
+}
+
+/// Compile the rule in its existing scope, or recognize an ES module if the body does not parse.
+fn compile_rule<'js>(
+    budget: &Budget,
+    ctx: &Ctx<'js>,
+    source: &str,
+) -> Result<CompiledRule<'js>, RuleError> {
+    let constructor: Function =
+        budget.step(ctx, || ctx.eval("(async function() {}).constructor"))?;
+    match budget.step(ctx, || constructor.call(("host", source))) {
+        Ok(rule) => Ok(CompiledRule::Body(rule)),
+        Err((ErrorKind::Invalid, _)) => budget
+            .step(ctx, || Module::declare(ctx.clone(), "nanobug-rule", source))
+            .map(CompiledRule::Shared),
+        Err(error) => Err(error),
+    }
+}
+
+/// Run one activation rule with its host context, or validate the script syntax.
 fn evaluate(
     id: u64,
     source: &str,
+    module_id: Option<&str>,
     context: Option<Value>,
     deadline: Instant,
     cancelled: Arc<AtomicBool>,
@@ -105,11 +223,17 @@ fn evaluate(
     runtime.set_interrupt_handler(Some(Box::new(move || clock.check().is_err())));
     let cx = Context::full(&runtime).map_err(js_error)?;
     cx.with(|ctx| {
-        let constructor: Function =
-            budget.step(&ctx, || ctx.eval("(async function() {}).constructor"))?;
-        let rule: Function = budget.step(&ctx, || constructor.call(("host", source)))?;
+        let compiled = compile_rule(&budget, &ctx, source)?;
         let Some(context) = context else {
             return Ok(Reply::RuleChecked { id });
+        };
+        let rule = match compiled {
+            CompiledRule::Body(rule) => rule,
+            CompiledRule::Shared(module) => {
+                let id = module_id
+                    .ok_or_else(|| (ErrorKind::Invalid, "Shared rule needs a module ID".into()))?;
+                budget.step(&ctx, || activation_function(module, id))?
+            }
         };
         let bootstrap: Function = budget.step(&ctx, || ctx.eval(include_str!("rule_api.js")))?;
         let context: rquickjs::Value = budget.step(&ctx, || ctx.json_parse(context.to_string()))?;
@@ -117,16 +241,22 @@ fn evaluate(
         let host: Object = bridge.get("host").map_err(js_error)?;
         let take: Function = bridge.get("take").map_err(js_error)?;
         let reply: Function = bridge.get("reply").map_err(js_error)?;
-        let promise: Promise = budget.step(&ctx, || rule.call((host,)))?;
+        let promise: MaybePromise = budget.step(&ctx, || rule.call((host,)))?;
         let mut waiting = std::collections::BTreeSet::new();
         let mut issued = 0;
         loop {
-            let result = budget.step(&ctx, || match promise.finish::<bool>() {
+            let result = budget.step(&ctx, || match promise.finish::<rquickjs::Value>() {
                 Err(rquickjs::Error::WouldBlock) => Ok(None),
-                other => other.map(Some),
+                Ok(value) => rule_result(value).map(Some),
+                Err(error) => Err(error),
             })?;
-            if let Some(matches) = result {
-                return Ok(Reply::Rule { id, matches });
+            if let Some((matches, start_language_server, exclude_dirs)) = result {
+                return Ok(Reply::Rule {
+                    id,
+                    matches,
+                    start_language_server,
+                    exclude_dirs,
+                });
             }
             let requests: String = budget.step(&ctx, || take.call(()))?;
             let requests: Vec<Value> =
@@ -192,19 +322,21 @@ pub(super) fn serve(mut input: impl BufRead, output: Output) -> anyhow::Result<(
     let mut running = BTreeMap::<u64, Running>::new();
     while let Some(request) = receive(&mut input)? {
         running.retain(|_, job| !job.done.load(Ordering::Acquire));
-        let (id, source, context, duration) = match request {
+        let (id, source, module, context, duration) = match request {
             Request::Evaluate {
                 id,
                 source,
+                module,
                 context,
                 remaining_ms,
             } => (
                 id,
                 source,
+                module,
                 Some(context),
                 DEADLINE.min(Duration::from_millis(remaining_ms)),
             ),
-            Request::CheckRule { id, source } => (id, source, None, DEADLINE),
+            Request::CheckRule { id, source } => (id, source, None, None, DEADLINE),
             Request::Data { id, query, result } => {
                 if let Some(sender) = running.get(&id).and_then(|job| job.sender.as_ref()) {
                     let _ = sender.try_send((query, result));
@@ -235,6 +367,7 @@ pub(super) fn serve(mut input: impl BufRead, output: Output) -> anyhow::Result<(
             let result = evaluate(
                 id,
                 &source,
+                module.as_deref(),
                 context,
                 deadline,
                 worker_cancelled,

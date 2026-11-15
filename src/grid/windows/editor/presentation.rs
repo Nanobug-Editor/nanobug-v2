@@ -47,7 +47,9 @@ impl EditorWindow {
                             })
                     });
             changed |= buffer.set_diagnostics(diagnostics) && active;
-            if !keep_folds {
+            if keep_folds {
+                buffer.retain_highlights();
+            } else {
                 changed |= buffer.set_presentation(provider) && active;
             }
         }

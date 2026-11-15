@@ -2,6 +2,7 @@
 
 use super::{
     Workspace,
+    editor_splits::PaneId,
     layout::{
         FOOTER_BADGE_INSET_Y, FOOTER_CHIP_PAD, FOOTER_COLUMN_DIGITS, FOOTER_ENCODING,
         FOOTER_ENCODING_GAP, FOOTER_LABEL_GAP, FOOTER_LINE_DIGITS, FOOTER_PROGRESS_DIGITS,
@@ -10,16 +11,31 @@ use super::{
 };
 use crate::{
     grid::{
-        render::{Frame, Rect},
-        windows::WindowFrame,
+        render::{Frame, Panel, Rect},
+        windows::{
+            WindowFrame,
+            editor::{MarkdownCache, MarkdownViewMode},
+        },
     },
     ui::theme::{
         ACCENT, CURRENT, CURSOR_TEXT, FOOTER_BLUE, FOOTER_DETAILS, FOOTER_INSERT, FOOTER_VISUAL,
         MUTED, TEXT, ThemeComponent, WARNING_TEXT, style,
     },
 };
-use gpui::{Context, px};
-use nanobug::{i18n, vim::Mode};
+use gpui::{AppContext, Context, Entity, px};
+use nanobug::{
+    animation::scroll::ScrollInput, i18n, plugins::session::LanguageServerPhase, vim::Mode,
+};
+
+/// Fixed border and clipped source layers of a visible editor outside the focused pane.
+pub(super) struct EditorPanePanels {
+    /// Stable editor identity on this page.
+    pub(super) pane: PaneId,
+    /// Pane border and Bufferline, line numbers, and document text.
+    pub(super) layers: [Entity<Panel>; 3],
+    /// Parsed and shaped preview retained at this pane's own width.
+    pub(super) markdown: MarkdownCache,
+}
 
 /// Format `progress` (0–100) and one-based `line` and `column` in fixed-width footer slots.
 /// The colon anchors both coordinates. Values that exceed their field show a lower bound.
@@ -38,6 +54,17 @@ fn footer_labels(line: usize, column: usize, progress: usize) -> (String, String
         format!("{FOOTER_ENCODING}{FOOTER_ENCODING_GAP}{progress:>FOOTER_PROGRESS_DIGITS$}%"),
         format!("{line:>FOOTER_LINE_DIGITS$}:{column:<FOOTER_COLUMN_DIGITS$}"),
     )
+}
+
+/// Select the localized footer text and foreground role for the server `phase`.
+fn language_server_label(phase: LanguageServerPhase) -> (&'static str, u32) {
+    let (key, color) = match phase {
+        LanguageServerPhase::Starting => ("editor.language_server_starting", MUTED),
+        LanguageServerPhase::Indexing => ("editor.language_server_indexing", MUTED),
+        LanguageServerPhase::Ready => ("editor.language_server_ready", TEXT),
+        LanguageServerPhase::Failed => ("editor.language_server_failed", WARNING_TEXT),
+    };
+    (i18n::text(key), color)
 }
 
 impl Workspace {
@@ -63,6 +90,7 @@ impl Workspace {
         for (panel, frame) in self.panels.iter().chain(self.bodies.iter()).zip(frames) {
             panel.update(cx, |panel, cx| panel.set(frame, cx));
         }
+        self.refresh_inactive_editor_panels(cx);
         self.tree_name_preview_rect = tree_name_preview.map(|(rect, frame)| {
             self.tree_name_preview
                 .update(cx, |panel, cx| panel.set(frame, cx));
@@ -71,6 +99,106 @@ impl Workspace {
         self.refresh_help_panels(cx);
         self.refresh_language_picker(cx);
         self.refresh_editor_close(cx);
+    }
+
+    /// Rebuild the retained layers of the other editors visible on this Tabpage.
+    fn refresh_inactive_editor_panels(&mut self, cx: &mut Context<Self>) {
+        let areas = self.editor_rects();
+        let project = self.projects.active();
+        let active = project.active_editor_id();
+        let modal_open = self.modal_open();
+        self.inactive_editor_panels.retain(|panels| {
+            panels.pane != active && areas.iter().any(|(pane, _)| *pane == panels.pane)
+        });
+        let metrics = self.metrics;
+        for (pane, area) in areas.into_iter().filter(|(pane, _)| *pane != active) {
+            let Some(editor) = project.editor_by_id(pane) else {
+                continue;
+            };
+            let frames = editor.frames(
+                WindowFrame {
+                    area,
+                    selected: false,
+                    modal_open,
+                    controls_hovered: false,
+                    spacing: &self.spacing,
+                },
+                self.layout.visible_cols,
+            );
+            let panels = &mut self.inactive_editor_panels;
+            let rendered = if let Some(index) = panels.iter().position(|entry| entry.pane == pane) {
+                &panels[index]
+            } else {
+                panels.push(EditorPanePanels {
+                    pane,
+                    layers: std::array::from_fn(|_| cx.new(|_| Panel::new(metrics))),
+                    markdown: MarkdownCache::default(),
+                });
+                &panels[panels.len() - 1]
+            };
+            for (panel, frame) in
+                rendered
+                    .layers
+                    .iter()
+                    .zip([frames.chrome, frames.numbers, frames.text])
+            {
+                panel.update(cx, |panel, cx| panel.set(frame, cx));
+            }
+        }
+    }
+
+    /// Advance unfocused editor viewports without retargeting the shared caret.
+    pub(super) fn advance_inactive_editor_scrolling(&mut self) -> bool {
+        let areas = self.editor_rects();
+        let Some(project) = self.projects.active_project_mut() else {
+            return false;
+        };
+        let active = project.active_editor_id();
+        let now = self.scroll_epoch.elapsed().as_secs_f64();
+        let mut changed = false;
+        for (pane, area) in areas.into_iter().filter(|(pane, _)| *pane != active) {
+            let Some(editor) = project.editor_by_id_mut(pane) else {
+                continue;
+            };
+            changed |= editor
+                .track_view(area, false, &self.spacing, [ScrollInput::Advance; 2], now)
+                .0;
+            if let Some(panels) = self
+                .inactive_editor_panels
+                .iter()
+                .find(|entry| entry.pane == pane)
+            {
+                changed |= editor
+                    .advance_markdown_preview(&panels.markdown, area, now)
+                    .0;
+            }
+        }
+        changed
+    }
+
+    /// Whether any other visible editor or its preview needs another scroll frame.
+    pub(super) fn inactive_editor_scroll_active(&self) -> bool {
+        let Some(project) = self.projects.active_project() else {
+            return false;
+        };
+        let active = project.active_editor_id();
+        self.editor_rects().into_iter().any(|(pane, area)| {
+            pane != active
+                && project.editor_by_id(pane).is_some_and(|editor| {
+                    let buffer = editor.buffer();
+                    editor.markdown_scroll_active(area)
+                        || editor.markdown_view_mode() != Some(MarkdownViewMode::Preview)
+                            && (buffer.scroll.is_active() || buffer.columns.is_active())
+                })
+        })
+    }
+
+    /// Update only the retained editor footer when plugin state changes through `cx`.
+    pub(super) fn refresh_footer(&self, cx: &mut Context<Self>) {
+        if self.projects.active_project().is_some() && self.file_picker.is_none() {
+            let frame = self.footer_frame(self.modal_open());
+            self.panels[2].update(cx, |panel, cx| panel.set(frame, cx));
+        }
     }
 
     /// Update the popup's retained border, list, dim title and active search through `cx`.
@@ -142,6 +270,8 @@ impl Workspace {
 
         let (mode, mode_color) = if active.focus == Focus::Manager {
             (i18n::text("manager.title"), FOOTER_BLUE)
+        } else if active.editor.markdown_view_mode() == Some(MarkdownViewMode::Preview) {
+            (i18n::text("editor.markdown_preview"), FOOTER_BLUE)
         } else {
             let color = match vim.mode {
                 Mode::Insert | Mode::Replace => FOOTER_INSERT,
@@ -181,13 +311,24 @@ impl Workspace {
             ("", TEXT)
         };
         let message_start = (tip + 1 + FOOTER_LABEL_GAP).min(slots.left.end);
-        footer.label(
-            0,
-            message_start..slots.left.end,
-            message,
-            color,
-            &self.spacing,
-        );
+        let mut message_end = slots.left.end;
+        if let Some((server, phase)) = self.active_language_server_status() {
+            let (state, color) = language_server_label(phase);
+            let message = message.lines().next().unwrap_or_default();
+            let available = message_end - message_start;
+            // Keep space for operation feedback and diagnostics before choosing a status label.
+            let feedback = self.spacing.columns(message).min(available / 2);
+            let gap = if feedback > 0 { FOOTER_LABEL_GAP } else { 0 };
+            for name in [server, "LSP"] {
+                let label = format!("{name} · {state}");
+                if self.spacing.columns(&label) + feedback + gap <= available {
+                    let left = footer.right_label(0, message_end, &label, color, &self.spacing);
+                    message_end = left.saturating_sub(gap).max(message_start);
+                    break;
+                }
+            }
+        }
+        footer.label(0, message_start..message_end, message, color, &self.spacing);
         footer
     }
 
@@ -219,11 +360,10 @@ impl Workspace {
                     (frames.chrome, frames.body, frames.preview)
                 },
             );
-        let editor = self
-            .projects
-            .active()
-            .editor
-            .frames(context(Focus::Editor, layout.editor), layout.visible_cols);
+        let editor = self.projects.active().editor.frames(
+            context(Focus::Editor, self.active_editor_area()),
+            layout.visible_cols,
+        );
         (
             [
                 manager_chrome,

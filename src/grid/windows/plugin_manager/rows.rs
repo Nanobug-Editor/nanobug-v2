@@ -679,6 +679,13 @@ fn modules(ui: &RowContext<'_>, namespace: &str, record: &Installed) -> Vec<Row>
                 description,
                 target,
             ));
+            if let Some(error) = ui.view.analyzer_errors.get(&key) {
+                rows.push(row(
+                    i18n::text("editor.language_server_retry"),
+                    error,
+                    Target::Action(Action::Retry(namespace.into())),
+                ));
+            }
             if let Some(tools) = ui.view.background_tools.get(&key) {
                 for (name, status) in tools {
                     let phase = match status.phase {
