@@ -1,6 +1,7 @@
 //! Read and atomically update the editor's portable settings file.
 
 use anyhow::{Context, Result};
+use serde::{Serialize, de::DeserializeOwned};
 use std::{
     env, fs,
     io::{ErrorKind, Write},
@@ -31,6 +32,30 @@ pub fn read_ui<T>(path: &Path, read_ui: impl FnOnce(&dyn TableLike) -> T) -> Res
         .get("ui")
         .and_then(Item::as_table_like)
         .map(read_ui))
+}
+
+/// Read serialized Vim settings from the `[vim]` table at `path`.
+pub(crate) fn read_vim<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    let mut settings = read(path)?;
+    let Some(item) = settings.remove("vim") else {
+        return Ok(None);
+    };
+    let table = item
+        .into_table()
+        .ok()
+        .with_context(|| format!("The vim setting in {} must be a table", path.display()))?;
+    toml_edit::de::from_document(DocumentMut::from(table))
+        .map(Some)
+        .with_context(|| format!("Read Vim settings in {}", path.display()))
+}
+
+/// Replace the `[vim]` table at `path` with `value`, retaining adjacent settings.
+pub(crate) fn save_vim<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let next = toml_edit::ser::to_document(value)?.into_table();
+    update(path, |settings| {
+        settings.insert("vim", Item::Table(next));
+        Ok(true)
+    })
 }
 
 /// Set one `[ui]` `key` at `path` to `value`, preserving adjacent settings and comments.

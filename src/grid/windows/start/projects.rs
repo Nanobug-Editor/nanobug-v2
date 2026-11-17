@@ -2,7 +2,9 @@
 
 use crate::{
     grid::{
-        render::{Frame, LabelStyle, OutlineStyle, Rect, SHORTCUT_SEPARATOR, shortcut_hint},
+        render::{
+            Frame, LabelStyle, Metrics, OutlineStyle, Rect, SHORTCUT_SEPARATOR, shortcut_hint,
+        },
         windows::manager::Entry,
     },
     ui::{
@@ -12,7 +14,7 @@ use crate::{
         theme::{ACCENT, GOLD, MUTED, SELECTION, TEXT},
     },
 };
-use gpui::KeyDownEvent;
+use gpui::{KeyDownEvent, Pixels, Point};
 use nanobug::i18n;
 use std::{
     borrow::Cow,
@@ -40,27 +42,33 @@ const FOLDER: Icon = Icon::new(
 /// Borrowed directory scan result. None indicates a scan in progress for a selected project.
 pub(super) type PreviewRows<'a> = Option<Result<&'a [Entry], &'a str>>;
 
-/// Two adjacent panes sharing a title row and bottom margin.
+/// Which panes remain visible in the open recent-project picker.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProjectPanes {
+    Both,
+    List,
+    Preview,
+}
+
+/// The visible panes and their shared title row and bottom margin.
 #[derive(Clone, Copy)]
 pub(in crate::grid) struct ProjectLayout {
     /// Bounds of the bordered panes in the start-page grid.
     pub(super) area: Rect,
-    /// Width of the left pane, including both border columns.
-    left: usize,
+    panes: ProjectPanes,
 }
 
 impl ProjectLayout {
     /// Inset the picker from the edges of the `cols` by `rows` grid.
-    pub(super) fn new(cols: usize, rows: usize) -> Self {
-        let w = cols - 6;
+    fn new(cols: usize, rows: usize, panes: ProjectPanes) -> Self {
         Self {
             area: Rect {
                 x: 3,
                 y: 1,
-                w,
+                w: cols - 6,
                 h: rows - 2,
             },
-            left: w / 2,
+            panes,
         }
     }
 
@@ -72,19 +80,39 @@ impl ProjectLayout {
         }
     }
 
-    /// Absolute start-grid bounds of the project list and directory preview.
-    pub(in crate::grid) fn pane_areas(self) -> [Rect; 2] {
-        [
-            Rect {
-                w: self.left,
+    /// Bounds of the visible project list, which fills the picker by itself.
+    fn list_area(self) -> Option<Rect> {
+        match self.panes {
+            ProjectPanes::Both => Some(Rect {
+                w: self.area.w / 2,
                 ..self.area
-            },
-            Rect {
-                x: self.area.x + self.left,
-                w: self.area.w - self.left,
-                ..self.area
-            },
-        ]
+            }),
+            ProjectPanes::List => Some(self.area),
+            ProjectPanes::Preview => None,
+        }
+    }
+
+    /// Bounds of the visible preview, separated from the list by one column when both are open.
+    fn preview_area(self) -> Option<Rect> {
+        match self.panes {
+            ProjectPanes::Both => {
+                let start = self.area.w / 2 + 1;
+                Some(Rect {
+                    x: self.area.x + start,
+                    w: self.area.w - start,
+                    ..self.area
+                })
+            }
+            ProjectPanes::List => None,
+            ProjectPanes::Preview => Some(self.area),
+        }
+    }
+
+    /// Absolute start-grid bounds of the panes that are still visible.
+    pub(in crate::grid) fn pane_areas(self) -> impl Iterator<Item = Rect> {
+        [self.list_area(), self.preview_area()]
+            .into_iter()
+            .flatten()
     }
 
     /// Number of project rows between the filter and the status line.
@@ -99,12 +127,19 @@ impl ProjectLayout {
 
     /// Whether the wheel at `(x, y)` is over the directory preview.
     pub(in crate::grid) fn over_preview(self, x: usize, y: usize) -> bool {
-        self.area.contains(x, y) && x >= self.area.x + self.left
+        self.preview_area().is_some_and(|area| area.contains(x, y))
+    }
+
+    /// Whether the wheel at `(x, y)` is over the project list.
+    pub(in crate::grid) fn over_list(self, x: usize, y: usize) -> bool {
+        self.list_area().is_some_and(|area| area.contains(x, y))
     }
 
     /// Whether the press at `(x, y)` is inside the filter prompt.
     pub(super) fn over_filter(self, x: usize, y: usize) -> bool {
-        y == self.area.y + QUERY_ROW && (self.area.x + 1..self.area.x + self.left - 1).contains(&x)
+        self.list_area().is_some_and(|area| {
+            y == area.y + QUERY_ROW && (area.x + 1..area.x + area.w - 1).contains(&x)
+        })
     }
 }
 
@@ -139,6 +174,8 @@ pub(in crate::grid) enum ProjectPickerAction {
 
 /// Snapshot of project history and input state for one open picker.
 pub(in crate::grid) struct ProjectPicker {
+    /// The pane titles still open in this picker session.
+    panes: ProjectPanes,
     /// Projects in history order.
     projects: Vec<ProjectChoice>,
     /// Indices of the projects satisfying the query, in history order.
@@ -189,6 +226,7 @@ impl ProjectPicker {
             }
         }
         Self {
+            panes: ProjectPanes::Both,
             matches: (0..projects.len()).collect(),
             projects,
             query: String::new(),
@@ -204,6 +242,7 @@ impl ProjectPicker {
     /// Load the latest `roots`, keeping the filter and selecting a nearby row if its project is gone.
     pub(in crate::grid) fn refresh_history(&mut self, roots: &[PathBuf]) {
         let mut refreshed = Self::new(roots);
+        refreshed.panes = self.panes;
         refreshed.query = std::mem::take(&mut self.query);
         refreshed.filter_focused = self.filter_focused;
         refreshed.refilter();
@@ -230,10 +269,56 @@ impl ProjectPicker {
         self.filter_focused
     }
 
+    /// Lay out the panes still open in the picker.
+    pub(super) fn layout(&self, cols: usize, rows: usize) -> ProjectLayout {
+        ProjectLayout::new(cols, rows, self.panes)
+    }
+
+    /// Whether the picker still shows the projects and filter.
+    pub(super) fn shows_list(&self) -> bool {
+        self.panes != ProjectPanes::Preview
+    }
+
+    /// Whether a scan is needed for the highlighted project's directory preview.
+    pub(in crate::grid) fn shows_preview(&self) -> bool {
+        self.panes != ProjectPanes::List
+    }
+
+    /// Close the title at `position`, or return to the launcher if it was the last pane.
+    pub(in crate::grid) fn close_title_at(
+        &mut self,
+        layout: ProjectLayout,
+        position: Point<Pixels>,
+        metrics: Metrics,
+        spacing: &TextSpacing,
+    ) -> ProjectPickerAction {
+        let remaining = if layout.list_area().is_some_and(|area| {
+            title_at(area, i18n::text("start.recent"), position, metrics, spacing)
+        }) {
+            ProjectPanes::Preview
+        } else if layout
+            .preview_area()
+            .is_some_and(|area| title_at(area, self.preview_title(), position, metrics, spacing))
+        {
+            ProjectPanes::List
+        } else {
+            return ProjectPickerAction::Ignore;
+        };
+        if self.panes != ProjectPanes::Both {
+            return ProjectPickerAction::Close;
+        }
+        self.panes = remaining;
+        if !self.shows_list() {
+            self.focus_list();
+        }
+        ProjectPickerAction::Update
+    }
+
     /// Measure the caret's column with `spacing` and return its row relative to `layout`.
     pub(super) fn caret(&self, layout: ProjectLayout, spacing: &TextSpacing) -> (f32, usize) {
         if self.filter_focused() {
-            let (query, _) = self.filter_row(layout.left, spacing);
+            let width = layout.list_area().expect("focused project list").w;
+            let (query, _) = self.filter_row(width, spacing);
             let units = spacing.cells(&query).last().map_or(0, |cell| cell.end);
             (
                 QUERY_COLUMN as f32 + units as f32 / UNITS_PER_COLUMN as f32,
@@ -309,7 +394,7 @@ impl ProjectPicker {
                 (true, _) => return Text,
                 (false, Some("j")) => self.move_selection(count, rows),
                 (false, Some("k")) => self.move_selection(-count, rows),
-                (false, Some("/")) => self.focus_filter(),
+                (false, Some("/")) if self.shows_list() => self.focus_filter(),
                 (false, Some("d")) if !event.is_held && self.selected().is_some() => {
                     return ConfirmRemove;
                 }
@@ -329,6 +414,12 @@ impl ProjectPicker {
         self.matches
             .get(self.selected)
             .map(|&index| &self.projects[index])
+    }
+
+    /// Caption of the directory preview, even when no project matches the filter.
+    fn preview_title(&self) -> &str {
+        self.selected_choice()
+            .map_or_else(|| i18n::text("start.preview"), |project| &project.name)
     }
 
     /// Append committed single-line `text` and recompute the filtered list.
@@ -406,8 +497,9 @@ impl ProjectPicker {
 
     /// Resolve a press in `layout` at `(x, y)` to a visible filtered project row.
     pub(super) fn hit(&self, layout: ProjectLayout, x: usize, y: usize) -> Option<usize> {
-        let column = x.checked_sub(layout.area.x)?;
-        if column == 0 || column >= layout.left - 1 {
+        let area = layout.list_area()?;
+        let column = x.checked_sub(area.x)?;
+        if column == 0 || column >= area.w - 1 {
             return None;
         }
         let range = self.visible(layout.project_rows());
@@ -426,22 +518,62 @@ impl ProjectPicker {
         spacing: &TextSpacing,
     ) -> Frame {
         let Rect { w, h, .. } = layout.area;
-        let right = layout.left;
         let mut frame = Frame::new(w, layout.frame_area().h);
-        pane_border(
-            &mut frame,
-            0..layout.left,
-            h,
-            i18n::text("start.recent"),
-            ACCENT,
-            spacing,
-        );
-        let title = self
-            .selected_choice()
-            .map_or_else(|| i18n::text("start.preview"), |project| &project.name);
-        pane_border(&mut frame, right..w, h, title, MUTED, spacing);
-        self.draw_filter(&mut frame, layout.left, spacing);
-        let end = layout.left - 1;
+        if let Some(list) = layout.list_area() {
+            pane_border(
+                &mut frame,
+                0..list.w,
+                h,
+                i18n::text("start.recent"),
+                ACCENT,
+                spacing,
+            );
+            self.draw_list(&mut frame, list.w, layout.project_rows(), spacing);
+        }
+        if let Some(pane) = layout.preview_area() {
+            let columns = pane.x - layout.area.x..w;
+            pane_border(
+                &mut frame,
+                columns.clone(),
+                h,
+                self.preview_title(),
+                MUTED,
+                spacing,
+            );
+            if self.selected().is_some() {
+                self.draw_preview(&mut frame, columns, layout.preview_rows(), preview, spacing);
+            }
+        }
+        let status = if status.is_empty()
+            && let Some(error) = history_error
+        {
+            Cow::Owned(i18n::format("start.history_error", &[("error", &error)]))
+        } else {
+            Cow::Borrowed(status)
+        };
+        if status.is_empty() {
+            let slot = 2..w - 2;
+            let shortcuts = self.shortcut_text(slot.len(), spacing);
+            frame.styled_label(h, slot, &shortcuts, TEXT, spacing, LabelStyle::Dimmed);
+        } else {
+            let (row, end) = layout
+                .list_area()
+                .map_or((h, w - 1), |list| (h - 2, list.w - 1));
+            frame.label(
+                row,
+                2..end,
+                &spacing.ellipsize(&status, end - 2),
+                GOLD,
+                spacing,
+            );
+        }
+        frame
+    }
+
+    /// Paint the filter and the visible rows of the recent-project list.
+    fn draw_list(&self, frame: &mut Frame, width: usize, rows: usize, spacing: &TextSpacing) {
+        self.draw_filter(frame, width, spacing);
+        let end = width - 1;
         if self.matches.is_empty() {
             let message = if self.projects.is_empty() {
                 "start.empty"
@@ -450,7 +582,7 @@ impl ProjectPicker {
             };
             frame.label(PROJECT_TOP, 2..end, i18n::text(message), MUTED, spacing);
         }
-        for (row, index) in self.visible(layout.project_rows()).enumerate() {
+        for (row, index) in self.visible(rows).enumerate() {
             let row = PROJECT_TOP + row;
             let project = &self.projects[self.matches[index]];
             let color = if index == self.selected {
@@ -478,34 +610,13 @@ impl ProjectPicker {
                 );
             }
         }
-        let status = if status.is_empty()
-            && let Some(error) = history_error
-        {
-            Cow::Owned(i18n::format("start.history_error", &[("error", &error)]))
-        } else {
-            Cow::Borrowed(status)
-        };
-        frame.label(
-            h - 2,
-            2..end,
-            &spacing.ellipsize(&status, end - 2),
-            GOLD,
-            spacing,
-        );
-        if status.is_empty() {
-            let slot = 2..w - 2;
-            let shortcuts = self.shortcut_text(slot.len(), spacing);
-            frame.styled_label(h, slot, &shortcuts, TEXT, spacing, LabelStyle::Dimmed);
-        }
-        if self.selected().is_some() {
-            self.draw_preview(&mut frame, layout, preview, spacing);
-        }
-        frame
     }
 
     /// Format complete shortcuts for the current focus and selection within `columns`, measured by `spacing`.
     fn shortcut_text(&self, columns: usize, spacing: &TextSpacing) -> String {
-        let focus_hints: &[(&str, &str)] = if self.filter_focused() {
+        let focus_hints: &[(&str, &str)] = if !self.shows_list() {
+            &[("picker.hint_back", "Esc")]
+        } else if self.filter_focused() {
             &[("start.browse_projects", "Esc")]
         } else {
             &[("start.continue_filter", "/"), ("picker.hint_back", "Esc")]
@@ -571,23 +682,21 @@ impl ProjectPicker {
         frame.text(1, RULE_ROW, &"─".repeat(width - 2), MUTED, width - 2);
     }
 
-    /// Draw the current `preview` within the right pane of `layout`.
+    /// Draw the current `preview` within the pane's `columns` and visible `rows`.
     fn draw_preview(
         &self,
         frame: &mut Frame,
-        layout: ProjectLayout,
+        columns: Range<usize>,
+        rows: usize,
         preview: PreviewRows<'_>,
         spacing: &TextSpacing,
     ) {
-        let x = layout.left;
-        let slot = x + LABEL_COLUMN..layout.area.w - 1;
+        let x = columns.start;
+        let slot = x + LABEL_COLUMN..columns.end - 1;
         match preview {
             Some(Ok(entries)) if !entries.is_empty() => {
-                let visible = layout.preview_rows();
-                let first = self
-                    .preview_first
-                    .min(entries.len().saturating_sub(visible));
-                for (index, entry) in entries.iter().skip(first).take(visible).enumerate() {
+                let first = self.preview_first.min(entries.len().saturating_sub(rows));
+                for (index, entry) in entries.iter().skip(first).take(rows).enumerate() {
                     let row = index + 1;
                     let name = entry.path.file_name().unwrap_or_default().to_string_lossy();
                     frame.icon(x + 2, row, entry.icon(false));
@@ -632,16 +741,14 @@ fn pane_border(
     color: u32,
     spacing: &TextSpacing,
 ) {
-    let width = columns.len();
-    let title = spacing.ellipsize(title, width - 6);
-    let title_width = spacing.columns(&title);
-    let title_start = columns.start + (width - title_width) / 2;
-    let title_end = title_start + title_width;
+    let (title, slot) = pane_title(columns.len(), title, spacing);
+    let title_start = columns.start + slot.start;
+    let title_end = columns.start + slot.end;
     frame.outline(
         Rect {
             x: columns.start,
             y: 0,
-            w: width,
+            w: columns.len(),
             h: height,
         },
         color,
@@ -649,6 +756,38 @@ fn pane_border(
         std::iter::once(title_start - 1..title_end + 1),
     );
     frame.label(0, title_start..title_end, &title, color, spacing);
+}
+
+/// Center `title` in the same columns for painting and pointer hit testing.
+fn pane_title<'a>(
+    width: usize,
+    title: &'a str,
+    spacing: &TextSpacing,
+) -> (Cow<'a, str>, Range<usize>) {
+    let title = spacing.ellipsize(title, width.saturating_sub(6));
+    let title_width = spacing.columns(&title);
+    let start = (width - title_width) / 2;
+    (title, start..start + title_width)
+}
+
+/// Test `position` against the displayed title inside `area`.
+fn title_at(
+    area: Rect,
+    title: &str,
+    position: Point<Pixels>,
+    metrics: Metrics,
+    spacing: &TextSpacing,
+) -> bool {
+    let (_, columns) = pane_title(area.w, title, spacing);
+    !columns.is_empty()
+        && Rect {
+            x: area.x + columns.start,
+            w: columns.len(),
+            h: 1,
+            ..area
+        }
+        .pixels(metrics)
+        .contains(&position)
 }
 
 /// Show the user-facing spelling of a canonical `path`.
@@ -672,7 +811,7 @@ pub(super) fn display_path(path: &Path) -> Cow<'_, str> {
 mod tests {
     use super::*;
     use crate::ui::keys::normal_character;
-    use gpui::{FontId, Keystroke, NoopTextSystem};
+    use gpui::{FontId, Keystroke, NoopTextSystem, point, px};
     use std::sync::Arc;
 
     /// Give tests fixed-width ASCII and double-width Han spacing without a native window.
@@ -707,6 +846,72 @@ mod tests {
         }
     }
 
+    /// Rendering and preview-wheel targeting share the same pane after the one-column gap.
+    #[test]
+    fn project_layout_reserves_a_column_between_panes() {
+        let layout = ProjectLayout::new(90, 24, ProjectPanes::Both);
+        let left = layout.list_area().unwrap();
+        let right = layout.preview_area().unwrap();
+        let gap = left.x + left.w;
+        assert_eq!(right.x, gap + 1);
+        assert_eq!(right.x + right.w, layout.area.x + layout.area.w);
+        assert!(!layout.over_preview(gap, right.y + 1));
+        assert!(layout.over_preview(right.x, right.y + 1));
+    }
+
+    /// Dismiss either visible caption independently and close on the last title.
+    #[test]
+    fn project_titles_close_independently() {
+        use ProjectPickerAction::{Close, Ignore, Open, Update};
+
+        let roots = [PathBuf::from("Team/project")];
+        let metrics = Metrics {
+            origin: point(px(0.), px(0.)),
+            cw: 10.,
+            lh: 20.,
+            font_size: 16.,
+        };
+        let spacing = spacing();
+        let center =
+            |area: Rect| metrics.at(area.x as f32 + area.w as f32 / 2., area.y as f32 + 0.5);
+        for close_list_first in [true, false] {
+            let mut picker = ProjectPicker::new(&roots);
+            let layout = picker.layout(90, 24);
+            let first = if close_list_first {
+                layout.list_area()
+            } else {
+                layout.preview_area()
+            }
+            .unwrap();
+            let border = metrics.at(first.x as f32 + 0.5, first.y as f32 + 0.5);
+            assert_eq!(
+                picker.close_title_at(layout, border, metrics, &spacing),
+                Ignore
+            );
+            assert_eq!(
+                picker.close_title_at(layout, center(first), metrics, &spacing),
+                Update
+            );
+
+            let layout = picker.layout(90, 24);
+            assert!(layout.pane_areas().eq([layout.area]));
+            assert_eq!(picker.shows_list(), !close_list_first);
+            assert_eq!(picker.shows_preview(), close_list_first);
+            assert_eq!(picker.filter_focused(), !close_list_first);
+            assert_eq!(press(&mut picker, layout, "enter"), Open);
+            if close_list_first {
+                assert_eq!(press(&mut picker, layout, "/"), Ignore);
+                assert!(!layout.over_filter(layout.area.x + 2, layout.area.y + QUERY_ROW));
+            }
+            picker.refresh_history(&roots);
+            assert!(picker.layout(90, 24).pane_areas().eq([layout.area]));
+            assert_eq!(
+                picker.close_title_at(layout, center(layout.area), metrics, &spacing),
+                Close
+            );
+        }
+    }
+
     /// Match contiguous directory-name text and move the caret with the input focus.
     #[test]
     fn filtering_selects_a_matching_project() {
@@ -716,7 +921,8 @@ mod tests {
             PathBuf::from("Team/项目示例"),
         ];
         let mut picker = ProjectPicker::new(&roots);
-        let layout = ProjectLayout::new(90, 24);
+        let layout = picker.layout(90, 24);
+        let width = layout.list_area().unwrap().w;
         let spacing = spacing();
         assert_eq!(picker.selected_root(), Some(roots[0].as_path()));
         assert_eq!(
@@ -737,12 +943,12 @@ mod tests {
         );
         picker.commit_filter(&"z".repeat(100));
         assert_eq!(picker.selected_root(), None);
-        let (query, count) = picker.filter_row(layout.left, &spacing);
+        let (query, count) = picker.filter_row(width, &spacing);
         assert_eq!(
             picker.caret(layout, &spacing),
             ((QUERY_COLUMN + query.len()) as f32, QUERY_ROW)
         );
-        assert_eq!(QUERY_COLUMN + query.len() + count.len() + 4, layout.left);
+        assert_eq!(QUERY_COLUMN + query.len() + count.len() + 4, width);
         assert_eq!(
             press(&mut picker, layout, "escape"),
             ProjectPickerAction::Update
@@ -760,7 +966,7 @@ mod tests {
             (QUERY_COLUMN as f32, QUERY_ROW)
         );
         picker.composition.mark(None, "项目", None);
-        assert_eq!(picker.filter_row(layout.left, &spacing).0, "项目");
+        assert_eq!(picker.filter_row(width, &spacing).0, "项目");
         assert_eq!(picker.selected_root(), Some(roots[0].as_path()));
         picker.focus_list();
         assert!(picker.composition.is_empty());
@@ -779,7 +985,7 @@ mod tests {
             PathBuf::from("Team/jk2-second"),
         ];
         let mut picker = ProjectPicker::new(&roots);
-        let layout = ProjectLayout::new(90, 24);
+        let layout = picker.layout(90, 24);
         let spacing = spacing();
         for key in ["j", "k", "2", "down"] {
             assert_eq!(press(&mut picker, layout, key), Update);
@@ -812,7 +1018,7 @@ mod tests {
     #[test]
     fn filter_hint_follows_list_focus() {
         let mut picker = ProjectPicker::new(&[]);
-        let layout = ProjectLayout::new(90, 24);
+        let layout = picker.layout(90, 24);
         let spacing = spacing();
         let filtering = picker.frame(layout, None, "", None, &spacing);
         let status = "Project unavailable";
@@ -866,7 +1072,7 @@ mod tests {
             PathBuf::from("Team/first"),
         ];
         let mut picker = ProjectPicker::new(&roots);
-        let layout = ProjectLayout::new(90, 24);
+        let layout = picker.layout(90, 24);
         assert_eq!(press(&mut picker, layout, "d"), Update);
         assert_eq!(picker.query, "d");
         assert_eq!(press(&mut picker, layout, "escape"), Update);
@@ -888,7 +1094,7 @@ mod tests {
             .map(|i| PathBuf::from(format!("project-{i}")))
             .collect();
         let mut picker = ProjectPicker::new(&roots);
-        let layout = ProjectLayout::new(90, 24);
+        let layout = picker.layout(90, 24);
         let rows = layout.project_rows();
         assert_eq!(
             press(&mut picker, layout, "escape"),
@@ -906,7 +1112,7 @@ mod tests {
         assert_eq!(picker.hit(layout, layout.area.x + 2, last), Some(39));
         assert_eq!(picker.hit(layout, layout.area.x + 2, last + 1), None);
         assert_eq!(
-            picker.hit(layout, layout.area.x + layout.left + 2, last),
+            picker.hit(layout, layout.preview_area().unwrap().x + 1, last),
             None
         );
         for key in ["1", "2", "k"] {

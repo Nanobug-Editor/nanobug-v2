@@ -1,0 +1,27 @@
+Nanobug Vim Help
+
+                                                      *g==*
+Move to a Vim example and press g== to run the complete block.
+
+>vim
+    echo 6 * 7
+<
+
+>vim
+    let values = [2, 4, 8]
+    echo join(values, ', ')
+<
+
+                                                      *operatorfunc*
+Define and select a function to use as an operator. g@ takes a motion or
+text object, g@@ works on the current line, and Visual g@ uses the selection.
+The function receives "char", "line", or "block". The '[ and '] marks delimit
+the operated text.
+
+    :function! ShowKind(kind) | echo a:kind | endfunction
+    :set operatorfunc=ShowKind
+    g@iw
+
+                                                      *expression* *@=*
+Use Ctrl+R = in Insert or Command-line mode to evaluate an expression and
+insert its result. With @=, the result is used as a sequence of Normal keys.

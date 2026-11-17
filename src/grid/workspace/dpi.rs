@@ -2,7 +2,7 @@
 
 use super::{
     Workspace,
-    layout::{OUTER_INSET_Y, TAB_GAP_Y},
+    layout::{OUTER_INSET_Y, PANE_GAP_Y},
 };
 use crate::{
     grid::{render::Metrics, windows::start::StartPage},
@@ -37,7 +37,7 @@ pub(super) fn measure(
         cw: (advance * scale).round().max(1.) / scale,
         lh: (height * scale).ceil() / scale,
         font_size,
-        origin: point(px(14.), px(OUTER_INSET_Y + TAB_GAP_Y)),
+        origin: point(px(14.), px(OUTER_INSET_Y + PANE_GAP_Y)),
     };
     let chinese = system.resolve_font(&GRID_CHINESE_FONT);
     let spacing = TextSpacing::new(glyphs.clone(), chinese, font_size, metrics.cw);
@@ -102,6 +102,12 @@ impl Workspace {
             (self.metrics, self.spacing) = measure(window, &self.glyphs, self.appearance);
         }
         let metrics = self.metrics;
+        if let Some(menu) = &self.vim_menu {
+            menu.set_appearance(metrics, cx);
+        }
+        if let Some(history) = &self.command_window {
+            history.set_appearance(metrics, cx);
+        }
         self.tabs.set_metrics(metrics, remeasure, cx);
         self.start_panel.update(cx, |panel, cx| {
             panel.set_appearance(StartPage::content_metrics(metrics), cx)

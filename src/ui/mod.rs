@@ -10,3 +10,4 @@ pub(crate) mod keys;
 pub(crate) mod native_atlas;
 pub(crate) mod text;
 pub(crate) mod theme;
+pub(crate) mod window_geometry;

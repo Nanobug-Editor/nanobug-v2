@@ -1,7 +1,10 @@
 //! One retained document viewport, including IME display text and measured caret positions.
 
 use super::markdown::{MarkdownHighlights, MarkdownViewport, is_markdown};
-use crate::ui::text::{TextSpacing, UNITS_PER_COLUMN};
+use crate::{
+    grid::windows::terminal::Terminal,
+    ui::text::{TextSpacing, UNITS_PER_COLUMN},
+};
 use nanobug::{
     animation::scroll::GridScroll,
     document::Document,
@@ -14,7 +17,7 @@ use nanobug_plugin_sdk::{
 };
 use std::{
     borrow::Cow,
-    cell::Ref,
+    cell::{Ref, RefCell},
     ops::Range,
     sync::{
         Arc,
@@ -87,18 +90,50 @@ pub(in crate::grid) const TEXT_OVERSCAN: usize = 4;
 /// Virtual placeholder preceding the closing brace of a folded code block.
 pub(super) const FOLD_ELLIPSIS: &str = " ... ";
 
+/// Display text for one logical line, with byte ranges for IME and synthetic fold cells.
+pub(super) struct PaintedLine<'a> {
+    /// Source text plus any preedit and rendered fold placeholder.
+    pub(super) text: Cow<'a, str>,
+    /// Byte range occupied by preedit text in `text`.
+    pub(super) preedit: Option<Range<usize>>,
+    /// Byte mapping for the synthesized ellipsis and closing brace.
+    pub(super) fold_suffix: Option<FoldSuffix>,
+}
+
+/// Map the fold placeholder's synthetic bytes to the displayed line and source document.
+pub(super) struct FoldSuffix {
+    /// First byte of the synthetic ellipsis on the displayed line.
+    pub(super) start_byte: usize,
+    /// First displayed byte of the synthetic closing brace.
+    pub(super) closing_byte: usize,
+    /// Actual document byte offset of the closing brace.
+    pub(super) closing_offset: usize,
+}
+
+/// Read displayed text from either a retained buffer or the Vim state during a replay.
+#[derive(Clone, Copy)]
+pub(super) struct LineSource<'a>(pub(super) &'a Vim);
+
 /// One open file and its retained viewport, displayed through the single editing area.
 pub(in crate::grid) struct Buffer {
     /// Stable identity retained when the buffer moves between tabs.
     pub(in crate::grid) id: u64,
     /// Document and modal state.
     pub(in crate::grid) vim: Vim,
+    /// Terminal screen and process when this buffer is backed by a PTY.
+    pub(super) terminal: Option<Terminal>,
     /// Continuous viewport position with a whole-row destination.
     pub(in crate::grid) scroll: GridScroll,
+    /// Last bound target and the requested row before clamping at a document boundary.
+    pub(super) bound_scroll: Option<(usize, isize)>,
     /// Continuous horizontal offset in base grid columns, independent of logical text columns.
     pub(in crate::grid) columns: GridScroll,
     /// Markdown mode and scroll position materialized from the current Tabpage.
     pub(super) markdown: MarkdownViewport,
+    /// Most recently measured Markdown source rows and their layout inputs.
+    pub(super) wraps: RefCell<Option<super::wrap::WrappedRows>>,
+    /// Source byte of the saved viewport's top fragment, awaiting native layout on restore.
+    pub(super) restored_wrap_byte: Option<usize>,
     /// Validated syntax data from the selected language provider for this buffer.
     presentation: Option<(nanobug::plugins::session::Key, Arc<DocumentPresentation>)>,
     /// Unchanged syntax spans remapped to the current revision while the parser catches up.
@@ -112,6 +147,72 @@ pub(in crate::grid) struct Buffer {
 }
 
 impl Buffer {
+    /// Create a listed placeholder for a file that has not been loaded yet.
+    pub(in crate::grid) fn unloaded(doc: Document) -> Self {
+        Self::new(doc)
+    }
+
+    /// Create the Session's terminal buffer with a stable Ex number.
+    pub(in crate::grid) fn terminal_view(terminal: Terminal) -> Self {
+        let mut view = Self::with_vim(Vim::read_only(Document::new("")));
+        view.terminal = Some(terminal);
+        view
+    }
+
+    /// Access this buffer's local terminal input state and shared process.
+    pub(in crate::grid) fn terminal(&self) -> Option<&Terminal> {
+        self.terminal.as_ref()
+    }
+
+    /// Create a scratch Options view that applies its commands in `pane`.
+    pub(in crate::grid) fn options_sheet(doc: Document, pane: usize) -> Self {
+        let mut view = Self::new(doc);
+        view.vim.mark_ex_options_editor(pane);
+        view
+    }
+
+    /// Whether this buffer represents editable text that other panes can display.
+    pub(in crate::grid) fn supports_shared_view(&self) -> bool {
+        self.terminal.is_none() && !self.vim.is_read_only()
+    }
+
+    /// Open a fresh caret and viewport onto this buffer's shared document.
+    pub(in crate::grid) fn shared_view(&self) -> Self {
+        let mut view = Self::new(self.vim.doc.shared_view());
+        view.vim.share_buffer_options(&self.vim);
+        view
+    }
+
+    /// Create an independent preview while preserving editability and any PTY backing.
+    pub(in crate::grid) fn preview_view(&self) -> Self {
+        if !self.vim.is_read_only() {
+            return self.shared_view();
+        }
+        let doc = self.vim.doc.shared_view();
+        let mut view = Self::with_vim(if self.vim.is_help() {
+            Vim::help(doc)
+        } else {
+            Vim::read_only(doc)
+        });
+        view.terminal = self.terminal.as_ref().map(Terminal::shared_view);
+        if view.terminal.is_some() {
+            view.vim.share_buffer_options(&self.vim);
+        }
+        view
+    }
+
+    /// Share a text buffer or PTY in a new pane with its own local input state.
+    pub(in crate::grid) fn split_view(&self) -> Option<Self> {
+        (self.supports_shared_view() || self.terminal.is_some()).then(|| self.preview_view())
+    }
+
+    /// Incorporate changes from another view, invalidating derived presentation for old text.
+    pub(super) fn refresh_shared_document(&mut self) {
+        if self.vim.refresh_shared_document() {
+            self.set_presentation(None);
+        }
+    }
+
     /// Start editing `doc` with a fresh Vim state and viewport.
     pub(super) fn new(doc: Document) -> Self {
         Self::with_vim(Vim::new(doc))
@@ -122,9 +223,13 @@ impl Buffer {
         Self {
             id: NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed),
             vim,
+            terminal: None,
             scroll: GridScroll::default(),
+            bound_scroll: None,
             columns: GridScroll::default(),
             markdown: MarkdownViewport::default(),
+            wraps: RefCell::new(None),
+            restored_wrap_byte: None,
             presentation: None,
             retained_highlights: None,
             markdown_highlights: MarkdownHighlights::default(),
@@ -385,63 +490,45 @@ impl Buffer {
             - 1
     }
 
-    /// Return document `row` with any active insert `composition`, plus its temporary byte range.
+    /// Return document `row` with inline `composition` for editing or a literal argument.
+    /// The optional byte range marks the temporary text in the returned line.
     pub(in crate::grid) fn displayed_line(
         &self,
         row: usize,
         composition: &str,
     ) -> (Cow<'_, str>, Option<Range<usize>>) {
-        let doc = &self.vim.doc;
-        let range = doc.line_range(row);
-        let line = &doc.text[range.clone()];
-        if composition.is_empty()
-            || !self.vim.mode.is_insert()
-            || !(range.start..=range.end).contains(&doc.cursor)
-        {
-            return (Cow::Borrowed(line), None);
-        }
-        let offset = doc.cursor - range.start;
-        let mut displayed = String::with_capacity(line.len() + composition.len());
-        displayed.push_str(&line[..offset]);
-        displayed.push_str(composition);
-        displayed.push_str(&line[offset..]);
-        (
-            Cow::Owned(displayed),
-            Some(offset..offset + composition.len()),
-        )
+        LineSource(&self.vim).displayed_line(row, composition)
+    }
+
+    /// Assemble the displayed logical `row` with current IME `composition` and any virtual fold suffix.
+    pub(super) fn painted_line(&self, row: usize, composition: &str) -> PaintedLine<'_> {
+        LineSource(&self.vim).painted_line(row, composition)
     }
 
     /// Borrow the closing brace and adjacent terminator of a folded block, with their source offset.
     pub(super) fn folded_brace(&self, row: usize) -> Option<(usize, &str)> {
-        let doc = &self.vim.doc;
-        let (_, closing) = doc.folded_braces(row)?;
-        let end = closing + 1 + usize::from(doc.text[closing + 1..].starts_with([',', ';']));
-        Some((closing, &doc.text[closing..end]))
+        LineSource(&self.vim).folded_brace(row)
     }
 
     /// Fit the fold suffix next to its opening brace, retaining source space for editing.
     pub(super) fn fold_header<'a>(&self, row: usize, line: &'a str) -> &'a str {
-        let prefix = line.trim_end();
-        let doc = &self.vim.doc;
-        let range = doc.line_range(row);
-        if (range.start..=range.end).contains(&doc.cursor)
-            && (self.vim.mode.is_insert() || doc.cursor >= range.start + prefix.len())
-        {
-            line
-        } else {
-            prefix
-        }
+        LineSource(&self.vim).fold_header(row, line)
     }
 
     /// Measure the rendered line and its virtual fold suffix for horizontal scrolling.
     pub(super) fn display_columns(&self, row: usize, line: &str, spacing: &TextSpacing) -> usize {
+        let columns = |line| {
+            spacing
+                .buffer_cells(line, 0, 0, self.vim.doc.tabstop())
+                .last()
+                .map_or(0, |cell| cell.end.div_ceil(UNITS_PER_COLUMN))
+        };
         if let Some((_, brace)) = self.folded_brace(row) {
-            spacing.columns(self.fold_header(row, line)) + FOLD_ELLIPSIS.len() + brace.len()
+            columns(self.fold_header(row, line)) + FOLD_ELLIPSIS.len() + brace.len()
         } else {
-            spacing.columns(line)
+            columns(line)
         }
     }
-
     /// Measure the three visible dots in spacing units on a folded preview line.
     pub(super) fn fold_ellipsis_span(
         &self,
@@ -450,7 +537,10 @@ impl Buffer {
         spacing: &TextSpacing,
     ) -> Range<usize> {
         let header = self.fold_header(row, line);
-        let end = spacing.cells(header).last().map_or(0, |cell| cell.end);
+        let end = spacing
+            .buffer_cells(header, 0, 0, self.vim.doc.tabstop())
+            .last()
+            .map_or(0, |cell| cell.end);
         end + UNITS_PER_COLUMN..end + (FOLD_ELLIPSIS.len() - 1) * UNITS_PER_COLUMN
     }
 
@@ -468,7 +558,7 @@ impl Buffer {
         }
         let offset = self.vim.doc.cursor - self.vim.doc.starts[row];
         let mut end = 0;
-        for cell in spacing.cells(line) {
+        for cell in spacing.buffer_cells(line, 0, 0, self.vim.doc.tabstop()) {
             if cell.byte + cell.text.len() > offset {
                 let width = if self.vim.mode.is_insert() || cell.text == "\t" {
                     UNITS_PER_COLUMN
@@ -490,5 +580,77 @@ impl Buffer {
     /// Text panel's horizontal displacement from its clip, in base grid columns.
     pub(in crate::grid) fn text_displacement(&self) -> f32 {
         self.left_padding() as f32 + self.columns.fraction()
+    }
+}
+
+impl<'a> LineSource<'a> {
+    /// Return the source line with pending IME text inserted at the caret.
+    pub(super) fn displayed_line(
+        self,
+        row: usize,
+        composition: &str,
+    ) -> (Cow<'a, str>, Option<Range<usize>>) {
+        let doc = &self.0.doc;
+        let range = doc.line_range(row);
+        let line = &doc.text[range.clone()];
+        if composition.is_empty()
+            || !(self.0.mode.is_insert() || self.0.awaits_literal_argument())
+            || !(range.start..=range.end).contains(&doc.cursor)
+        {
+            return (Cow::Borrowed(line), None);
+        }
+        let offset = doc.cursor - range.start;
+        let mut displayed = String::with_capacity(line.len() + composition.len());
+        displayed.push_str(&line[..offset]);
+        displayed.push_str(composition);
+        displayed.push_str(&line[offset..]);
+        (
+            Cow::Owned(displayed),
+            Some(offset..offset + composition.len()),
+        )
+    }
+
+    /// Append the virtual ellipsis and closing brace of a collapsed source line.
+    pub(super) fn painted_line(self, row: usize, composition: &str) -> PaintedLine<'a> {
+        let (mut text, preedit) = self.displayed_line(row, composition);
+        let fold_suffix = self.folded_brace(row).map(|(closing_offset, brace)| {
+            let start_byte = self.fold_header(row, &text).len();
+            let text = text.to_mut();
+            text.truncate(start_byte);
+            text.push_str(FOLD_ELLIPSIS);
+            text.push_str(brace);
+            FoldSuffix {
+                start_byte,
+                closing_byte: start_byte + FOLD_ELLIPSIS.len(),
+                closing_offset,
+            }
+        });
+        PaintedLine {
+            text,
+            preedit,
+            fold_suffix,
+        }
+    }
+
+    /// Find the real source offset and text of a folded line's closing brace.
+    pub(super) fn folded_brace(self, row: usize) -> Option<(usize, &'a str)> {
+        let doc = &self.0.doc;
+        let (_, closing) = doc.folded_braces(row)?;
+        let end = closing + 1 + usize::from(doc.text[closing + 1..].starts_with([',', ';']));
+        Some((closing, &doc.text[closing..end]))
+    }
+
+    /// Trim trailing space from a fold header unless the caret can edit that space.
+    pub(super) fn fold_header<'b>(self, row: usize, line: &'b str) -> &'b str {
+        let prefix = line.trim_end();
+        let doc = &self.0.doc;
+        let range = doc.line_range(row);
+        if (range.start..=range.end).contains(&doc.cursor)
+            && (self.0.mode.is_insert() || doc.cursor >= range.start + prefix.len())
+        {
+            line
+        } else {
+            prefix
+        }
     }
 }

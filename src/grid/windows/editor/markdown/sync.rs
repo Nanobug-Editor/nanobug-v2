@@ -1,14 +1,14 @@
 //! Translate between source viewport rows and rendered Markdown pixels.
 
+use super::super::wrap::VisualRows;
 use super::PreviewScrollOrigin;
-use nanobug::document::Document;
 
 /// Correspondence between the scrollable parts of two views of one Markdown document.
 pub(super) struct ScrollMap<'a> {
     /// Interior points ordered by physical source row and logical preview pixels.
     points: &'a [(f32, f32)],
-    /// The active source document supplies the visible rows after folding.
-    doc: &'a Document,
+    /// Source rows after folding and soft wrapping.
+    rows: VisualRows<'a>,
     /// Last full screen of source rows and last full screen of preview pixels.
     end: (f32, f32),
     /// Largest editor scroll position, in visible source rows.
@@ -16,43 +16,43 @@ pub(super) struct ScrollMap<'a> {
 }
 
 impl<'a> ScrollMap<'a> {
-    /// Keep layout `points` reachable by both viewports and pair their natural scroll limits.
+    /// Keep layout `points` reachable by both viewports. Pair the end of the source
+    /// viewport of `source_height` visual `rows` with the rendered `preview_max` offset.
     pub(super) fn new(
         points: &'a [(f32, f32)],
-        doc: &'a Document,
+        rows: VisualRows<'a>,
         source_height: usize,
         preview_max: usize,
     ) -> Option<Self> {
-        let source_max = doc.display_rows().saturating_sub(source_height.max(1));
+        let source_max = rows.len().saturating_sub(source_height.max(1));
         if source_max == 0 || preview_max == 0 {
             return None;
         }
-        let end = (doc.document_row(source_max) as f32, preview_max as f32);
+        let end = (
+            rows.document_position(source_max as f32),
+            preview_max as f32,
+        );
         let first = points.partition_point(|&(row, pixel)| row <= 0. || pixel <= 0.);
         let bounded = &points[first..];
         let last = bounded.partition_point(|&(row, pixel)| row < end.0 && pixel < end.1);
         Some(Self {
             points: &bounded[..last],
-            doc,
+            rows,
             end,
             source_max,
         })
     }
 
-    /// Convert the animated source `display_row` to a preview offset in logical pixels.
-    pub(super) fn preview_top(&self, display_row: f32) -> f32 {
-        let row = display_row.clamp(0., self.source_max as f32);
-        let first = self.doc.document_row(row.floor() as usize) as f32;
-        let next = self.doc.document_row(row.ceil() as usize) as f32;
-        self.map(first + (next - first) * row.fract(), |p| p)
+    /// Convert the animated source `visual_row` to a preview offset in logical pixels.
+    pub(super) fn preview_top(&self, visual_row: f32) -> f32 {
+        let row = visual_row.clamp(0., self.source_max as f32);
+        self.map(self.rows.document_position(row), |p| p)
     }
 
-    /// Convert the animated preview offset `pixels` to a visible editor row, accounting for folds.
+    /// Convert the animated preview offset `pixels` to a folded and wrapped editor row.
     fn source_top(&self, pixels: f32) -> f32 {
         let row = self.map(pixels, |(row, pixel)| (pixel, row));
-        let first = self.doc.display_row(row.floor() as usize) as f32;
-        let next = self.doc.display_row(row.ceil() as usize) as f32;
-        first + (next - first) * row.fract()
+        self.rows.visual_position(row).min(self.source_max as f32)
     }
 
     /// Follow preview pixels `current` from the displayed `origin` to `target`.
@@ -95,7 +95,12 @@ impl<'a> ScrollMap<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::Buffer;
     use super::*;
+    use crate::ui::text::TextSpacing;
+    use gpui::{FontId, NoopTextSystem};
+    use nanobug::document::Document;
+    use std::sync::Arc;
 
     /// Layout anchors, rather than document percentages, drive both directions and meet at the end.
     #[test]
@@ -108,13 +113,13 @@ mod tests {
             (60., 1400.),
             (95., 3000.),
         ];
-        let map = ScrollMap::new(&points, &doc, 20, 2000).unwrap();
+        let map = ScrollMap::new(&points, VisualRows::physical(&doc), 20, 2000).unwrap();
         assert_eq!(map.preview_top(0.), 0.);
         assert_eq!(map.preview_top(35.), 600.);
         assert_eq!(map.source_top(600.), 35.);
         assert_eq!(map.preview_top(81.), 2000.);
         assert_eq!(map.source_top(2000.), 81.);
-        assert!(ScrollMap::new(&points, &doc, 110, 2000).is_none());
+        assert!(ScrollMap::new(&points, VisualRows::physical(&doc), 110, 2000).is_none());
     }
 
     /// A preview position inside a folded region still corresponds to the fold's visible header.
@@ -123,10 +128,40 @@ mod tests {
         let mut doc = Document::new(&"row\n".repeat(20));
         doc.collapse_rows(3..8);
         let points = [(2., 150.), (5., 400.), (8., 700.), (12., 900.)];
-        let map = ScrollMap::new(&points, &doc, 4, 1000).unwrap();
+        let map = ScrollMap::new(&points, VisualRows::physical(&doc), 4, 1000).unwrap();
         assert_eq!(map.preview_top(3.), 700.);
         assert_eq!(map.source_top(400.), 2.);
         assert_eq!(map.source_top(700.), 3.);
+    }
+
+    /// Both panes can scroll through wrapped segments of the same final source line.
+    #[test]
+    fn markdown_sync_interpolates_continuations_of_one_source_line() {
+        let buffer = Buffer::new(Document::new(&"x".repeat(32)));
+        let spacing = TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 8.);
+        let rows = buffer.measure_visual_rows(8, &spacing, "");
+        assert_eq!(rows.len(), 4);
+        let map = ScrollMap::new(&[], rows, 2, 240).unwrap();
+        assert_eq!(map.preview_top(1.), 120.);
+        assert_eq!(map.source_top(120.), 1.);
+        assert_eq!(map.preview_top(1.5), 180.);
+        assert_eq!(map.source_top(180.), 1.5);
+        assert_eq!(map.source_top(240.), 2.);
+    }
+
+    /// A scroll limit inside a wrapped fold header still pairs both pane bottoms.
+    #[test]
+    fn markdown_sync_pane_bottom_can_end_inside_a_wrapped_fold_header() {
+        let mut doc = Document::new(&format!("{}\na\nb\nc", "x".repeat(32)));
+        doc.collapse_rows(1..3);
+        let buffer = Buffer::new(doc);
+        let spacing = TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 8.);
+        let rows = buffer.measure_visual_rows(8, &spacing, "");
+        assert_eq!(rows.row(2).unwrap().line, 0);
+        let height = rows.len() - 2;
+        let map = ScrollMap::new(&[], rows, height, 240).unwrap();
+        assert_eq!(map.preview_top(2.), 240.);
+        assert!((map.source_top(240.) - 2.).abs() < 0.001);
     }
 
     /// Apply alignment throughout the existing animation and keep the preview's exact target.
@@ -134,7 +169,7 @@ mod tests {
     fn markdown_preview_settles_on_one_source_row_without_a_final_jump() {
         let doc = Document::new(&"row\n".repeat(30));
         let points = [(10., 300.), (20., 600.)];
-        let map = ScrollMap::new(&points, &doc, 5, 800).unwrap();
+        let map = ScrollMap::new(&points, VisualRows::physical(&doc), 5, 800).unwrap();
         let origin = PreviewScrollOrigin {
             preview: 300.,
             source: 10.,

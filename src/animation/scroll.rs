@@ -57,6 +57,19 @@ impl GridScroll {
         rows: usize,
         now: f64,
     ) -> (Option<usize>, f32) {
+        self.track_rows_with_margin(input, caret, height, rows, now, ROW_CARET_MARGIN)
+    }
+
+    /// Track the viewport using `margin` visible rows on either side of a moving caret.
+    pub fn track_rows_with_margin(
+        &mut self,
+        input: ScrollInput,
+        caret: Option<usize>,
+        height: usize,
+        rows: usize,
+        now: f64,
+        margin: usize,
+    ) -> (Option<usize>, f32) {
         let height = height.max(1);
         let full_top = rows.saturating_sub(height);
         let maximum = match input {
@@ -81,7 +94,9 @@ impl GridScroll {
                     self.target
                 }
                 .min(maximum);
-                caret.map_or(top, |row| self.reveal_row(top, row, height, maximum))
+                caret.map_or(top, |row| {
+                    self.reveal_row(top, row, height, maximum, margin)
+                })
             }
             ScrollInput::Wheel(delta) => {
                 let target = self.target.saturating_add_signed(delta).min(maximum);
@@ -105,7 +120,7 @@ impl GridScroll {
         let caret = if self.wheeling {
             caret.map(|row| {
                 let (first, last) = self.complete_rows(height, rows);
-                let (above, below) = self.wheel_row_insets(height, rows);
+                let (above, below) = self.wheel_row_insets_with_margin(height, rows, margin);
                 row.clamp(first + above, last - below)
             })
         } else {
@@ -235,16 +250,23 @@ impl GridScroll {
 
     /// Start from `top` and scroll when `row` moves past the fourth row from a scrollable edge.
     /// `height` is the viewport's row count and `maximum` is the final legal top row.
-    fn reveal_row(&self, top: usize, row: usize, height: usize, maximum: usize) -> usize {
-        let inset = ROW_CARET_MARGIN.min((height - 1) / 2);
+    fn reveal_row(
+        &self,
+        top: usize,
+        row: usize,
+        height: usize,
+        maximum: usize,
+        margin: usize,
+    ) -> usize {
+        let inset = margin.min((height - 1) / 2);
         let bottom = top + height - 1;
         if self.caret_cell.is_some_and(|previous| row < previous)
-            && top > ROW_CARET_MARGIN
+            && top > margin
             && row < top + inset
         {
             row.saturating_sub(inset)
         } else if self.caret_cell.is_some_and(|previous| row > previous)
-            && maximum - top > ROW_CARET_MARGIN
+            && maximum - top > margin
             && row > bottom - inset
         {
             row.saturating_sub(height - 1 - inset).min(maximum)
@@ -262,11 +284,21 @@ impl GridScroll {
 
     /// Top and bottom caret padding while the wheel scrolls a viewport of `height` over `rows` rows.
     pub fn wheel_row_insets(&self, height: usize, rows: usize) -> (usize, usize) {
+        self.wheel_row_insets_with_margin(height, rows, ROW_CARET_MARGIN)
+    }
+
+    /// Top and bottom padding based on the `margin` configured for this editor.
+    pub fn wheel_row_insets_with_margin(
+        &self,
+        height: usize,
+        rows: usize,
+        margin: usize,
+    ) -> (usize, usize) {
         if !self.wheeling {
             return (0, 0);
         }
         let (first, last) = self.complete_rows(height, rows);
-        let margin = ROW_CARET_MARGIN.min(last.saturating_sub(first) / 2);
+        let margin = margin.min(last.saturating_sub(first) / 2);
         (
             if first > 0 { margin } else { 0 },
             if last + 1 < rows { margin } else { 0 },

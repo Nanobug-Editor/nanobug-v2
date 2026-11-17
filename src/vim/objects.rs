@@ -14,6 +14,141 @@ static TAGS: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 impl Vim {
+    /// Store mark `name` at the caret, sharing file marks through `register`.
+    pub(super) fn set_command_mark(&mut self, name: char, register: &mut super::Register) {
+        self.ex_hidden_marks.remove(&name);
+        let cursor = self.doc.cursor;
+        match name {
+            '<' | '>' => self.g.set_visual_mark(name == '>', cursor),
+            '[' | ']' => {
+                let operated = self.operated.get_or_insert(cursor..self.doc.next(cursor));
+                if name == '[' {
+                    operated.start = cursor;
+                } else {
+                    operated.end = self.doc.next(cursor);
+                }
+            }
+            '\'' | '`' => self.record_jump(),
+            _ => {
+                if name.is_ascii_uppercase() {
+                    register.file_marks.set(name, &self.doc);
+                } else {
+                    self.marks.insert(name, cursor);
+                }
+            }
+        }
+    }
+
+    /// Resolve mark `name` with `linewise` placement and optional `jump` recording.
+    /// Complete an `operator` only within the current document, using `register` for both marks
+    /// and the operation's saved text.
+    pub(super) fn command_mark(
+        &mut self,
+        name: char,
+        linewise: bool,
+        jump: bool,
+        operator: Option<super::Operator>,
+        register: &mut super::Register,
+    ) -> super::Action {
+        if let Some(index) = name.to_digit(10) {
+            let Some(mark) = register
+                .numbered_marks
+                .get(index as usize)
+                .filter(|mark| !mark.path.as_os_str().is_empty())
+            else {
+                self.message = crate::i18n::text("vim_hint.mark_unset").into();
+                return super::Action::None;
+            };
+            if self.doc.path.as_ref() == Some(&mark.path) {
+                let row = mark.row.min(self.line_count() - 1);
+                let (end, kind) = if linewise {
+                    (self.first_nonblank(row), Kind::Line)
+                } else {
+                    (self.doc.offset(row, mark.column), Kind::Exclusive)
+                };
+                let motion = Motion { end, kind, jump };
+                if let Some(operator) = operator {
+                    self.operate_motion(operator, motion, register);
+                } else {
+                    self.apply_motion(motion);
+                }
+                return super::Action::None;
+            }
+            if operator.is_some() || self.mode.is_visual() {
+                self.message = crate::i18n::text("vim_hint.mark_other_file").into();
+                return super::Action::None;
+            }
+            return super::Action::OpenFileMark {
+                name,
+                path: Some(mark.path.clone()),
+                opening: 0,
+                row: mark.row,
+                column: mark.column,
+                linewise,
+            };
+        }
+        if let Some(mark) = register.file_marks.get(name) {
+            if let Some(offset) = mark.offset_in(&self.doc) {
+                let mut motion = self.mark_motion_at(offset, linewise);
+                motion.jump = jump;
+                if let Some(operator) = operator {
+                    self.operate_motion(operator, motion, register);
+                } else {
+                    self.apply_motion(motion);
+                }
+                return super::Action::None;
+            }
+            if operator.is_some() || self.mode.is_visual() {
+                self.message = crate::i18n::text("vim_hint.mark_other_file").into();
+                return super::Action::None;
+            }
+            let (row, column) = mark.location;
+            return super::Action::OpenFileMark {
+                name,
+                path: mark.path,
+                opening: mark.opening,
+                row,
+                column,
+                linewise,
+            };
+        }
+        if let Some(mut motion) = self.mark_motion(name, linewise) {
+            if let Some(operator) = operator {
+                self.operate_motion(operator, motion, register);
+            } else {
+                motion.jump = jump;
+                self.apply_motion(motion);
+            }
+        }
+        super::Action::None
+    }
+
+    /// Resolve `name` in the selected buffer, using saved `location` if it was reopened.
+    /// Use the first nonblank character if `linewise`, and bind a reopened mark to `register`.
+    pub fn place_file_mark(
+        &mut self,
+        name: char,
+        location: (usize, usize),
+        linewise: bool,
+        register: &mut super::Register,
+    ) {
+        let previous = self.doc.cursor;
+        let at = if name.is_ascii_uppercase() {
+            register.bind_file_marks(&self.doc);
+            register
+                .file_marks
+                .get(name)
+                .and_then(|mark| mark.offset_in(&self.doc))
+                .unwrap_or_else(|| super::file_marks::file_offset(&self.doc, location))
+        } else {
+            self.doc.offset(location.0, location.1)
+        };
+        self.set_cursor(at);
+        if linewise {
+            self.set_cursor(self.first_nonblank(self.doc.location(at).0));
+        }
+        self.settle_fold_cursor(previous, self.doc.revision);
+    }
     /// Resolve a text object and its `around` variant, with the requested `count`.
     /// An inner-word count past the end leaves the cursor at the file end.
     pub(super) fn object(
@@ -453,17 +588,27 @@ impl Vim {
 
     /// Build a mark jump to `name`, optionally using its line's first nonblank character.
     pub(super) fn mark_motion(&self, name: char, linewise: bool) -> Option<Motion> {
+        if self.ex_hidden_marks.contains(&name) {
+            return None;
+        }
         let position = self.marks.get(&name).copied().or_else(|| match name {
             '[' => self.operated.as_ref().map(|range| range.start),
             ']' => self
                 .operated
                 .as_ref()
-                .map(|range| range.end.saturating_sub(1)),
+                .map(|range| self.doc.previous(range.end)),
             '.' => self.g.last_change(),
             '^' => self.g.insertion,
             '<' | '>' => self.g.visual_mark(name == '>'),
+            '(' | ')' => Some(self.sentence_motion(name == '(', 1)),
+            '{' | '}' => Some(self.paragraph_motion(name == '{', 1)),
             _ => None,
         })?;
+        Some(self.mark_motion_at(position, linewise))
+    }
+
+    /// Translate a byte `position` into a local mark motion in the requested shape.
+    fn mark_motion_at(&self, position: usize, linewise: bool) -> Motion {
         let position = self
             .doc
             .text
@@ -476,10 +621,10 @@ impl Vim {
         } else {
             (position, Kind::Exclusive)
         };
-        Some(Motion {
+        Motion {
             end,
             kind,
             jump: true,
-        })
+        }
     }
 }

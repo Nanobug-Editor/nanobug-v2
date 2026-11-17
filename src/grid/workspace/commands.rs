@@ -6,7 +6,11 @@ use crate::ui::theme::{AppearanceChange, GridFont};
 use super::{
     Workspace,
     editor_close::CloseTarget,
+    editor_splits::PaneId,
+    ex_commands::ExContinuation,
     layout::{Focus, ShellWindow},
+    projects::SplitDocument,
+    sleep::Source,
 };
 use anyhow::Context as _;
 use gpui::{Context, Window};
@@ -14,7 +18,7 @@ use nanobug::{
     i18n,
     vim::{Action, Register, Vim},
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 impl Workspace {
     /// Open `path` in the current project or in its own standalone tab.
@@ -32,9 +36,8 @@ impl Workspace {
             return;
         }
         let project = self.projects.active_mut();
-        if let Err(error) = project
-            .editor
-            .open(path, self.scroll_epoch.elapsed().as_secs_f64())
+        if let Err(error) =
+            project.open_editor_file(path, self.scroll_epoch.elapsed().as_secs_f64())
         {
             project.status = format!("{error:#}");
             return;
@@ -47,34 +50,195 @@ impl Workspace {
         project.status.clear();
     }
 
+    /// Follow a validated file destination inside the Vim window that initiated the jump.
+    pub(super) fn jump_to_file(
+        &mut self,
+        path: &Path,
+        require_file: bool,
+        resolve: impl FnOnce(&nanobug::document::Document) -> Option<usize>,
+    ) -> anyhow::Result<bool> {
+        let now = self.scroll_epoch.elapsed().as_secs_f64();
+        let visited = self
+            .projects
+            .active_mut()
+            .jump_file(path, require_file, now, resolve)?;
+        if visited {
+            self.finish_file_jump();
+        }
+        Ok(visited)
+    }
+
+    /// Reveal and focus the pane containing the new cursor position.
+    fn finish_file_jump(&mut self) {
+        self.last_cursor_space = None;
+        let project = self.projects.active_mut();
+        project.focus_pane(Focus::Editor);
+        if project.hidden_pane == Some(Focus::Editor) {
+            project.hidden_pane = None;
+        }
+        project.status.clear();
+    }
+
     /// Execute modal `action` in `window` through `cx`, preserving buffers on I/O errors.
     pub(super) fn action(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
         match action {
             Action::None => {}
+            Action::CommandWindow(prompt) => self.open_command_window(prompt, window, cx),
+            Action::VimMenu { path } => self.popup_vim_menu(path, window, cx),
+            Action::Help(topic) => self.open_vim_help(&topic, window, cx),
+            Action::HelpTags {
+                directory,
+                list_self,
+            } => self.index_ex_help(&directory, list_self),
+            Action::CheckHealth(components) => self.show_ex_health(&components, window, cx),
+            Action::QuitWithCode(code) => {
+                self.force_ex_close(CloseTarget::QuitWithCode(code), window, cx)
+            }
+            Action::Runtime {
+                patterns,
+                all_matches,
+            } => self.source_ex_runtime(&patterns, all_matches, window, cx),
+            Action::Restart { close, command } => self.restart_from_ex(&close, command, window, cx),
+            Action::NumberedMarks { write } => self.update_numbered_marks(write),
+            Action::VimInfo { write, force, path } => {
+                self.transfer_vim_info(write, force, path.as_deref())
+            }
+            Action::TerminalOpen(command) => self.open_terminal(command, window, cx),
+            Action::Sleep(seconds) => self.sleep_editor(seconds, window, cx),
+            Action::AlternateBuffer(id) => self.switch_alternate_buffer(id, window, cx),
             Action::Open(name) => {
-                let path = self.projects.active().root.join(name);
+                let path = self
+                    .file_operand(&name)
+                    .unwrap_or_else(|| self.ex_current_dir().join(name.replace("\\ ", " ")));
                 if path.is_dir() {
                     self.open_project(&path, window, cx);
-                } else {
-                    self.open(path, window, cx);
+                } else if let Err(error) = self.jump_to_file(&path, false, |doc| Some(doc.cursor)) {
+                    self.set_status(format!("{error:#}"));
                 }
             }
-            Action::OpenAt(name, line) => {
+            Action::OpenFile(name, position) => {
                 let path = self.vim_file_path(&name);
-                match path.canonicalize() {
-                    Ok(path) if path.is_file() => {
-                        self.open(path.clone(), window, cx);
-                        if let Some(project) = self.projects.active_project_mut()
-                            && project.editor.vim().doc.path.as_ref() == Some(&path)
-                        {
-                            project.editor.edit(|vim, _| {
-                                vim.move_to_row(line.saturating_sub(1).min(vim.line_count() - 1));
-                                Action::None
-                            });
-                        }
-                    }
-                    _ => self.set_status(i18n::format("vim_g.missing_file", &[("path", &name)])),
+                let result = self.jump_to_file(&path, true, |doc| {
+                    Some(position.map_or(doc.cursor, |(row, column)| {
+                        let range = doc.line_range(row.min(doc.starts.len() - 1));
+                        range.start + column.min(range.len())
+                    }))
+                });
+                if let Err(error) = result {
+                    self.set_status(format!("{error:#}"));
                 }
+            }
+            Action::OpenFileMark {
+                name,
+                path,
+                opening,
+                row,
+                column,
+                linewise,
+            } => {
+                let now = self.scroll_epoch.elapsed().as_secs_f64();
+                match self.projects.active_mut().jump_file_mark(
+                    name,
+                    (opening, path.as_deref()),
+                    (row, column),
+                    linewise,
+                    now,
+                ) {
+                    Ok(()) => self.finish_file_jump(),
+                    Err(error) => self.set_status(format!("{error:#}")),
+                }
+            }
+            Action::JumpHistory { forward, count } => {
+                let now = self.scroll_epoch.elapsed().as_secs_f64();
+                if self
+                    .projects
+                    .active_mut()
+                    .visit_editor_jump(forward, count, now)
+                {
+                    self.finish_file_jump();
+                }
+            }
+            Action::ShowListing(list) => self.ex_output_listing(&list, window, cx),
+            Action::EditableListing(list) => self.open_editor_split_at(
+                true,
+                false,
+                SplitDocument::Editable(nanobug::document::Document::new(&list)),
+                None,
+                window,
+                cx,
+            ),
+            Action::IncludeSplit {
+                path,
+                row,
+                column,
+                preview,
+            } => {
+                if preview {
+                    self.open_include_preview(path, row, column, window, cx);
+                } else {
+                    self.open_editor_split_at(
+                        true,
+                        true,
+                        SplitDocument::Include(path, row, column),
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+            }
+            Action::Files(command) => self.file_ex_command(command, window, cx),
+            Action::BufferLifecycle(command) => self.buffer_lifecycle(command, window, cx),
+            Action::SessionExport(command) => self.session_export_ex(command, window, cx),
+            Action::WindowModified { modifiers, command } => {
+                self.execute_window_modified(modifiers, &command, window, cx)
+            }
+            Action::MessageModified { modifier, command } => {
+                self.execute_message_modified(modifier, &command, window, cx)
+            }
+            Action::UndoFile { path, write, force } => {
+                if let Some(path) = self.file_operand(&path) {
+                    let result = self
+                        .projects
+                        .active_mut()
+                        .editor
+                        .ex_undo_file(&path, write, force);
+                    self.report_ex_result(result);
+                } else {
+                    self.set_status(i18n::text("ex.undo_file_argument").into());
+                }
+            }
+            Action::WindowExtras(command) => self.window_extras(command, window, cx),
+            Action::Shell(command) => self.run_shell_command(command, None, window, cx),
+            Action::RegisterEx(text) => self.execute_ex_input(&text, "@", 1, false, window, cx),
+            Action::UserEx { text, source } => {
+                self.execute_user_ex(&text, source.as_deref(), window, cx)
+            }
+            Action::Autocmd {
+                event,
+                pattern,
+                all,
+                group,
+            } => self.execute_explicit_autocmd(
+                &event,
+                pattern.as_deref(),
+                group.as_deref(),
+                all,
+                window,
+                cx,
+            ),
+            Action::NoAutocmd(command) => self.execute_no_autocmd(&command, window, cx),
+            Action::ClipboardEx => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    self.execute_ex_input(&text, "@+", 1, false, window, cx);
+                } else {
+                    self.set_status(i18n::text("ex.register_empty").into());
+                }
+            }
+            Action::DeleteNumberedMarks(slots) => self.delete_numbered_marks(&slots),
+            Action::FinishSource => self.set_status(i18n::text("ex.finish_outside_source").into()),
+            Action::ListScripts => self.list_sourced_scripts(window, cx),
+            Action::EditSourcedScript { address, path } => {
+                self.open_sourced_script(address, path, window, cx)
             }
             Action::OpenExternal(target) => {
                 let result = if url::Url::parse(&target)
@@ -96,6 +260,16 @@ impl Workspace {
             Action::TabNavigate(direction, count) => {
                 self.navigate_vim_tab(direction, count, window, cx)
             }
+            Action::TabEndpoint(last) => {
+                let index = if last {
+                    self.projects.active().page_count() - 1
+                } else {
+                    0
+                };
+                self.select_editor_page(index, window, cx);
+            }
+            Action::ListTabs => self.list_ex_tabs(window, cx),
+            Action::TabMove(address) => self.move_ex_tabpage(&address, window, cx),
             Action::TabNew(file) => self.open_editor_page(file, window, cx),
             Action::TabClose => {
                 if self.projects.active().page_count() > 1 {
@@ -105,7 +279,24 @@ impl Workspace {
                     self.set_status(i18n::text("editor.last_tabpage").into());
                 }
             }
+            Action::TabOnly => self.request_close(CloseTarget::OtherPages, window, cx),
+            Action::Only => {
+                self.only_editor_split(window, cx);
+            }
+            Action::EmptyBuffer => self.open_ex_empty_buffer(),
+            Action::EmptySplit(stacked) => {
+                self.open_editor_split_at(stacked, false, SplitDocument::Empty, None, window, cx)
+            }
             Action::Split { stacked, file } => self.open_editor_split(stacked, file, window, cx),
+            Action::Arguments {
+                command,
+                count,
+                arguments,
+            } => {
+                self.argument_list_command(command, count, arguments, window, cx);
+            }
+            Action::PreviewOpen(path) => self.open_vim_preview(path, window, cx),
+            Action::PreviewClose => self.close_vim_preview(window, cx),
             Action::BracketBuffer {
                 forward,
                 edge,
@@ -137,10 +328,54 @@ impl Workspace {
                 }
             }
             Action::Save(name) => {
-                let path = name.map(|name| self.projects.active().root.join(name));
+                let path = name.map(|name| self.ex_current_dir().join(name));
                 self.save_with_plugins(path, false, window, cx);
             }
-            Action::SaveClose => self.save_with_plugins(None, true, window, cx),
+            Action::WriteFile { name, force, close } => {
+                if self.write_ex_buffer(name.as_deref(), false, force, window, cx) && close {
+                    self.close_ex_window(force, true, window, cx);
+                }
+            }
+            Action::SaveAs { path, force } => {
+                self.write_ex_buffer(Some(&path), true, force, window, cx);
+            }
+            Action::ReadFile { after, path } => self.read_ex_file(after, &path, window, cx),
+            Action::WriteAll => {
+                self.write_ex_buffers(false, window, cx);
+            }
+            Action::WriteQuitAll => {
+                if self.write_ex_buffers(true, window, cx) {
+                    self.request_close(CloseTarget::Quit, window, cx);
+                }
+            }
+            Action::SaveClose => {
+                if self.write_ex_buffer(None, false, false, window, cx) {
+                    self.close_ex_window(false, true, window, cx);
+                }
+            }
+            Action::SaveVimConfig => {
+                self.save_vim_config();
+            }
+            Action::ListBuffers => self.list_ex_buffers(window, cx),
+            Action::SelectBuffer(selector) => self.select_ex_buffer(&selector),
+            Action::NavigateBuffer {
+                direction,
+                count,
+                edge,
+            } => self.navigate_ex_buffer(direction, count, edge),
+            Action::DeleteBuffer { selector, force } => {
+                self.delete_ex_buffer(&selector, force, window, cx)
+            }
+            Action::WindowCommand { keys, count } => {
+                self.ex_window_command(&keys, count, window, cx)
+            }
+            Action::Source { file, lines } => self.source_ex(file.as_deref(), lines, window, cx),
+            Action::RunBatch {
+                scope,
+                range,
+                commands,
+            } => self.run_ex_batch(scope, &range, &commands, window, cx),
+            Action::UndoBatch => self.undo_ex_batch(window, cx),
             Action::Format(selection) => self.manual_format(selection, window, cx),
             Action::SqlDialect { buffer_only, name } => {
                 self.set_sql_dialect(buffer_only, name, window, cx);
@@ -149,6 +384,14 @@ impl Workspace {
             Action::UndoPlugin => self.undo_plugin_edits(window, cx),
             Action::PluginComplete => {
                 self.plugin_language(nanobug::plugins::package::Provider::Complete, window, cx)
+            }
+            Action::SyntaxSelection => self.request_syntax_selection(false, window, cx),
+            Action::InsertCandidates {
+                start,
+                values,
+                reverse,
+            } => {
+                self.show_insert_candidates(start, values, reverse, cx);
             }
             Action::PluginDiagnose => {
                 self.plugin_language(nanobug::plugins::package::Provider::Diagnose, window, cx)
@@ -167,32 +410,16 @@ impl Workspace {
                     self.set_status(i18n::text("editor.appearance_usage").into());
                 }
             }
-            Action::Close(force) => {
-                let project = self.projects.active();
-                if project.split_count() > 1 && project.focus == Focus::Editor {
-                    if force {
-                        self.finish_close_editor_split(project.active_editor_id(), window, cx);
-                    } else {
-                        self.close_editor_split(None, window, cx);
-                    }
-                } else if force {
-                    self.finish_close(CloseTarget::Quit, window, cx);
-                } else {
-                    self.request_close(CloseTarget::Quit, window, cx);
-                }
+            Action::Close(force) => self.close_ex_window(force, true, window, cx),
+            Action::CloseWindow(force) => self.close_ex_window(force, false, window, cx),
+            Action::QuitAll(force) => self.quit_ex(force, window, cx),
+            Action::Filter { range, command } => {
+                self.filter_lines(range, command, None, window, cx)
             }
-            Action::QuitAll(force) => {
-                if force {
-                    self.finish_close(CloseTarget::Quit, window, cx);
-                } else {
-                    self.request_close(CloseTarget::Quit, window, cx);
-                }
-            }
-            Action::Filter { range, command } => self.filter_lines(range, command, window, cx),
         }
     }
 
-    /// Resolve a file name from under the caret relative to the buffer and then the project.
+    /// Resolve a name from under the caret relative to the buffer and then the Ex directory.
     pub(super) fn vim_file_path(&self, name: &str) -> PathBuf {
         let project = self.projects.active();
         if let Some(parent) = project
@@ -208,10 +435,10 @@ impl Workspace {
                 return path;
             }
         }
-        project.root.join(name)
+        self.ex_current_dir().join(name)
     }
 
-    /// Switch pages inside a directory project, or top-level tabs from a standalone editor.
+    /// Switch editor tabpages, or top-level tabs from a standalone editor with only one page.
     /// `direction` and the optional one-based `count` follow the Vim tab commands.
     pub(super) fn navigate_vim_tab(
         &mut self,
@@ -221,7 +448,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if let Some(project) = self.projects.active_project()
-            && project.manager.is_some()
+            && (project.manager.is_some() || project.page_count() > 1)
         {
             if let Some(index) = tab_destination(
                 project.active_page(),
@@ -279,7 +506,7 @@ impl Workspace {
         self.apply_edit(edit, window, cx);
     }
 
-    /// Open a page showing the current buffer or a project-relative `file`.
+    /// Open a page with an unnamed buffer or `file` relative to the Ex directory.
     fn open_editor_page(
         &mut self,
         file: Option<String>,
@@ -291,8 +518,11 @@ impl Workspace {
             return;
         }
         let now = self.scroll_epoch.elapsed().as_secs_f64();
+        let path = file.as_deref().map(|file| {
+            self.file_operand(file)
+                .unwrap_or_else(|| self.ex_current_dir().join(file.replace("\\ ", " ")))
+        });
         let project = self.projects.active_mut();
-        let path = file.map(|file| project.root.join(file));
         match project.open_page(path, now) {
             Ok(()) => {
                 project.status.clear();
@@ -334,21 +564,28 @@ impl Workspace {
         }
     }
 
-    /// Run a line filter off the UI thread and apply it only to the same buffer revision.
-    fn filter_lines(
+    /// Run a line filter, applying the result to the same revision before resuming Ex input.
+    pub(super) fn filter_lines(
         &mut self,
         range: std::ops::Range<usize>,
         command: String,
+        continuation: Option<ExContinuation>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let silence = self.input_mappings.ex_silence();
+        let root = self.ex_current_dir().to_owned();
         let project = self.projects.active_mut();
+        let scope = project.plugin_scope;
+        let pane = project.active_editor_id();
         let buffer = project.editor.buffer();
         let id = buffer.id;
+        let opening = buffer.vim.doc.opening;
         let revision = buffer.vim.doc.revision;
         let text = buffer.vim.doc.text[range.clone()].to_owned();
-        let root = project.root.clone();
-        project.status = i18n::text("editor.filter_running").into();
+        if silence.is_none() {
+            project.status = i18n::text("editor.filter_running").into();
+        }
         let worker = cx
             .background_executor()
             .spawn(async move { nanobug::vim::run_filter(&root, &command, &text) });
@@ -357,6 +594,8 @@ impl Workspace {
             let _ = cx.update(|window, cx| {
                 view.update(cx, |workspace, cx| {
                     let mut changed_path = None;
+                    let mut completed = false;
+                    let mut failure = None;
                     for project in workspace.projects.iter_mut() {
                         let Some((pane, index)) = project.editors().find_map(|(pane, editor)| {
                             editor.buffer_index(id).map(|index| (pane, index))
@@ -364,7 +603,7 @@ impl Workspace {
                             continue;
                         };
                         let editor = project.editor_by_id_mut(pane).expect("retained editor");
-                        project.status = match result {
+                        let status = match result {
                             Ok(output) if editor.buffers()[index].vim.doc.revision == revision => {
                                 changed_path = editor
                                     .edit_buffer(index, |vim, _| {
@@ -372,6 +611,7 @@ impl Workspace {
                                         nanobug::vim::Action::None
                                     })
                                     .changed_path;
+                                completed = true;
                                 i18n::text("editor.filter_complete").into()
                             }
                             Ok(_) => i18n::text("editor.filter_changed").into(),
@@ -380,6 +620,15 @@ impl Workspace {
                                 &[("error", &format!("{error:#}"))],
                             ),
                         };
+                        if silence.is_none() || !completed && silence != Some(true) {
+                            project.status = status.clone();
+                        }
+                        if !completed {
+                            workspace.input_mappings.remember_ex_error(&status);
+                            if continuation.is_some() && silence != Some(true) {
+                                failure = Some(status);
+                            }
+                        }
                         break;
                     }
                     workspace.apply_edit(
@@ -390,11 +639,90 @@ impl Workspace {
                         window,
                         cx,
                     );
+                    if let Some(resume) = continuation
+                        && workspace.ex_shell_view_is_active(scope, pane, opening)
+                    {
+                        resume(workspace, window, cx, failure);
+                    }
                     workspace.sync(window, cx);
                 })
             });
         })
         .detach();
+    }
+
+    /// Execute Shell in the initiating Session and resume its Ex input without opening a split.
+    pub(super) fn run_shell_command(
+        &mut self,
+        command: String,
+        continuation: Option<ExContinuation>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let silence = self.input_mappings.ex_silence();
+        let root = self.ex_current_dir().to_owned();
+        let project = self.projects.active_mut();
+        let scope = project.plugin_scope;
+        let pane = project.active_editor_id();
+        let opening = project.editor.vim().doc.opening;
+        if silence.is_none() {
+            project.status = i18n::text("editor.filter_running").into();
+        }
+        let worker = cx
+            .background_executor()
+            .spawn(async move { nanobug::vim::run_ex_shell(&root, &command) });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = worker.await;
+            let _ = cx.update(|window, cx| {
+                view.update(cx, |workspace, cx| {
+                    let (output, completed) = match result {
+                        Ok(output) => (output, true),
+                        Err(error) => (format!("{error:#}"), false),
+                    };
+                    let failure = (!completed && continuation.is_some() && silence != Some(true))
+                        .then(|| output.trim().to_owned());
+                    if !completed {
+                        workspace.input_mappings.remember_ex_error(output.trim());
+                    }
+                    let visible = silence.is_none() || !completed && silence != Some(true);
+                    if visible
+                        && continuation.is_none()
+                        && workspace
+                            .projects
+                            .active_project()
+                            .is_some_and(|project| project.plugin_scope == scope)
+                        && output.lines().count() > 1
+                        && !workspace.modal_open()
+                    {
+                        workspace.set_status(String::new());
+                        workspace.action(Action::ShowListing(output), window, cx);
+                    } else if visible
+                        && let Some(project) = workspace
+                            .projects
+                            .iter_mut()
+                            .find(|project| project.plugin_scope == scope)
+                    {
+                        project.status = output.trim().into();
+                    }
+                    if let Some(resume) = continuation
+                        && workspace.ex_shell_view_is_active(scope, pane, opening)
+                    {
+                        resume(workspace, window, cx, failure);
+                    }
+                    workspace.sync(window, cx);
+                })
+            });
+        })
+        .detach();
+    }
+
+    /// Confirm that asynchronous Ex input still targets the initiating editor view.
+    fn ex_shell_view_is_active(&self, scope: u64, pane: PaneId, opening: u64) -> bool {
+        !self.modal_open()
+            && matches!(self.active_vim_input(), Some((Source::Editor, editor)) if editor.vim().doc.opening == opening)
+            && self.projects.active_project().is_some_and(|project| {
+                project.plugin_scope == scope && project.active_editor_id() == pane
+            })
     }
 
     /// Apply editor `input`, then coordinate its effects through `window` and `cx`.
@@ -523,6 +851,8 @@ fn tab_destination(
         (1, Some(count)) if count > total => None,
         (1, Some(count)) => Some(count.saturating_sub(1)),
         (1, None) => Some((selected + 1) % total),
-        _ => Some((selected + total - count.unwrap_or(1) % total) % total),
+        _ => Some(
+            (selected + total - count.unwrap_or(direction.unsigned_abs() as usize) % total) % total,
+        ),
     }
 }

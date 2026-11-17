@@ -13,7 +13,7 @@ pub(in crate::grid) use cursor::Cursor;
 pub(in crate::grid) use geometry::exposed_regions;
 pub(crate) use geometry::{Metrics, Rect};
 pub(in crate::grid) use layer::GridLayer;
-pub(in crate::grid) use outline::{OutlineStyle, outline_path};
+pub(in crate::grid) use outline::{OutlineStyle, outline_path, solid_stroke_width};
 pub(in crate::grid) use panel::sample_waves;
 pub(crate) use panel::{CursorCell, Panel};
 pub(in crate::grid) use popup::{
@@ -422,6 +422,8 @@ pub struct Frame {
     chevrons: Vec<RowChevron>,
     /// Path outlines whose geometry stays independent of the shaped rows.
     outlines: Vec<Outline>,
+    /// Frame-local cells occupied by the primary border title.
+    title_columns: Range<usize>,
     /// Vertical inset of row tint fills, in logical pixels.
     tint_inset: Pixels,
     /// Optional component that supplies the panel's color overrides.
@@ -456,6 +458,7 @@ impl Frame {
             guides: Vec::new(),
             chevrons: Vec::new(),
             outlines: Vec::new(),
+            title_columns: 0..0,
             tint_inset: px(0.),
             theme_component: None,
             theme_background: ThemeBackground::Full,
@@ -823,7 +826,9 @@ impl Frame {
         let columns = area.border_title_columns(controls.as_ref());
         let mut gaps = EdgeGaps::new();
         if !columns.is_empty() {
+            let start = columns.start;
             let end = draw_title(self, columns, color);
+            self.title_columns = start..end;
             gaps.push(BORDER_LABEL_INSET..end + 1);
         }
         if let Some(controls) = controls {
@@ -871,7 +876,29 @@ impl Frame {
                 style,
                 top: gaps.into_iter().collect(),
                 bottom: EdgeGaps::new(),
+                top_offset: px(0.),
+                bottom_offset: px(0.),
             });
+        }
+    }
+
+    /// Move a docked pane's last outline by signed logical pixels `top` and `bottom`.
+    /// Its row-zero title follows `top`; the content rows stay on their grid.
+    pub(in crate::grid) fn offset_pane_borders(&mut self, top: Pixels, bottom: Pixels) {
+        if let Some(outline) = self.outlines.last_mut() {
+            outline.top_offset = top;
+            outline.bottom_offset = bottom;
+        }
+    }
+
+    /// Follow the docked pane's top outline when painting its title row.
+    fn title_offset(&self, row: usize) -> Pixels {
+        if row == 0 {
+            self.outlines
+                .last()
+                .map_or(px(0.), |outline| outline.top_offset)
+        } else {
+            px(0.)
         }
     }
 
@@ -912,6 +939,7 @@ impl Frame {
             return;
         }
         let start = (width - heading) / 2;
+        self.title_columns = start..start + heading;
         self.outline(
             area,
             border,

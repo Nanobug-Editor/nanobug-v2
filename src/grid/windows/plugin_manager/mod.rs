@@ -4,8 +4,10 @@ pub(in crate::grid) mod comparison;
 mod input;
 pub(in crate::grid) mod layout;
 pub(in crate::grid) mod rows;
+mod session;
 mod view;
 
+pub(in crate::grid) use input::ListTabClose;
 pub(in crate::grid) use layout::{
     ListLayout, MIN_HEIGHT, SEARCH_BUTTONS, prompt_button_at, secondary_description,
     secondary_list_entries,
@@ -14,11 +16,13 @@ use nanobug::{
     i18n,
     plugins::{package::Identity, session::ConfigScope},
 };
+use serde::{Deserialize, Serialize};
+pub(in crate::grid) use session::ManagerSnapshot;
 pub(in crate::grid) use view::{ManagerView, Presentation};
 use zeroize::Zeroizing;
 
 /// Top-level package source selected in the manager.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub(in crate::grid) enum Page {
     #[default]
     Installed,
@@ -26,8 +30,13 @@ pub(in crate::grid) enum Page {
     Zip,
 }
 
+impl Page {
+    /// Top-level pages in the order of the tab captions and numeric bindings.
+    pub(in crate::grid) const ALL: [Self; 3] = [Self::Installed, Self::Marketplace, Self::Zip];
+}
+
 /// Detail tab retained while navigating within a package.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub(in crate::grid) enum Detail {
     #[default]
     Overview,
@@ -91,6 +100,8 @@ pub(in crate::grid) struct ManagerWindow {
     pub(in crate::grid) review_token: Option<u64>,
     pub(in crate::grid) review_page: usize,
     pub(in crate::grid) page: Page,
+    /// Pages closed by title within this instance of the plugin browser.
+    closed_list_tabs: [bool; Page::ALL.len()],
     pub(in crate::grid) detail: Option<String>,
     pub(in crate::grid) detail_page: Detail,
     pub(in crate::grid) comparison: Option<comparison::Comparison>,

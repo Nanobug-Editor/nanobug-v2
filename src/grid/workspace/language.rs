@@ -45,11 +45,44 @@ fn picker_hints() -> [(KeyIcon, &'static str); 2] {
 }
 
 impl Workspace {
+    /// Query or set Nanobug's interface locale through the same preference as the picker.
+    pub(super) fn ex_language(
+        &mut self,
+        arguments: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (first, remainder) = arguments
+            .split_once(char::is_whitespace)
+            .unwrap_or((arguments, ""));
+        let messages = first.len() >= 3 && "messages".starts_with(first);
+        if ["ctype", "time", "collate"]
+            .iter()
+            .any(|name| first.len() >= 3 && name.starts_with(first))
+        {
+            self.set_status(i18n::text("language.os_locale_unsupported").into());
+            return;
+        }
+        let name = if messages {
+            remainder.trim()
+        } else {
+            arguments.trim()
+        };
+        if name.is_empty() {
+            let locale = i18n::locale().tag();
+            self.show_ex_setting(i18n::format("language.current", &[("locale", &locale)]));
+        } else if let Some(locale) = ex_locale(name) {
+            self.finish_language_picker(Some(locale), window, cx);
+        } else {
+            self.set_status(i18n::format("language.unsupported", &[("locale", &name)]));
+        }
+    }
+
     /// Open the picker in `window` with the active language highlighted, then repaint through `cx`.
     pub(super) fn open_language_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.language_selection = Some(i18n::locale());
         self.hovered_controls = None;
-        self.resizing = false;
+        self.pane_resize = None;
         if let Some(project) = self.projects.active_project_mut() {
             project.editor.stop_drag();
             if let Some(manager) = &mut project.manager {
@@ -210,7 +243,11 @@ impl Workspace {
                     project.editor.clear_messages();
                 }
             }
-            if let Err(error) = i18n::save_locale(locale) {
+            let result = self.appearance_settings_path.as_deref().map_or_else(
+                || i18n::save_locale(locale),
+                |path| i18n::save_locale_to(path, locale),
+            );
+            if let Err(error) = result {
                 self.set_status(i18n::format(
                     "language.save_failed",
                     &[("error", &format_args!("{error:#}"))],
@@ -219,4 +256,18 @@ impl Workspace {
         }
         self.repaint([ScrollInput::Advance; 3], window, cx);
     }
+}
+
+/// Resolve bundled locales and their common native identifiers without changing process settings.
+fn ex_locale(name: &str) -> Option<Locale> {
+    let lower = name.to_ascii_lowercase();
+    let tag = lower
+        .strip_suffix(".utf-8")
+        .or_else(|| lower.strip_suffix(".utf8"))
+        .unwrap_or(&lower);
+    Some(match tag {
+        "c" | "posix" | "en" | "en-us" | "en_us" | "en-gb" | "en_gb" => Locale::English,
+        "zh-cn" | "zh_cn" | "zh-hans" | "zh_hans" | "zh-hans-cn" => Locale::SimplifiedChinese,
+        _ => return None,
+    })
 }

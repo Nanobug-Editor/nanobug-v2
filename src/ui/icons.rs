@@ -78,13 +78,6 @@ pub(crate) struct KeyIcon {
 }
 
 impl KeyIcon {
-    /// Spacebar pictogram sized for the leader hint's border title.
-    pub(crate) const SPACE: Self = Self::new(
-        include_bytes!("../../assets/icons/keyboard-space.svg"),
-        [18., 6.],
-        [0., 0., 18., 6.],
-        8.,
-    );
     /// Lettered Escape legend shared by the leader and language footers.
     pub(crate) const ESC: Self = Self::new(
         include_bytes!("../../assets/icons/leader-close.svg"),

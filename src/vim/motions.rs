@@ -1,7 +1,6 @@
 //! Grapheme motions and logical viewport commands used by Normal, Visual and operators.
 
 use super::Vim;
-use crate::document::display_width;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Range semantics of a motion when used after an operator.
@@ -55,6 +54,31 @@ pub enum HorizontalScroll {
     CursorRight,
 }
 
+/// Target within the measured screen lines of a wrapped buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenMotion {
+    /// Move to the corresponding column of a preceding display row.
+    Up,
+    /// Move to the corresponding column of a following display row.
+    Down,
+    /// Move to the left edge of the current display row.
+    Start,
+    /// Move to the first nonblank character of the current display row.
+    FirstNonblank,
+    /// Move halfway across the current display row.
+    Middle,
+    /// Move to the last available character in the counted display row.
+    End,
+    /// Move to the last nonblank character in the counted display row.
+    LastNonblank,
+}
+
+/// Resolve a screen-line motion with the editor's current measured wrapping.
+/// The arguments are the Vim state, requested target, count and preferred horizontal position.
+/// Return the document byte and preferred position, or `None` for unwrapped movement.
+pub type ScreenMotionResolver<'a> =
+    dyn FnMut(&Vim, ScreenMotion, usize, Option<usize>) -> Option<(usize, usize)> + 'a;
+
 impl Vim {
     /// Keep command-mode carets on a character in a logical line.
     pub fn clamp_normal(&mut self) {
@@ -78,7 +102,11 @@ impl Vim {
 
     /// Place the caret at byte `offset`, resetting the preferred display column.
     pub fn set_cursor(&mut self, offset: usize) {
+        if self.doc.cursor != offset {
+            self.cancel_syntax_request();
+        }
         self.folded_closing_caret = None;
+        self.screen_column = None;
         self.doc.cursor = self
             .doc
             .text
@@ -91,20 +119,22 @@ impl Vim {
 
     /// Jump to a byte offset in the current document, preserving the source in the jumplist.
     pub fn jump_to(&mut self, offset: usize) {
-        let previous = self.doc.cursor;
         if self.doc.cursor != offset {
             self.record_jump();
         }
-        self.set_cursor(offset);
-        self.settle_fold_cursor(previous, self.doc.revision);
+        self.place_jump(offset);
     }
 
     /// Move the viewport-following caret to `row` while retaining its preferred column.
     pub fn move_to_row(&mut self, row: usize) {
         let previous = self.doc.cursor;
         self.folded_closing_caret = None;
+        self.screen_column = None;
         self.doc.cursor = self.row_target(row);
         self.clamp_normal();
+        if self.doc.cursor != previous {
+            self.cancel_syntax_request();
+        }
         self.settle_fold_cursor(previous, self.doc.revision);
     }
 
@@ -171,8 +201,8 @@ impl Vim {
                 }
                 p
             }
-            "j" | "Down" | "Ctrl+j" | "k" | "Up" => {
-                let down = matches!(key, "j" | "Down" | "Ctrl+j");
+            "j" | "Down" | "Ctrl+j" | "Ctrl+n" | "k" | "Up" | "Ctrl+p" => {
+                let down = matches!(key, "j" | "Down" | "Ctrl+j" | "Ctrl+n");
                 let (first, limit) = if visible {
                     (self.doc.display_row(row), self.doc.display_rows() - 1)
                 } else {
@@ -214,13 +244,18 @@ impl Vim {
                 let end = range.start + self.doc.text[range].trim_end_matches([' ', '\t']).len();
                 self.doc.previous(end).max(self.doc.starts[target])
             }
-            "w" | "W" | "b" | "B" | "e" | "E" => {
+            "w" | "W" | "b" | "B" | "e" | "E" | "Shift+Left" | "Shift+Right" | "Ctrl+left"
+            | "Ctrl+right" | "Ctrl+Left" | "Ctrl+Right" => {
                 let mut p = at;
-                let big = key.as_bytes()[0].is_ascii_uppercase();
+                let big = matches!(key, "W" | "B" | "E");
                 for _ in 0..n {
                     let next = match key {
-                        "w" | "W" => self.word_forward(p, big),
-                        "b" | "B" => self.word_backward(p, big),
+                        "w" | "W" | "Shift+Right" | "Ctrl+right" | "Ctrl+Right" => {
+                            self.word_forward(p, big)
+                        }
+                        "b" | "B" | "Shift+Left" | "Ctrl+left" | "Ctrl+Left" => {
+                            self.word_backward(p, big)
+                        }
                         _ => {
                             kind = Kind::Inclusive;
                             self.word_end(p, big)
@@ -233,12 +268,12 @@ impl Vim {
                 }
                 p
             }
-            "G" | "gg" => {
-                let target =
-                    count.map_or(if key == "gg" { 0 } else { last }, |n| (n - 1).min(last));
+            "G" | "gg" | "Ctrl+Home" | "Ctrl+home" | "Ctrl+End" | "Ctrl+end" => {
+                let first = matches!(key, "gg" | "Ctrl+Home" | "Ctrl+home");
+                let target = count.map_or(if first { 0 } else { last }, |n| (n - 1).min(last));
                 return Some(self.line_jump(target));
             }
-            "-" | "+" | "_" | "Enter" => {
+            "-" | "+" | "_" | "Enter" | "Ctrl+m" => {
                 kind = Kind::Line;
                 let target = match key {
                     "-" => row.saturating_sub(n),
@@ -446,41 +481,6 @@ impl Vim {
         ))
     }
 
-    /// Record the current cursor as the origin of a jump.
-    fn record_jump(&mut self) {
-        self.marks.insert('\'', self.doc.cursor);
-        self.marks.insert('`', self.doc.cursor);
-        self.jumps.truncate(self.jump_index);
-        if self.jumps.last() != Some(&self.doc.cursor) {
-            if self.jumps.len() == 100 {
-                self.jumps.remove(0);
-            }
-            self.jumps.push(self.doc.cursor);
-        }
-        self.jump_index = self.jumps.len();
-    }
-
-    /// Move through the buffer's jumplist by `count` entries.
-    pub(super) fn jump_history(&mut self, forward: bool, count: usize) {
-        if self.jumps.is_empty() {
-            return;
-        }
-        if self.jump_index == self.jumps.len() {
-            if forward {
-                return;
-            }
-            self.jumps.push(self.doc.cursor);
-        }
-        self.jump_index = if forward {
-            self.jump_index
-                .saturating_add(count)
-                .min(self.jumps.len() - 1)
-        } else {
-            self.jump_index.saturating_sub(count)
-        };
-        self.set_cursor(self.jumps[self.jump_index]);
-    }
-
     /// Set the logical left offset and visible `columns` supplied by the viewport.
     pub fn set_view_width(&mut self, left: usize, columns: usize) {
         self.view.left = left;
@@ -515,7 +515,7 @@ impl Vim {
         let last = self.doc.display_rows() - 1;
         let top = self.view.top.min(last);
         let full_top = self.doc.display_rows().saturating_sub(height);
-        let margin = self.scroll_margin();
+        let margin = Self::scroll_margin(height);
         let n = count.unwrap_or(1);
         let (destination, caret) = match key {
             "zz" | "zt" | "zb" | "zEnter" | "z." | "z-" | "z+" | "z^" => {
@@ -575,41 +575,14 @@ impl Vim {
                     (top.saturating_sub(amount), row.saturating_sub(amount))
                 }
             }
-            "Ctrl+f" | "Ctrl+b" | "PageUp" | "PageDown" => {
-                let page = if height <= 2 { height } else { height - 2 };
-                let amount = n.saturating_mul(page);
-                if matches!(key, "Ctrl+f" | "PageDown") {
-                    let mut next = top;
-                    for _ in 0..n {
-                        next = if next >= full_top {
-                            last
-                        } else {
-                            next.saturating_add(page).min(last)
-                        };
-                        if next == last {
-                            break;
-                        }
-                    }
-                    (
-                        next,
-                        if next == top {
-                            row
-                        } else {
-                            self.viewport_limits(next).0
-                        },
-                    )
-                } else {
-                    let next = top.saturating_sub(amount);
-                    (
-                        next,
-                        if next == top {
-                            row
-                        } else {
-                            self.viewport_limits(next).1
-                        },
-                    )
-                }
-            }
+            "Ctrl+f" | "Ctrl+b" | "PageUp" | "PageDown" => Self::page_scroll(
+                top,
+                height,
+                last,
+                row,
+                n,
+                matches!(key, "Ctrl+f" | "PageDown"),
+            ),
             _ => return false,
         };
         let caret = self
@@ -625,19 +598,61 @@ impl Vim {
         true
     }
 
+    /// Advance `count` pages from `top` toward the `last` visible row when `down` is true,
+    /// otherwise toward the start. Return the new top and caret from `row` in a `height`-row view.
+    pub fn page_scroll(
+        top: usize,
+        height: usize,
+        last: usize,
+        row: usize,
+        count: usize,
+        down: bool,
+    ) -> (usize, usize) {
+        let height = height.max(1);
+        let page = if height <= 2 { height } else { height - 2 };
+        let next = if down {
+            let full_top = last.saturating_add(1).saturating_sub(height);
+            let mut next = top;
+            for _ in 0..count {
+                next = if next >= full_top {
+                    last
+                } else {
+                    next.saturating_add(page).min(last)
+                };
+                if next == last {
+                    break;
+                }
+            }
+            next
+        } else {
+            top.saturating_sub(count.saturating_mul(page))
+        };
+        let (first, bottom) = Self::screen_limits(next, height, last);
+        let caret = if next == top {
+            row
+        } else if down {
+            first
+        } else {
+            bottom
+        };
+        (next, caret)
+    }
+
     /// Handle a nowrap horizontal command `key`, repeated `count` cells or half pages.
     fn scroll_columns(&mut self, key: &str, count: usize) {
         let (row, column) = self.doc.location(self.doc.cursor);
         let width = self.view.columns;
-        let cell_width = display_width(
-            &self.doc.text[self.doc.cursor
-                ..self
-                    .doc
-                    .next(self.doc.cursor)
-                    .min(self.doc.line_range(row).end)],
-            column,
-        )
-        .max(1);
+        let cell_width = self
+            .doc
+            .display_width(
+                &self.doc.text[self.doc.cursor
+                    ..self
+                        .doc
+                        .next(self.doc.cursor)
+                        .min(self.doc.line_range(row).end)],
+                column,
+            )
+            .max(1);
         let (left, placement) = match key {
             "zs" | "ze" if self.doc.folded_at(row) => (0, HorizontalScroll::Position(0)),
             "zs" => (column, HorizontalScroll::CursorLeft),
@@ -670,7 +685,8 @@ impl Vim {
                         let at = self.doc.offset(row, end - 1);
                         let (_, start) = self.doc.location(at);
                         let next = self.doc.next(at).min(self.doc.line_range(row).end);
-                        let end_of_cell = start + display_width(&self.doc.text[at..next], start);
+                        let end_of_cell =
+                            start + self.doc.display_width(&self.doc.text[at..next], start);
                         self.set_cursor(if end_of_cell > end {
                             self.doc.previous(at)
                         } else {
@@ -687,15 +703,19 @@ impl Vim {
     }
 
     /// Complete rows of padding requested at each scrollable screen edge.
-    fn scroll_margin(&self) -> usize {
-        3.min((self.view.rows - 1) / 2)
+    fn scroll_margin(height: usize) -> usize {
+        3.min((height - 1) / 2)
     }
 
     /// Legal interval of display rows when the viewport starts at `top`.
     fn viewport_limits(&self, top: usize) -> (usize, usize) {
-        let last_row = self.doc.display_rows() - 1;
-        let bottom = top.saturating_add(self.view.rows - 1).min(last_row);
-        let margin = self.scroll_margin();
+        Self::screen_limits(top, self.view.rows, self.doc.display_rows() - 1)
+    }
+
+    /// Keep the caret within the screen margins for a `height`-row viewport at `top` through `last_row`.
+    fn screen_limits(top: usize, height: usize, last_row: usize) -> (usize, usize) {
+        let bottom = top.saturating_add(height - 1).min(last_row);
+        let margin = Self::scroll_margin(height);
         let first = if top == 0 { top } else { top + margin }.min(bottom);
         let last = if bottom == last_row {
             bottom

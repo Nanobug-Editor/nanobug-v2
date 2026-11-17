@@ -1,7 +1,7 @@
 //! The visual context supplied to a concrete grid window for one frame.
 
 use crate::{
-    grid::render::{Frame, Rect},
+    grid::render::Rect,
     ui::{
         text::TextSpacing,
         theme::{CURRENT, SELECTION},
@@ -17,18 +17,13 @@ pub(in crate::grid) struct WindowFrame<'a> {
     pub selected: bool,
     /// Whether a modal popup currently owns input.
     pub modal_open: bool,
-    /// Whether the corner controls are visible in the border.
+    /// Whether the popup's corner controls are visible.
     pub controls_hovered: bool,
     /// Shared font measurements used for labels and document cells.
     pub spacing: &'a TextSpacing,
 }
 
 impl WindowFrame<'_> {
-    /// Draw `title` around `frame` using the shared border and corner controls.
-    pub fn border(self, frame: &mut Frame, title: &str) {
-        frame.border(title, self.selected, self.controls_hovered, self.spacing);
-    }
-
     /// Dim retained pane selections while a modal popup owns input.
     pub fn selection_tint(self) -> u32 {
         if self.modal_open { CURRENT } else { SELECTION }

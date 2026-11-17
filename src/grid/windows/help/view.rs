@@ -15,7 +15,7 @@ use crate::{
     },
 };
 
-use gpui::{AnyElement, Bounds, Pixels, point, px, size};
+use gpui::{AnyElement, Bounds, Pixels, Point, point, px, size};
 use nanobug::i18n;
 use std::ops::Range;
 
@@ -48,7 +48,18 @@ impl HelpList {
         spacing: &TextSpacing,
     ) -> [(&'static str, Range<usize>); 3] {
         let mut start = slot.start;
-        [self.window_title(), " | ", i18n::text("help.global_title")].map(|text| {
+        let window = self.has_scope(Scope::Window);
+        let global = self.has_scope(Scope::Global);
+        let parts = [
+            if window { self.window_title() } else { "" },
+            if window && global { " | " } else { "" },
+            if global {
+                i18n::text("help.global_title")
+            } else {
+                ""
+            },
+        ];
+        parts.map(|text| {
             let available = (slot.end - start) * UNITS_PER_COLUMN;
             let width = spacing
                 .fitting_cells(text, available)
@@ -90,6 +101,24 @@ impl HelpList {
 }
 
 impl HelpWindow {
+    /// Find the visible help title at `position` using the same layout as the border.
+    pub(in crate::grid) fn scope_at(
+        &self,
+        area: Rect,
+        metrics: Metrics,
+        spacing: &TextSpacing,
+        controls_hovered: bool,
+        position: Point<Pixels>,
+    ) -> Option<Scope> {
+        self.list
+            .as_ref()?
+            .tab_targets(area, metrics, spacing, controls_hovered)
+            .into_iter()
+            .find_map(|(scope, bounds)| {
+                (!bounds.is_empty() && bounds.contains(&position)).then_some(scope)
+            })
+    }
+
     /// Center the popup in `cols` by `rows` at the same size in browsing and search.
     pub(in crate::grid) fn layout(&self, cols: usize, rows: usize) -> Rect {
         let Some(list) = &self.list else {

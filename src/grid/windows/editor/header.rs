@@ -89,18 +89,23 @@ impl EditorWindow {
         let buffers = self.visible_buffers().map(|buffer| {
             let doc = &buffer.vim.doc;
             let path = doc.path.as_deref();
-            let label = path
+            let mut label = path
                 .and_then(Path::file_name)
                 .map_or_else(
                     || i18n::text("editor.untitled").into(),
                     |name| name.to_string_lossy().into_owned(),
                 )
                 .replace(['\r', '\n', '\t'], " ");
+            if buffer.terminal.is_some() {
+                label = i18n::text("terminal.title").into();
+            } else if buffer.vim.is_help() && path.is_none() {
+                label = i18n::text("vim_g.help_title").into();
+            }
             let icon = EntryIcon::for_path(path.unwrap_or_else(|| Path::new("")), false, false);
             Entry {
                 label,
                 id: buffer.id,
-                icon: Some(icon),
+                icon: buffer.terminal.is_none().then_some(icon),
                 active: buffer.id == active,
                 modified: doc.modified(),
             }

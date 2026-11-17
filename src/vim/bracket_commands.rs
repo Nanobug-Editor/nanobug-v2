@@ -3,7 +3,7 @@
 mod includes;
 
 use super::{
-    Action, Mode, Register, Vim,
+    Action, ArgumentCommand, Mode, Pending, Register, Vim,
     hint::Continuation,
     motions::{Kind, Motion},
 };
@@ -27,9 +27,12 @@ pub(super) const BRACKET_BACKWARD: &[Continuation] = &[
     ("Ctrl+i", "vim_bracket.identifier_jump", false),
     ("Ctrl+d", "vim_bracket.define_jump", false),
     ("p P", "vim_bracket.put_before", false),
+    ("MiddleMouse", "vim_bracket.put_before", false),
     ("Space", "vim_bracket.blank_above", false),
     ("b", "vim_bracket.previous_buffer", false),
     ("B", "vim_bracket.first_buffer", false),
+    ("a", "vim_bracket.previous_argument", false),
+    ("A", "vim_bracket.first_argument", false),
     ("d", "vim_bracket.previous_diagnostic", false),
     ("D", "vim_bracket.first_diagnostic", false),
 ];
@@ -52,10 +55,13 @@ pub(super) const BRACKET_FORWARD: &[Continuation] = &[
     ("Ctrl+i", "vim_bracket.identifier_jump", false),
     ("Ctrl+d", "vim_bracket.define_jump", false),
     ("p", "vim_bracket.put_after", false),
+    ("MiddleMouse", "vim_bracket.put_after", false),
     ("P", "vim_bracket.put_before", false),
     ("Space", "vim_bracket.blank_below", false),
     ("b", "vim_bracket.next_buffer", false),
     ("B", "vim_bracket.last_buffer", false),
+    ("a", "vim_bracket.next_argument", false),
+    ("A", "vim_bracket.last_argument", false),
     ("d", "vim_bracket.next_diagnostic", false),
     ("D", "vim_bracket.last_diagnostic", false),
 ];
@@ -64,11 +70,29 @@ pub(super) const BRACKET_FORWARD: &[Continuation] = &[
 pub(super) fn is_motion_hint(label: &str) -> bool {
     !matches!(
         label,
-        "f" | "i I" | "Ctrl+i" | "Ctrl+d" | "p P" | "p" | "P" | "Space" | "b" | "B" | "d" | "D"
+        "f" | "i I"
+            | "Ctrl+i"
+            | "Ctrl+d"
+            | "p P"
+            | "p"
+            | "P"
+            | "MiddleMouse"
+            | "Space"
+            | "b"
+            | "B"
+            | "a"
+            | "A"
+            | "d"
+            | "D"
     )
 }
 
 impl Vim {
+    /// Detect a bracket paste awaiting the native middle mouse button.
+    pub fn awaits_bracket_paste(&self) -> bool {
+        matches!(self.pending, Some(Pending::Prefix('[' | ']', None, _)))
+    }
+
     /// Resolve a square-bracket motion from `command`, with its `count` and operator context.
     pub(super) fn bracket_motion(
         &mut self,
@@ -131,11 +155,11 @@ impl Vim {
         let forward = command.starts_with(']');
         match command {
             "[f" | "]f" => Some(self.file_at_cursor(count)),
-            "[p" | "[P" | "]P" | "]p" => {
+            "[p" | "[P" | "]P" | "]p" | "[MiddleMouse" | "]MiddleMouse" => {
                 if self.read_only {
                     return Some(self.reject_edit());
                 }
-                self.put_indented(register, command != "]p", steps);
+                self.put_indented(register, !matches!(command, "]p" | "]MiddleMouse"), steps);
                 Some(Action::None)
             }
             "[ " | "] " if self.mode == Mode::Normal => {
@@ -152,6 +176,18 @@ impl Vim {
                     forward,
                     edge: command.ends_with('B'),
                     count,
+                })
+            }
+            "[a" | "]a" | "[A" | "]A" if self.mode == Mode::Normal && !self.read_only => {
+                let command = if command.ends_with('A') {
+                    ArgumentCommand::Edge { last: forward }
+                } else {
+                    ArgumentCommand::Step { forward }
+                };
+                Some(Action::Arguments {
+                    command,
+                    count,
+                    arguments: String::new(),
                 })
             }
             "[d" | "]d" | "[D" | "]D" if self.mode == Mode::Normal && !self.read_only => {

@@ -18,6 +18,8 @@ use tree_sitter::{
 };
 
 const MAX_NODES: usize = 2048;
+/// Keep complete native node lists under the bounded reply size.
+const MAX_SELECTION_NODES: usize = 24_000;
 /// Cap both capture traffic and syntax error rows for a single snapshot.
 const MAX_CAPTURES: usize = 6144;
 const MAX_DIAGNOSTICS: usize = 80;
@@ -26,25 +28,43 @@ const MAX_CACHED: usize = 12;
 const PARSE_BUDGET: Duration = Duration::from_millis(500);
 type Key = (String, u64, u64);
 
+/// A view of the same versioned Tree-sitter tree.
+enum Projection<'a> {
+    /// Legacy node details for plugins.
+    Outline,
+    /// Named captures and error diagnostics for a plugin query.
+    Query(&'a str),
+    /// Named UTF-8 byte intervals for native selection.
+    Selection,
+}
+
 /// Reuse parse results for the same document version and grammar.
 pub(super) fn serve(mut input: impl BufRead, output: Output) -> anyhow::Result<()> {
     let mut syntax = Syntax::default();
     while let Some(request) = receive(&mut input)? {
-        let (id, language, document, query) = match request {
+        let (id, result) = match request {
             Request::Parse {
                 id,
                 language,
                 document,
-            } => (id, language, document, None),
+            } => (id, syntax.run(language, &document, Projection::Outline)),
             Request::QuerySyntax {
                 id,
                 language,
                 query,
                 document,
-            } => (id, language, document, Some(query)),
+            } => (
+                id,
+                syntax.run(language, &document, Projection::Query(&query)),
+            ),
+            Request::SyntaxNodes {
+                id,
+                language,
+                document,
+            } => (id, syntax.run(language, &document, Projection::Selection)),
             _ => anyhow::bail!("unexpected syntax request"),
         };
-        match syntax.run(language, &document, query.as_deref()) {
+        match result {
             Ok(value) => output.send(Reply::Parsed { id, value })?,
             Err(error) => output.error(id, ErrorKind::Invalid, error)?,
         }
@@ -62,12 +82,12 @@ struct Syntax {
 }
 
 impl Syntax {
-    /// Parse or reuse the tree for `doc` and project it as a node list or a bounded `query`.
+    /// Parse or reuse the tree for `doc` in `language` and produce its requested `projection`.
     fn run(
         &mut self,
         language: String,
         doc: &DocumentSnapshot,
-        query: Option<&str>,
+        projection: Projection<'_>,
     ) -> anyhow::Result<Value> {
         anyhow::ensure!(
             doc.text.len() <= 120 * 1024,
@@ -85,28 +105,39 @@ impl Syntax {
             }
             (key, tree, None)
         };
-        let result = if let Some(source) = query {
-            self.query(
+        let result = match projection {
+            Projection::Query(source) => self.query(
                 &entry.0.0,
                 &base,
                 source,
                 entry.1.root_node(),
                 doc,
                 deadline,
-            )
-        } else if let Some(value) = &entry.2 {
-            let mut value = value.clone();
-            value["cached"] = Value::Bool(true);
-            Ok(value)
-        } else {
-            project_nodes(
+            ),
+            Projection::Selection => selection_nodes(
                 &mut self.parser,
                 &entry.0.0,
-                doc,
+                &doc.text,
                 entry.1.root_node(),
                 deadline,
             )
-            .inspect(|value| entry.2 = Some(value.clone()))
+            .and_then(|nodes| Ok(serde_json::to_value(nodes)?)),
+            Projection::Outline => {
+                if let Some(value) = &entry.2 {
+                    let mut value = value.clone();
+                    value["cached"] = Value::Bool(true);
+                    Ok(value)
+                } else {
+                    project_nodes(
+                        &mut self.parser,
+                        &entry.0.0,
+                        doc,
+                        entry.1.root_node(),
+                        deadline,
+                    )
+                    .inspect(|value| entry.2 = Some(value.clone()))
+                }
+            }
         };
         self.trees.push_back(entry);
         result
@@ -219,6 +250,62 @@ impl Syntax {
             && Instant::now() < deadline;
         result.captures.sort_by_key(|capture| capture.range.start);
     }
+}
+
+/// Collect named ranges, including the inline grammars used in Markdown and web documents.
+fn selection_nodes(
+    parser: &mut Parser,
+    language: &str,
+    text: &str,
+    root: Node<'_>,
+    deadline: Instant,
+) -> anyhow::Result<Vec<ByteRange>> {
+    let mut ranges = Vec::new();
+    append_selection_nodes(&mut ranges, root, 0, deadline)?;
+    let vue = matches!(language, "vue" | "vue-template");
+    if matches!(
+        language,
+        "markdown" | "html" | "vue" | "vue-template" | "astro" | "svelte"
+    ) {
+        let regions = descendants(root).filter_map(|node| {
+            if language == "markdown" {
+                (node.kind() == "inline").then(|| ("markdown_inline", node.byte_range()))
+            } else if language == "astro" && node.kind() == "frontmatter" {
+                node.named_child(0)
+                    .filter(|child| child.kind() == "frontmatter_js_block")
+                    .map(|child| ("typescript", child.byte_range()))
+            } else {
+                (!vue || node.parent() == Some(root))
+                    .then(|| embedded_region(node, text, vue))
+                    .flatten()
+            }
+        });
+        for (language, region) in regions {
+            let grammar = grammar(language).expect("built-in embedded selection grammar");
+            let tree = parse_tree(parser, &grammar, &text.as_bytes()[region.clone()], deadline)?;
+            append_selection_nodes(&mut ranges, tree.root_node(), region.start, deadline)?;
+        }
+    }
+    Ok(ranges)
+}
+
+/// Add nonempty named nodes below `root`, translating them by `offset` before `deadline`.
+fn append_selection_nodes(
+    ranges: &mut Vec<ByteRange>,
+    root: Node<'_>,
+    offset: usize,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    for node in descendants(root).filter(Node::is_named) {
+        anyhow::ensure!(Instant::now() < deadline, "Syntax selection timed out");
+        let start = offset + node.start_byte();
+        let end = offset + node.end_byte();
+        if start < end {
+            anyhow::ensure!(ranges.len() < MAX_SELECTION_NODES, "Too many syntax nodes");
+            ranges.push(ByteRange { start, end });
+        }
+    }
+    Ok(())
 }
 
 /// Return query captures and parser recovery errors in UTF-8 byte coordinates.
@@ -596,6 +683,46 @@ const JSON_HIGHLIGHTS: &str = r#"
 mod tests {
     use super::*;
 
+    /// Return named ranges in original UTF-8 coordinates, including Markdown inline nodes.
+    #[test]
+    fn selection_uses_named_tree_sitter_nodes() {
+        let mut syntax = Syntax::default();
+        let cases = [
+            (
+                "rust",
+                "fn run() { println!(\"中文\"); }",
+                &["run", "\"中文\"", "中文"][..],
+                "{",
+            ),
+            (
+                "markdown",
+                "# 标题\n\nSee **强调** and [中文](https://example.test).\n",
+                &["**强调**", "中文", "https://example.test"][..],
+                "**",
+            ),
+        ];
+        for (language, text, expected, anonymous) in cases {
+            let doc = DocumentSnapshot {
+                path: None,
+                opening: 0,
+                revision: 0,
+                text: text.into(),
+            };
+            let value = syntax
+                .run(language.into(), &doc, Projection::Selection)
+                .unwrap();
+            let ranges: Vec<ByteRange> = serde_json::from_value(value).unwrap();
+            let selected: Vec<&str> = ranges
+                .iter()
+                .map(|range| &text[range.start..range.end])
+                .collect();
+            for expected in expected {
+                assert!(selected.contains(expected), "{language}: {selected:?}");
+            }
+            assert!(!selected.contains(&anonymous), "{language}: {selected:?}");
+        }
+    }
+
     /// The same outer query can opt in to embedded captures without changing diagnostics.
     #[test]
     fn markup_queries_include_inline_captures_only_when_requested() {
@@ -639,7 +766,7 @@ mod tests {
                 text: text.into(),
             };
             let run = |syntax: &mut Syntax, query| -> SyntaxQuery {
-                let result = syntax.run(language.into(), &doc, Some(query)).unwrap();
+                let result = syntax.run(language.into(), &doc, Projection::Query(query)).unwrap();
                 serde_json::from_value(result).unwrap()
             };
             let plain = run(&mut syntax, plain_query);
@@ -667,6 +794,8 @@ fn grammar(name: &str) -> Option<Language> {
     Some(match name {
         "html" | "vue" | "vue-template" => tree_sitter_html::LANGUAGE.into(),
         "css" => tree_sitter_css::LANGUAGE.into(),
+        "c" => tree_sitter_c::LANGUAGE.into(),
+        "cpp" => tree_sitter_cpp::LANGUAGE.into(),
         "javascript" | "jsx" => tree_sitter_javascript::LANGUAGE.into(),
         "json" => tree_sitter_json::LANGUAGE.into(),
         "rust" => tree_sitter_rust::LANGUAGE.into(),
@@ -677,11 +806,16 @@ fn grammar(name: &str) -> Option<Language> {
         "go" => tree_sitter_go::LANGUAGE.into(),
         "java" => tree_sitter_java::LANGUAGE.into(),
         "kotlin" => tree_sitter_kotlin_ng::LANGUAGE.into(),
+        "lua" => tree_sitter_lua::LANGUAGE.into(),
+        "markdown" => tree_sitter_md::LANGUAGE.into(),
+        "markdown_inline" => tree_sitter_md::INLINE_LANGUAGE.into(),
         "php" => tree_sitter_php::LANGUAGE_PHP.into(),
         "python" => tree_sitter_python::LANGUAGE.into(),
         "ruby" => tree_sitter_ruby::LANGUAGE.into(),
         "sql" => tree_sitter_sequel::LANGUAGE.into(),
         "svelte" => tree_sitter_svelte_ng::LANGUAGE.into(),
+        "toml" => tree_sitter_toml_ng::LANGUAGE.into(),
+        "yaml" => tree_sitter_yaml::LANGUAGE.into(),
         _ => return None,
     })
 }

@@ -3,10 +3,16 @@
 use super::{
     EditorPage, EditorSplits, EditorWindow, PageLayout, PaneId, Project, Workspace, WorkspaceTabs,
 };
-use crate::grid::{windows::editor::EditorSnapshot, workspace::editor_close::CloseTarget};
+use crate::grid::{
+    windows::{editor::EditorSnapshot, manager::ExplorerSnapshot},
+    workspace::{editor_close::CloseTarget, plugins::PluginWindowsSnapshot},
+};
 use anyhow::{Context as _, Result, ensure};
 use gpui::{Context, PromptLevel, Window};
-use nanobug::{app_data, i18n};
+use nanobug::{
+    app_data, i18n,
+    vim::{FileMarkSnapshot, FileMarks},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -35,6 +41,15 @@ struct ProjectSnapshot {
     previous_page: Option<usize>,
     /// Editor snapshots keyed by the pane identities used in the split trees.
     editors: BTreeMap<PaneId, EditorSnapshot>,
+    /// Project-wide Explorer navigation shared by all its pages.
+    #[serde(default)]
+    explorer: Option<ExplorerSnapshot>,
+    /// Attached plugin window and plugin manager browsing state.
+    #[serde(default)]
+    plugin_windows: PluginWindowsSnapshot,
+    /// Named uppercase marks belonging to this project.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    file_marks: Vec<FileMarkSnapshot>,
 }
 
 /// Outer pane layout and editor split geometry for one project page.
@@ -44,6 +59,70 @@ struct PageSnapshot {
     layout: PageLayout,
     /// Nested split structure and focused editor.
     splits: EditorSplits,
+}
+
+/// Explicit Session exports carry their original root and retain exact Nanobug layout.
+#[derive(Deserialize, Serialize)]
+struct ExSessionSnapshot {
+    root: PathBuf,
+    standalone: bool,
+    layout: ProjectSnapshot,
+}
+
+impl Project {
+    /// Serialize this Session using the layout and editor-view format used by local restoration.
+    pub(in crate::grid::workspace) fn ex_session_snapshot(&self) -> Result<String> {
+        Ok(serde_json::to_string(&ExSessionSnapshot {
+            root: self.root.clone(),
+            standalone: self.manager.is_none(),
+            layout: ProjectSnapshot::capture(self),
+        })?)
+    }
+}
+
+impl WorkspaceTabs {
+    /// Restore one validated exported Session without replacing other project tabs.
+    pub(in crate::grid::workspace) fn restore_ex_session(&mut self, text: &str) -> Result<()> {
+        let snapshot: ExSessionSnapshot = serde_json::from_str(text)?;
+        let root = snapshot.root.canonicalize()?;
+        ensure!(
+            root.is_dir(),
+            "{}",
+            i18n::format("ex.directory_missing", &[("path", &root.display())])
+        );
+        let mut project = snapshot.layout.restore(root.clone())?;
+        if snapshot.standalone {
+            project.manager = None;
+        }
+        let existing = if snapshot.standalone {
+            project
+                .editor
+                .vim()
+                .doc
+                .path
+                .as_deref()
+                .and_then(|path| self.file_index(path))
+        } else {
+            self.project_index(&root)
+        };
+        let tab = if let Some(tab) = existing {
+            let retained = self.project(tab);
+            ensure!(
+                retained.editors().all(|(_, editor)| !editor.modified())
+                    && retained.detached_documents().all(|doc| !doc.modified()),
+                "{}",
+                i18n::text("ex.unsaved_buffers")
+            );
+            // A layout restore hides existing jobs without terminating or restarting their PTYs.
+            project.terminal_buffers = std::mem::take(&mut self.project_mut(tab).terminal_buffers);
+            self.tabs[tab].content = super::TabContent::Project(Box::new(project));
+            tab
+        } else {
+            self.push(super::TabContent::Project(Box::new(project)))
+        };
+        self.activate(tab);
+        Ok(())
+    }
 }
 
 /// Highest processed request and last successful snapshot for a project.
@@ -104,6 +183,12 @@ impl ProjectSnapshot {
             previous_page: project.previous_page,
             pages,
             editors,
+            explorer: project
+                .manager
+                .as_ref()
+                .map(super::ManagerWindow::project_snapshot),
+            plugin_windows: project.plugin_windows.clone(),
+            file_marks: project.file_marks.snapshot(),
         }
     }
 
@@ -143,14 +228,22 @@ impl ProjectSnapshot {
         let editor = editors
             .remove(&active)
             .context("Missing active Session editor")?;
-        let manager = super::ManagerWindow::new(root.clone());
+        let mut manager = super::ManagerWindow::new(root.clone());
+        if let Some(explorer) = self.explorer {
+            manager.restore_project_snapshot(explorer);
+        }
         let mut project = Project::with_editor(root, editor, Some(manager), String::new());
+        project.plugin_windows = self.plugin_windows;
         project.pages = self
             .pages
             .into_iter()
             .map(|page| EditorPage {
+                script_scope: Default::default(),
                 layout: page.layout,
                 splits: page.splits,
+                editor_zoomed: false,
+                preview: None,
+                directory: Default::default(),
             })
             .collect();
         project.active_page = self.active_page;
@@ -159,6 +252,8 @@ impl ProjectSnapshot {
             .filter(|&index| index < project.pages.len() && index != project.active_page);
         project.next_pane = next_pane;
         project.inactive_editors = editors;
+        project.join_restored_buffers();
+        project.install_file_marks(FileMarks::restore(self.file_marks));
         project.restore_page_layout();
         if skipped > 0 {
             project.status = i18n::format("project_session.skipped_files", &[("count", &skipped)]);
@@ -204,10 +299,11 @@ impl ProjectSessions {
             }
         };
         if let Some(file) = file {
-            if let Err(error) = project.editor.open(file, 0.) {
+            if let Err(error) = project.open_editor_file(file, 0.) {
                 project.status = format!("{error:#}");
             } else {
                 project.focus_pane(super::Focus::Editor);
+                project.plugin_windows.focus_editor();
                 if project.hidden_pane == Some(super::Focus::Editor) {
                     project.hidden_pane = None;
                 }
@@ -218,6 +314,12 @@ impl ProjectSessions {
 }
 
 impl WorkspaceTabs {
+    /// Use a temporary on-disk Session store in a native integration test.
+    #[cfg(all(test, windows))]
+    pub(in crate::grid::workspace) fn use_project_session_store(&mut self, directory: PathBuf) {
+        self.sessions.directory = Some(directory);
+    }
+
     /// Capture the directory projects in a close `target`, or all of them for an autosave.
     fn session_batch(&mut self, target: Option<CloseTarget>) -> Option<WriteBatch> {
         let directory = self.sessions.directory.clone()?;
@@ -225,7 +327,8 @@ impl WorkspaceTabs {
             .indexed()
             .filter(|(index, project)| {
                 project.manager.is_some()
-                    && (target != Some(CloseTarget::Tab) || *index == self.selected)
+                    && (!target.is_some_and(CloseTarget::closes_selected_tab)
+                        || *index == self.selected)
             })
             .map(|(_, project)| (project.root.clone(), ProjectSnapshot::capture(project)))
             .collect::<Vec<_>>();
@@ -261,6 +364,7 @@ impl Workspace {
                         if workspace.editor_close.is_some() {
                             return None;
                         }
+                        workspace.remember_project_plugin_windows();
                         workspace.projects.session_batch(None)
                     })
                 }) else {
@@ -293,6 +397,7 @@ impl Workspace {
         &mut self,
         target: CloseTarget,
     ) -> bool {
+        self.remember_project_plugin_windows();
         self.projects
             .session_batch(Some(target))
             .is_none_or(|batch| batch.write().is_empty())

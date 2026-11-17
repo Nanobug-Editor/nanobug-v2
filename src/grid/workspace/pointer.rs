@@ -1,16 +1,32 @@
 //! Pointer hit testing, selection, pane resizing and wheel input.
 
+#[cfg(all(test, windows))]
+mod tests;
+
 use super::{
     Workspace,
-    editor_splits::PaneId,
-    layout::{Focus, ShellWindow, near_corner_controls},
+    editor_splits::{DividerHit, PaneId},
+    layout::{
+        Focus, ShellWindow, near_corner_controls, pane_border_offsets, stacked_divider_bounds,
+    },
 };
+use crate::grid::render::Rect;
 use crate::grid::windows::editor::{EditorWindow, HeaderTarget, MarkdownPreview};
+use crate::grid::windows::help::HelpCommand;
 use gpui::{
-    Bounds, ClickEvent, Context, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    ScrollEvent, Window, px,
+    Bounds, ClickEvent, Context, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, ScrollEvent, Window, px,
 };
 use nanobug::animation::scroll::ScrollInput;
+
+/// Divider that owns a pointer resize until the left button is released.
+#[derive(Clone, Copy)]
+pub(super) enum PaneResize {
+    /// Explorer divider and the correction from the mouse-down row to its seam.
+    Explorer(usize),
+    /// Split divider and the correction from the mouse-down row to its seam.
+    Editor(DividerHit, usize),
+}
 
 /// Tracks Markdown links in the final painted preview and the current left-button gesture.
 #[derive(Default)]
@@ -105,32 +121,13 @@ impl Workspace {
             .map(|link| (painted.document, link))
     }
 
-    /// Find the visible window whose corner controls are near the window-local pointer `position`.
+    /// Detect hover over the shortcut popup's close control at the window-local `position`.
     pub(super) fn corner_controls_at(&self, position: Point<Pixels>) -> Option<ShellWindow> {
-        if self.small_modal_open() {
-            return None;
-        }
-        let near = |target: ShellWindow| {
-            near_corner_controls(
-                self.window_area(target),
-                target.has_help(),
-                self.metrics,
-                position,
-            )
-        };
-        if self.help.is_open() {
-            return (!self.help.is_editor_help() && near(ShellWindow::ShortcutHelp))
-                .then_some(ShellWindow::ShortcutHelp);
-        }
-        if self.file_picker.is_some() {
-            return (self.file_picker_controls_available() && near(ShellWindow::FilePicker))
-                .then_some(ShellWindow::FilePicker);
-        }
-        if self.projects.start().is_some() {
-            return None;
-        }
-        let manager = ShellWindow::Pane(Focus::Manager);
-        near(manager).then_some(manager)
+        (!self.small_modal_open()
+            && self.help.is_open()
+            && !self.help.is_editor_help()
+            && near_corner_controls(self.help_layout(), false, self.metrics, position))
+        .then_some(ShellWindow::ShortcutHelp)
     }
 
     /// Update the corner controls through `cx` when the hovered `target` changes.
@@ -177,7 +174,29 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.vim_menu.is_some() {
+            self.click_vim_menu(event.position, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(area) = self.command_window_area() {
+            self.dismiss_sequence_hint(cx);
+            let (x, y) = self.metrics.cell(event.position);
+            if EditorWindow::body(area).contains(x, y)
+                && let Some(history) = &mut self.command_window
+            {
+                history
+                    .editor
+                    .press(event.position, area, self.metrics, &self.spacing);
+                self.sync(window, cx);
+            } else {
+                self.sync_text_input(window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         self.markdown_pointer.pressed = None;
+        self.pane_resize = None;
         self.dismiss_definition_hover(cx);
         if let Some((menu, ..)) = self.completion_menu(window)
             && let Some(index) = menu.hit(event.position, self.metrics)
@@ -260,6 +279,13 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
+        if let Some((divider, row_correction)) = self.editor_divider_at(event.position) {
+            self.pane_resize = Some(PaneResize::Editor(divider, row_correction));
+            self.set_controls_hover(None, cx);
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         let editor_hit = self.editor_at(x, y);
         let Some(project) = self.projects.active_project_mut() else {
             self.press_start_page(event, window, cx);
@@ -275,17 +301,22 @@ impl Workspace {
         } else {
             self.layout.tree
         };
+        let seam = Rect {
+            y: first.y + first.h,
+            h: 1,
+            ..first
+        };
         if project.manager.is_some()
             && project.hidden_pane.is_none()
             && if project.stacked {
-                x >= first.x && x < first.x + first.w && y == first.y + first.h
+                stacked_divider_bounds(seam, self.metrics).contains(&event.position)
             } else {
                 y >= first.y
                     && y < first.y + first.h
                     && (x == first.x + first.w || x == first.x + first.w.saturating_sub(1))
             }
         {
-            self.resizing = true;
+            self.pane_resize = Some(PaneResize::Explorer(seam.y.saturating_sub(y)));
         } else if project.manager.is_some() && self.layout.tree.contains(x, y) {
             project.focus_pane(Focus::Manager);
             let manager = project.manager.as_mut().expect("visible Explorer");
@@ -299,7 +330,7 @@ impl Workspace {
                 if let Some(path) = selection.open {
                     self.open(path, window, cx);
                 }
-                self.layout = self.derive_layout(window);
+                self.update_layout(window);
                 self.repaint(
                     [
                         ScrollInput::Advance,
@@ -314,6 +345,14 @@ impl Workspace {
         } else if let Some((pane, area)) = editor_hit {
             self.focus_editor_pane(pane, window, cx);
             if y == area.y || y == area.y + area.h - 1 {
+                self.sync(window, cx);
+                return;
+            }
+            let body = EditorWindow::body(area);
+            if body.contains(x, y)
+                && let Some(terminal) = self.projects.active_mut().editor.terminal_mut()
+            {
+                terminal.click(x - body.x, y - body.y);
                 self.sync(window, cx);
                 return;
             }
@@ -356,31 +395,185 @@ impl Workspace {
             .map(|target| (pane, target))
     }
 
-    /// Remove a file label on middle-click, while preserving Canvas input and modal ownership.
+    /// Close the title under a middle-click, preserving Canvas input outside the title.
     pub(super) fn middle_mouse_down(
         &mut self,
         event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.vim_menu.is_some() {
+            cx.stop_propagation();
+            return;
+        }
         self.dismiss_definition_hover(cx);
         self.dismiss_completion(cx);
-        if self.plugin_canvas_down(event) {
-            cx.stop_propagation();
-            return;
-        }
-        if self.modal_open() || event.click_count > 1 || self.plugins.file_busy {
-            return;
-        }
-        let (x, y) = self.metrics.cell(event.position);
-        if let Some((pane, HeaderTarget::Buffer(id))) = self.editor_header_target(x, y) {
-            if !self.focus_editor_pane(pane, window, cx) {
-                self.finish_editor_input(window, cx);
-            }
-            self.request_close(super::editor_close::CloseTarget::Buffer(id), window, cx);
+        if !self.modal_open()
+            && self.projects.active_project().is_some_and(|project| {
+                project.focus == Focus::Editor && project.editor.vim().awaits_bracket_paste()
+            })
+            && EditorWindow::body(self.active_editor_area())
+                .pixels(self.metrics)
+                .contains(&event.position)
+        {
+            self.run_vim(|vim, register| vim.key("MiddleMouse", register), window, cx);
             self.sync(window, cx);
             cx.stop_propagation();
+            return;
         }
+        if event.click_count == 1 && self.middle_close_title(event.position, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.plugin_canvas_down(event) {
+            cx.stop_propagation();
+        }
+    }
+
+    /// Let the topmost modal own title presses.
+    fn middle_close_title(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.plugin_popup_area().is_some() {
+            return self.middle_close_plugin_title(position, window, cx);
+        }
+        if self.help.is_open() {
+            let Some(scope) = self.help.scope_at(
+                self.help_layout(),
+                self.metrics,
+                &self.spacing,
+                self.hovered_controls == Some(ShellWindow::ShortcutHelp),
+                position,
+            ) else {
+                return false;
+            };
+            match self
+                .help
+                .close_scope(scope, self.scroll_epoch.elapsed().as_secs_f64())
+            {
+                HelpCommand::Close => {
+                    self.close_grid_window(ShellWindow::ShortcutHelp, window, cx);
+                    self.sync(window, cx);
+                }
+                HelpCommand::Update(input) => self.repaint_help(input, window, cx),
+                _ => {}
+            }
+            return true;
+        }
+        let popup_title = |area| {
+            self.popup_panel
+                .read(cx)
+                .title_at(area, position, self.metrics)
+        };
+        if let Some(area) = self.editor_close_area() {
+            let hit = popup_title(area);
+            if hit {
+                self.cancel_editor_close(window, cx);
+            }
+            return hit;
+        }
+        if let Some(area) = self.remove_recent_project_area() {
+            let hit = popup_title(area);
+            if hit {
+                self.finish_remove_recent_project(false, window, cx);
+            }
+            return hit;
+        }
+        if let Some(area) = self.language_picker_area() {
+            let hit = popup_title(area);
+            if hit {
+                self.finish_language_picker(None, window, cx);
+            }
+            return hit;
+        }
+        if let Some(area) = self.file_picker_prompt_area() {
+            let hit = popup_title(area);
+            if hit {
+                self.finish_picker_prompt(true, window, cx);
+            }
+            return hit;
+        }
+        if let Some(session) = &self.file_picker {
+            let hit = session.panel.read(cx).title_at(
+                self.file_picker_layout().area,
+                position,
+                self.metrics,
+            );
+            if hit {
+                self.close_focused_grid(window, cx);
+            }
+            return hit;
+        }
+        if self.plugins.open {
+            return self.middle_close_plugin_title(position, window, cx);
+        }
+        if self.plugins.file_busy {
+            return false;
+        }
+        if let Some(area) = self.sequence_hint_area()
+            && area.pixels(self.metrics).contains(&position)
+        {
+            let hit = popup_title(area);
+            if hit {
+                self.dismiss_sequence_hint(cx);
+                self.sync_text_input(window, cx);
+            }
+            return hit;
+        }
+        if let Some(area) = self.plugin_surface_area()
+            && area.pixels(self.metrics).contains(&position)
+        {
+            let hit = self
+                .plugin_panel()
+                .read(cx)
+                .title_at(area, position, self.metrics);
+            if hit {
+                self.close_plugin_surface();
+                self.sync(window, cx);
+            }
+            return hit;
+        }
+        if self.projects.start().is_some() {
+            return self.middle_close_start_title(position, window, cx);
+        }
+        if self.panels[0]
+            .read(cx)
+            .title_at(self.layout.tree, position, self.metrics)
+        {
+            self.close_grid_window(ShellWindow::Pane(Focus::Manager), window, cx);
+            self.sync(window, cx);
+            return true;
+        }
+        let Some((pane, id)) = self.editor_title_at(position) else {
+            return false;
+        };
+        self.close_editor_title(pane, id, window, cx);
+        true
+    }
+
+    /// Match file title cells after the same seam offset used to paint stacked panes.
+    fn editor_title_at(&self, position: Point<Pixels>) -> Option<(PaneId, u64)> {
+        let project = self.projects.active_project()?;
+        let panes = self.workspace_pane_areas();
+        self.editor_rects().into_iter().find_map(|(pane, area)| {
+            let mut title = Rect { h: 1, ..area }.pixels(self.metrics);
+            title.origin.y += pane_border_offsets(area, &panes, self.metrics).0;
+            if !title.contains(&position) {
+                return None;
+            }
+            let (x, _) = self.metrics.cell(position);
+            let target = project
+                .editor_by_id(pane)?
+                .header(area, &self.spacing, self.layout.visible_cols)
+                .target_at(x, area.y)?;
+            match target {
+                HeaderTarget::Buffer(id) => Some((pane, id)),
+                HeaderTarget::Overflow(_) => None,
+            }
+        })
     }
 
     /// Update close button hover from `event` or continue resizing or selection in `window`.
@@ -390,6 +583,37 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.vim_menu.is_some() {
+            self.hover_vim_menu(event.position, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(area) = self.command_window_area()
+            && let Some(history) = &mut self.command_window
+        {
+            if event.pressed_button != Some(MouseButton::Left) {
+                history.editor.stop_drag();
+            } else if history
+                .editor
+                .drag(event.position, area, self.metrics, &self.spacing)
+            {
+                self.sync(window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(PaneResize::Editor(divider, row_correction)) = self.pane_resize {
+            if event.pressed_button == Some(MouseButton::Left) && !self.modal_open() {
+                let (x, y) = self.metrics.cell(event.position);
+                if self.move_editor_divider(divider, x, y.saturating_add(row_correction)) {
+                    self.sync(window, cx);
+                }
+                cx.stop_propagation();
+                return;
+            }
+            self.pane_resize = None;
+            cx.notify();
+        }
         self.update_markdown_pointer(Some(event.position), cx);
         if self.file_picker.is_some() {
             if !self.help.is_open() && !self.small_modal_open() {
@@ -419,13 +643,13 @@ impl Workspace {
             return;
         };
         if !event.dragging() {
-            self.resizing = false;
+            self.pane_resize = None;
             project.editor.stop_drag();
         }
-        if self.resizing {
+        if let Some(PaneResize::Explorer(row_correction)) = self.pane_resize {
             let (x, y) = self.metrics.cell(event.position);
             if project.stacked {
-                let first_rows = y.saturating_sub(1);
+                let first_rows = y.saturating_add(row_correction).saturating_sub(1);
                 let rows = self.layout.tree.h + self.layout.editor.h;
                 project.manager_height = Some(if project.editor_first {
                     rows.saturating_sub(first_rows)
@@ -461,8 +685,22 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut native_drag = self.end_plugin_field_drag() || self.resizing;
-        self.resizing = false;
+        if let Some(history) = &mut self.command_window {
+            history.editor.stop_drag();
+            cx.stop_propagation();
+            return;
+        }
+        let resize = self.pane_resize.take();
+        let mut native_drag = self.end_plugin_field_drag() || resize.is_some();
+        if let Some(PaneResize::Editor(divider, row_correction)) = resize {
+            let (x, y) = self.metrics.cell(event.position);
+            if self.move_editor_divider(divider, x, y.saturating_add(row_correction)) {
+                self.sync(window, cx);
+            } else {
+                cx.notify();
+            }
+            cx.stop_propagation();
+        }
         if let Some(editor) = self
             .file_picker
             .as_mut()
@@ -497,6 +735,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.vim_menu.is_some() {
+            self.wheel_vim_menu(event, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self.command_window.is_some() {
+            self.wheel_command_window(event, window, cx);
+            cx.stop_propagation();
+            return;
+        }
         self.dismiss_completion(cx);
         if self.small_modal_open() {
             cx.stop_propagation();

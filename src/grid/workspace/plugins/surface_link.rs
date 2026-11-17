@@ -3,6 +3,17 @@
 use super::*;
 
 impl Workspace {
+    /// Dismiss the host surface and clear its local input state.
+    pub(in crate::grid::workspace) fn close_plugin_surface(&mut self) {
+        self.plugins.surface.focused = false;
+        self.plugins.surface.key = None;
+        self.plugins.surface.viewport = None;
+        self.plugins.surface.native_field = None;
+        self.plugins.composition.clear();
+        self.clear_canvas_focus();
+        self.end_plugin_field_drag();
+    }
+
     pub(in crate::grid::workspace) fn plugin_surface_area(&self) -> Option<Rect> {
         let key = self.plugins.surface.key.as_ref()?;
         if Some(key.instance.project) != self.plugins.active || self.modal_open() {

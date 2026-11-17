@@ -152,7 +152,11 @@ fn commands_produce_explicit_file_actions_with_space_containing_paths() {
     let (mut vim, mut register) = edit("", &[":w hello world.txt"]);
     assert_eq!(
         vim.key("Enter", &mut register),
-        Action::Save(Some("hello world.txt".into()))
+        Action::WriteFile {
+            name: Some("hello world.txt".into()),
+            force: false,
+            close: false
+        }
     );
     vim.text(":q!", &mut register);
     assert_eq!(vim.key("Enter", &mut register), Action::Close(true));

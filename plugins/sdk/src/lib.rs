@@ -520,6 +520,12 @@ pub enum Request {
         query: String,
         document: Box<DocumentSnapshot>,
     },
+    /// Project named Tree-sitter ranges for native syntax selection.
+    SyntaxNodes {
+        id: u64,
+        language: String,
+        document: Box<DocumentSnapshot>,
+    },
     Data {
         id: u64,
         query: u32,

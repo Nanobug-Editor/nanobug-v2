@@ -125,6 +125,8 @@ pub(in crate::grid) enum StartFocus {
     Projects,
     /// Thin cursor at the end of the visible project filter.
     Filter,
+    /// Directory preview with no cursor or text input.
+    Preview,
 }
 
 /// Per-tab navigation and feedback for the start page.
@@ -181,6 +183,7 @@ impl StartPage {
     pub(in crate::grid) fn cursor_focus(&self) -> StartFocus {
         match &self.picker {
             Some(picker) if picker.filter_focused() => StartFocus::Filter,
+            Some(picker) if !picker.shows_list() => StartFocus::Preview,
             Some(_) => StartFocus::Projects,
             None => StartFocus::Menu,
         }
@@ -229,8 +232,8 @@ impl StartPage {
 
     /// Position the current view in `cols` by `rows`, below the native caption.
     pub(in crate::grid) fn layout(&self, cols: usize, rows: usize) -> StartLayout {
-        if self.picker.is_some() {
-            return StartLayout::Projects(ProjectLayout::new(cols, rows));
+        if let Some(picker) = &self.picker {
+            return StartLayout::Projects(picker.layout(cols, rows));
         }
         let w = cols.min(MENU_COLUMNS);
         let h = MENU_TOP + ACTIONS.len() * MENU_STEP + 1;

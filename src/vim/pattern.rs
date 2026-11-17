@@ -1,12 +1,12 @@
 //! Vim-style search patterns and line-addressed substitutions using Rust regex.
 
 use super::{
-    Register, Vim,
+    Action, Register, ScreenMotionResolver, Vim,
     motions::{Kind, Motion},
 };
 use crate::i18n;
 use regex::{Captures, Regex, RegexBuilder};
-use std::ops::Range;
+use std::{collections::VecDeque, ops::Range};
 
 /// Last confirmed search, including the direction of its prompt.
 pub(super) struct Search {
@@ -32,16 +32,151 @@ pub(super) struct Substitution {
     quiet: bool,
     /// Count matches without applying edits.
     count_only: bool,
+    /// Explicit initial magic from :smagic or :snomagic.
+    magic: Option<bool>,
+    /// Whether each match is confirmed.
+    confirm: bool,
+    /// Optional output formatting after the last replacement.
+    print: Option<char>,
+}
+
+/// An occurrence and its already expanded replacement, in the original document.
+struct Occurrence {
+    range: Range<usize>,
+    replacement: String,
+}
+
+/// Remaining confirmed-substitution matches and their accumulated byte adjustment.
+pub(super) struct Confirmation {
+    pending: VecDeque<Occurrence>,
+    shift: isize,
+    revision: u64,
+    initial_revision: u64,
+}
+
+impl Confirmation {
+    /// Locate an original match in the document after earlier decisions.
+    fn range(&self, occurrence: &Occurrence) -> Range<usize> {
+        occurrence.range.start.saturating_add_signed(self.shift)
+            ..occurrence.range.end.saturating_add_signed(self.shift)
+    }
 }
 
 impl Vim {
+    /// Search matches starting in `range`, for rendering just the visible source.
+    pub fn search_highlights(&self, range: Range<usize>) -> Vec<Range<usize>> {
+        if self.search_highlights_hidden || !self.highlight_search() {
+            return Vec::new();
+        }
+        self.last_search.as_ref().map_or_else(Vec::new, |search| {
+            search
+                .regex
+                .find_iter(&self.doc.text[range.clone()])
+                .map(|hit| range.start + hit.start()..range.start + hit.end())
+                .collect()
+        })
+    }
+
     /// Most recent successfully compiled search pattern for the slash register.
     pub(super) fn search_pattern(&self) -> Option<&str> {
         self.last_search.as_ref().map(|search| search.text.as_str())
     }
 
-    /// Compile the search prompt `text`, then move or apply the queued operator through `register`.
-    pub(super) fn confirm_search(&mut self, text: &str, register: &mut Register) {
+    /// Preview the current prompt, moving `step` matches from its current preview.
+    /// A zero step restarts the incremental search at the original caret.
+    pub(super) fn preview_search(&mut self, step: isize) {
+        if !self.incremental_search() {
+            return;
+        }
+        let Some(origin) = self.command_prompt.search_origin else {
+            return;
+        };
+        let old = self.command_prompt.search_preview.take();
+        let position = if self.command.is_empty() {
+            None
+        } else if let Ok(regex) = compile(&self.command, self.pattern_case(&self.command, None)) {
+            let hits: Vec<_> = regex
+                .find_iter(&self.doc.text)
+                .map(|hit| hit.range())
+                .collect();
+            if hits.is_empty() {
+                None
+            } else {
+                let first = if self.prompt == '?' {
+                    let edge = hits.partition_point(|hit| hit.start < origin);
+                    (edge + hits.len() - self.search_count % hits.len()) % hits.len()
+                } else {
+                    let edge = hits.partition_point(|hit| hit.start <= origin);
+                    (edge + self.search_count.saturating_sub(1)) % hits.len()
+                };
+                let index = if step == 0 {
+                    first
+                } else {
+                    let current = old
+                        .and_then(|old| hits.iter().position(|hit| *hit == old))
+                        .unwrap_or(first);
+                    (current as isize + step).rem_euclid(hits.len() as isize) as usize
+                };
+                Some(hits[index].clone())
+            }
+        } else {
+            None
+        };
+        let caret = position.as_ref().map_or(origin, |hit| hit.start);
+        self.command_prompt.search_preview = position;
+        if self.doc.cursor != caret {
+            self.doc
+                .set_search_fold_row(Some(self.doc.location(caret).0));
+            self.set_cursor(caret);
+        }
+    }
+
+    /// Restore the search source caret and return the last preview destination, if present.
+    pub(super) fn end_prompt_search(&mut self) -> Option<usize> {
+        let origin = self.command_prompt.search_origin.take()?;
+        let preview = self.command_prompt.search_preview.take()?;
+        self.doc
+            .set_search_fold_row(Some(self.doc.location(origin).0));
+        self.set_cursor(origin);
+        Some(preview.start)
+    }
+
+    /// Append the character immediately after the current incremental match to the pattern.
+    pub(super) fn extend_prompt_search(&mut self) {
+        let Some(hit) = self.command_prompt.search_preview.as_ref() else {
+            return;
+        };
+        let Some(ch) = self.doc.text[hit.end..].chars().next() else {
+            return;
+        };
+        let origin = hit.start;
+        self.command_pos = self.command.len();
+        let continuation = if ch == '\n' {
+            "\\n".into()
+        } else if ".*[]~$^\\".contains(ch) {
+            format!("\\{ch}")
+        } else {
+            ch.to_string()
+        };
+        self.command_insert(&continuation);
+        if let Ok(regex) = compile(&self.command, self.pattern_case(&self.command, None))
+            && let Some(hit) = regex.find_at(&self.doc.text, origin)
+            && hit.start() == origin
+        {
+            self.command_prompt.search_preview = Some(hit.range());
+            self.doc
+                .set_search_fold_row(Some(self.doc.location(origin).0));
+            self.set_cursor(origin);
+        }
+    }
+
+    /// Compile search `text`, then move to `preview` or apply the queued operator through `register`.
+    pub(super) fn confirm_search(
+        &mut self,
+        text: &str,
+        preview: Option<usize>,
+        register: &mut Register,
+    ) {
         let operator = self.search_operator.take();
         if !text.is_empty() {
             if !self.set_search(text, self.prompt == '?') {
@@ -50,7 +185,25 @@ impl Vim {
         } else if let Some(search) = &mut self.last_search {
             search.backward = self.prompt == '?';
         }
-        if let Some(operator) = operator {
+        if let Some(end) = preview {
+            let search = self
+                .last_search
+                .as_ref()
+                .expect("previewed a compiled search");
+            self.message = format!("{}{}", self.prompt, search.text);
+            self.desired_column = None;
+            let motion = Motion {
+                end,
+                kind: Kind::Exclusive,
+                jump: true,
+            };
+            if let Some(operator) = operator {
+                self.operate_motion(operator, motion, register);
+            } else {
+                self.doc.set_search_fold_row(Some(self.doc.location(end).0));
+                self.apply_motion(motion);
+            }
+        } else if let Some(operator) = operator {
             if let Some(motion) = self.search_motion(false, self.search_count) {
                 self.operate_motion(operator, motion, register);
             }
@@ -147,8 +300,9 @@ impl Vim {
 
     /// Compile and remember `text` with its `backward` direction, leaving the prior search on error.
     fn set_search(&mut self, text: &str, backward: bool) -> bool {
-        match compile(text, None) {
+        match compile(text, self.pattern_case(text, None)) {
             Ok(regex) => {
+                self.search_highlights_hidden = false;
                 self.last_search = Some(Search {
                     text: text.into(),
                     regex,
@@ -165,6 +319,7 @@ impl Vim {
 
     /// Move to a match of the saved search, reversing its direction for N and wrapping at EOF.
     pub(super) fn search(&mut self, reverse: bool, count: usize) {
+        self.search_highlights_hidden = false;
         if let Some(motion) = self.search_motion(reverse, count) {
             self.doc
                 .set_search_fold_row(Some(self.doc.location(motion.end).0));
@@ -205,7 +360,7 @@ impl Vim {
     pub(super) fn repeat_substitution(&mut self) {
         let row = self.doc.location(self.doc.cursor).0;
         if let Some(previous) = self.last_substitution.clone() {
-            self.substitute(row..row + 1, previous);
+            self.substitute(row..row + 1, previous, false);
         }
     }
 
@@ -215,93 +370,128 @@ impl Vim {
             if let Some(search) = &self.last_search {
                 previous.pattern.clone_from(&search.text);
             }
-            self.substitute(0..self.line_count(), previous);
+            self.substitute(0..self.line_count(), previous, false);
         }
     }
 
     /// Parse Ex substitution `text`, returning whether it names a substitution.
     pub(super) fn substitute_command(&mut self, text: &str) -> bool {
-        let current = self.doc.location(self.doc.cursor).0;
-        let Some((lines, rest)) = parse_range(text, current, self.line_count()) else {
+        let current = self
+            .doc
+            .location(self.doc.cursor)
+            .0
+            .min(self.line_count() - 1);
+        let Some((lines, rest)) = self.ex_range(text) else {
             return false;
         };
-        let Some(args) = rest
-            .strip_prefix("substitute")
-            .or_else(|| rest.strip_prefix('s'))
-        else {
+        let mut lines = lines.unwrap_or(current..current + 1);
+        let Some((args, magic, repeat, last_search)) = substitution_head(rest) else {
             return false;
         };
-        if args.starts_with(char::is_alphabetic) {
-            return false;
-        }
         let args = args.trim_start();
-        if args.is_empty() {
-            if let Some(previous) = self.last_substitution.clone() {
-                self.substitute(
-                    lines,
-                    Substitution {
-                        global: false,
-                        quiet: false,
-                        count_only: false,
-                        ..previous
-                    },
-                );
-            }
-            return true;
-        }
-        let delimiter = args.chars().next().unwrap();
-        if delimiter.is_alphanumeric() || matches!(delimiter, '\\' | '"' | '|') {
-            return false;
-        }
-        let Some((pattern, tail)) = delimited(&args[delimiter.len_utf8()..], delimiter) else {
-            self.pattern_error("Missing substitution delimiter");
-            return true;
-        };
-        let (replacement, flags) =
-            delimited(tail, delimiter).unwrap_or_else(|| (tail.to_owned(), ""));
-        let flags = flags.trim();
-        if flags
+        let delimiter = args
             .chars()
-            .any(|ch| !matches!(ch, 'g' | 'i' | 'I' | 'e' | 'n'))
-        {
-            self.message = i18n::format("editor.unsupported_command", &[("command", &text)]);
-            return true;
-        }
-        let pattern = if pattern.is_empty() {
-            self.last_search
-                .as_ref()
-                .map_or_else(String::new, |search| search.text.clone())
+            .next()
+            .filter(|ch| !repeat && !ch.is_alphanumeric() && !matches!(ch, '\\' | '"' | '|'));
+        let (query, replacement, flags) = if let Some(delimiter) = delimiter {
+            let Some((query, tail)) = delimited(&args[delimiter.len_utf8()..], delimiter) else {
+                self.pattern_error("Missing substitution delimiter");
+                return true;
+            };
+            let (replacement, flags) =
+                delimited(tail, delimiter).unwrap_or_else(|| (tail.to_owned(), ""));
+            (Some(query), Some(replacement), flags)
         } else {
-            pattern
+            (None, None, args)
         };
-        if pattern.is_empty() {
+        let flags = flags.trim();
+        let digits = flags
+            .find(|ch: char| ch.is_ascii_digit())
+            .unwrap_or(flags.len());
+        let (flags, count) = flags.split_at(digits);
+        let (inherit, flags) = flags
+            .strip_prefix('&')
+            .map_or((false, flags), |flags| (true, flags));
+        if !flags
+            .chars()
+            .all(|ch| ch.is_ascii_whitespace() || "giIencpl#r".contains(ch))
+        {
+            self.pattern_error("Invalid substitution flags");
             return true;
         }
+        if !count.is_empty() {
+            let Some(count) = count
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|&count| count > 0)
+            else {
+                self.pattern_error("Invalid substitution line count");
+                return true;
+            };
+            lines.start = lines.end - 1;
+            lines.end = lines.start.saturating_add(count).min(self.line_count());
+        }
+        let previous = self.last_substitution.as_ref();
+        let uses_search = last_search || flags.contains('r') || query.as_deref() == Some("");
+        let query = if uses_search {
+            self.last_search.as_ref().map(|search| search.text.clone())
+        } else {
+            query.or_else(|| previous.map(|sub| sub.pattern.clone()))
+        };
+        let Some((pattern, replacement)) =
+            query.zip(replacement.or_else(|| previous.map(|sub| sub.replacement.clone())))
+        else {
+            self.pattern_error("No previous substitution or search pattern");
+            return true;
+        };
+        let prior = previous.filter(|_| inherit);
+        let confirm = flags.contains('c') ^ prior.is_some_and(|sub| sub.confirm);
         self.substitute(
             lines,
             Substitution {
                 pattern,
                 replacement,
-                global: flags.contains('g'),
-                case: if flags.contains('i') {
-                    Some(true)
-                } else {
-                    flags.contains('I').then_some(false)
-                },
-                quiet: flags.contains('e'),
-                count_only: flags.contains('n'),
+                global: flags.contains('g') ^ prior.is_some_and(|sub| sub.global),
+                case: flags
+                    .chars()
+                    .rev()
+                    .find_map(|flag| match flag {
+                        'i' => Some(true),
+                        'I' => Some(false),
+                        _ => None,
+                    })
+                    .or_else(|| prior.and_then(|sub| sub.case)),
+                quiet: flags.contains('e') ^ prior.is_some_and(|sub| sub.quiet),
+                count_only: flags.contains('n') ^ prior.is_some_and(|sub| sub.count_only),
+                magic: magic.or_else(|| {
+                    (delimiter.is_none() && !uses_search)
+                        .then(|| previous.and_then(|sub| sub.magic))
+                        .flatten()
+                }),
+                confirm,
+                print: flags
+                    .chars()
+                    .rev()
+                    .find(|&flag| "pl#".contains(flag))
+                    .or_else(|| prior.and_then(|sub| sub.print)),
             },
+            confirm,
         );
         true
     }
 
     /// Replace the first or all matches on each addressed line, as one undo transaction.
-    fn substitute(&mut self, rows: Range<usize>, command: Substitution) {
+    fn substitute(&mut self, rows: Range<usize>, command: Substitution, confirm: bool) {
         if self.read_only && !command.count_only {
             self.reject_edit();
             return;
         }
-        let regex = match compile(&command.pattern, command.case) {
+        let regex = match compile_with_magic(
+            &command.pattern,
+            self.pattern_case(&command.pattern, command.case),
+            command.magic.unwrap_or(true),
+        ) {
             Ok(regex) => regex,
             Err(error) => {
                 self.pattern_error(&error);
@@ -313,7 +503,12 @@ impl Vim {
             regex: regex.clone(),
             backward: false,
         });
+        self.search_highlights_hidden = false;
         self.last_substitution = Some(command.clone());
+        if confirm && !command.count_only {
+            self.begin_substitute_confirmation(rows, &command, &regex);
+            return;
+        }
         let mut count = 0;
         let mut edits = Vec::new();
         for row in rows {
@@ -339,6 +534,7 @@ impl Vim {
             }
         }
         if count == 0 && !command.quiet {
+            self.ex_failed = true;
             self.message = i18n::format("editor.search_not_found", &[("query", &command.pattern)]);
         }
         if command.count_only {
@@ -351,49 +547,274 @@ impl Vim {
         }
         if let Some(row) = cursor {
             self.set_cursor(self.first_nonblank(row.min(self.line_count() - 1)));
+            if let Some(flag) = command.print {
+                let line = self.doc.line(row);
+                self.message = match flag {
+                    'l' => format!("{}$", line.replace('\t', "^I")),
+                    '#' => format!("{} {line}", row + 1),
+                    _ => line.to_owned(),
+                };
+            }
+        }
+    }
+
+    /// Use the global pattern for both the search register and repeat-substitution patterns.
+    pub(super) fn remember_global_pattern(&mut self, pattern: String, regex: Regex) {
+        self.search_highlights_hidden = false;
+        if let Some(substitute) = &mut self.last_substitution {
+            substitute.pattern.clone_from(&pattern);
+        }
+        self.last_search = Some(Search {
+            text: pattern,
+            regex,
+            backward: false,
+        });
+    }
+
+    /// Plan replacements against the original text while retaining each full match for highlighting.
+    fn begin_substitute_confirmation(
+        &mut self,
+        rows: Range<usize>,
+        command: &Substitution,
+        regex: &Regex,
+    ) {
+        let mut pending = VecDeque::new();
+        for row in rows {
+            let offset = self.doc.starts[row];
+            for captures in regex
+                .captures_iter(self.doc.line(row))
+                .take(if command.global { usize::MAX } else { 1 })
+            {
+                let hit = captures.get(0).unwrap();
+                let mut replacement = String::new();
+                expand_replacement(&command.replacement, &captures, &mut replacement);
+                pending.push_back(Occurrence {
+                    range: offset + hit.start()..offset + hit.end(),
+                    replacement,
+                });
+            }
+        }
+        if pending.is_empty() {
+            if !command.quiet {
+                self.ex_failed = true;
+                self.message =
+                    i18n::format("editor.search_not_found", &[("query", &command.pattern)]);
+            }
+            return;
+        }
+        self.substitute_confirmation = Some(Confirmation {
+            pending,
+            shift: 0,
+            revision: self.doc.revision,
+            initial_revision: self.doc.revision,
+        });
+        self.show_substitution_match();
+    }
+
+    /// Whether the current prompt owns keys ahead of normal editor shortcuts and maps.
+    pub fn substitute_confirmation_active(&self) -> bool {
+        self.substitute_confirmation.is_some()
+    }
+
+    /// The current confirmed-substitution match, for drawing its highlight.
+    pub fn substitution_match(&self) -> Option<Range<usize>> {
+        let prompt = self.substitute_confirmation.as_ref()?;
+        if self.doc.revision != prompt.revision {
+            return None;
+        }
+        Some(prompt.range(prompt.pending.front()?))
+    }
+
+    /// Reveal the current match and refresh the localized prompt in the editor footer.
+    fn show_substitution_match(&mut self) {
+        let Some(range) = self.substitution_match() else {
+            return;
+        };
+        self.doc
+            .set_search_fold_row(Some(self.doc.location(range.start).0));
+        self.set_cursor(range.start);
+        self.message = i18n::text("editor.confirm_substitution").into();
+    }
+
+    /// Abandon outstanding matches and any enclosing global command, retaining confirmed changes.
+    pub(super) fn cancel_substitute_confirmation(&mut self) {
+        if self.substitute_confirmation.take().is_some() {
+            self.ex_lines = None;
+            self.message.clear();
+        }
+    }
+
+    /// Consume a confirmation response and resume pending global lines when this command ends.
+    pub(super) fn substitute_confirmation_key(
+        &mut self,
+        key: &str,
+        register: &mut Register,
+        resolve_screen: &mut ScreenMotionResolver<'_>,
+    ) -> Action {
+        let Some(mut prompt) = self.substitute_confirmation.take() else {
+            return Action::None;
+        };
+        if prompt.revision != self.doc.revision || self.read_only {
+            self.ex_lines = None;
+            self.message = i18n::text("editor.substitution_invalidated").into();
+            self.resume_ex_prompt();
+            return Action::None;
+        }
+        if matches!(key, "Escape" | "Ctrl+[" | "Ctrl+c") {
+            self.ex_lines = None;
+            self.message.clear();
+            self.resume_ex_prompt();
+            return Action::None;
+        }
+        if matches!(key, "Ctrl+e" | "Ctrl+y") {
+            self.scroll(key, None);
+        }
+        let mut last = None;
+        if matches!(key, "y" | "n" | "a" | "l") {
+            while let Some(occurrence) = prompt.pending.pop_front() {
+                let range = prompt.range(&occurrence);
+                last = Some(range.start);
+                if key != "n" {
+                    let shift = occurrence.replacement.len() as isize - range.len() as isize;
+                    self.replace(
+                        range,
+                        &occurrence.replacement,
+                        self.doc.revision == prompt.initial_revision,
+                    );
+                    prompt.shift += shift;
+                    prompt.revision = self.doc.revision;
+                }
+                if key != "a" {
+                    break;
+                }
+            }
+        }
+        if prompt.pending.is_empty() || matches!(key, "q" | "l") {
+            if let Some(last) = last {
+                self.set_cursor(last);
+            }
+            self.message.clear();
+            let action = self.continue_ex_lines(register, resolve_screen);
+            self.resume_ex_prompt();
+            return action;
+        } else {
+            self.substitute_confirmation = Some(prompt);
+            if last.is_some() {
+                self.show_substitution_match();
+            }
+        }
+        Action::None
+    }
+
+    /// Restore the persistent Ex prompt once it receives input again.
+    fn resume_ex_prompt(&mut self) {
+        if self.g.ex_mode && !self.substitute_confirmation_active() {
+            self.open_prompt(':', 1);
         }
     }
 
     /// Report a pattern `error` in the status line without changing document text.
-    fn pattern_error(&mut self, error: &str) {
+    pub(super) fn pattern_error(&mut self, error: &str) {
+        self.ex_failed = true;
         self.message = i18n::format("editor.invalid_pattern", &[("error", &error)]);
     }
 }
 
-/// Parse percent, current line, last line or numeric line addresses before an Ex command.
-fn parse_range(text: &str, current: usize, count: usize) -> Option<(Range<usize>, &str)> {
-    if let Some(rest) = text.strip_prefix('%') {
-        return Some((0..count, rest.trim_start()));
+/// Resolve full and abbreviated substitution forms and the two punctuation repeats.
+fn substitution_head(rest: &str) -> Option<(&str, Option<bool>, bool, bool)> {
+    if let Some(args) = rest.strip_prefix('&') {
+        return Some((args, None, true, false));
     }
-    let Some((first, rest)) = address(text, current, count) else {
-        return Some((current..current + 1, text));
-    };
-    let (last, rest) = if let Some(rest) = rest.trim_start().strip_prefix([',', ';']) {
-        address(rest.trim_start(), current, count)?
+    if let Some(args) = rest.strip_prefix('~') {
+        return Some((args, None, true, true));
+    }
+    let end = rest.bytes().take_while(u8::is_ascii_alphabetic).count();
+    let (name, args) = rest.split_at(end);
+    let magic = if !name.is_empty() && "substitute".starts_with(name) {
+        None
+    } else if name.len() >= 3 && "snomagic".starts_with(name) {
+        Some(false)
+    } else if name.len() >= 2 && "smagic".starts_with(name) {
+        Some(true)
+    } else if let Some(flags) = name.strip_prefix('s')
+        && !flags.is_empty()
+        && flags.chars().all(|flag| "giIencr".contains(flag))
+    {
+        return Some((&rest[1..], None, true, false));
     } else {
-        (first, rest)
-    };
-    if first > last || last >= count {
         return None;
-    }
-    Some((first..last + 1, rest.trim_start()))
+    };
+    Some((args, magic, false, false))
 }
 
-/// Parse one one-based Ex line address and return its zero-based row.
-fn address(text: &str, current: usize, count: usize) -> Option<(usize, &str)> {
-    if let Some(rest) = text.strip_prefix('.') {
-        return Some((current, rest));
+impl Vim {
+    /// Read an optional Ex range from `text` and return it with the following command.
+    pub(super) fn ex_range<'a>(&self, text: &'a str) -> Option<(Option<Range<usize>>, &'a str)> {
+        let current = self.doc.location(self.doc.cursor).0;
+        let count = self.line_count();
+        if let Some(rest) = text.strip_prefix('%') {
+            return Some((Some(0..count), rest.trim_start()));
+        }
+        let Some((first, rest)) = self.ex_address(text, current + 1) else {
+            return Some((None, text));
+        };
+        let (last, rest) = if let Some(rest) = rest.trim_start().strip_prefix(',') {
+            self.ex_address(rest.trim_start(), current + 1)?
+        } else if let Some(rest) = rest.trim_start().strip_prefix(';') {
+            self.ex_address(rest.trim_start(), first)?
+        } else {
+            (first, rest)
+        };
+        (first <= last && last <= count).then_some((
+            Some(first.saturating_sub(1)..last.max(1)),
+            rest.trim_start(),
+        ))
     }
-    if let Some(rest) = text.strip_prefix('$') {
-        return Some((count - 1, rest));
+
+    /// Resolve an Ex line number from `text`, preserving address zero before the first line.
+    pub(super) fn ex_address<'a>(&self, text: &'a str, current: usize) -> Option<(usize, &'a str)> {
+        let (mut row, mut rest) = match text.as_bytes().first()? {
+            b'.' => (current, &text[1..]),
+            b'$' => (self.line_count(), &text[1..]),
+            b'\'' => {
+                let name = text[1..].chars().next()?;
+                let mark = self.mark_motion(name, false)?;
+                (
+                    self.doc.location(mark.end).0 + 1,
+                    &text[1 + name.len_utf8()..],
+                )
+            }
+            b'+' | b'-' => (current, text),
+            b'0'..=b'9' => {
+                let end = text.bytes().take_while(u8::is_ascii_digit).count();
+                (text[..end].parse().ok()?, &text[end..])
+            }
+            _ => return None,
+        };
+        loop {
+            let offset = rest.trim_start();
+            let Some(sign @ (b'+' | b'-')) = offset.as_bytes().first() else {
+                return Some((row, rest));
+            };
+            let digits = offset[1..].trim_start();
+            let end = digits.bytes().take_while(u8::is_ascii_digit).count();
+            let n = if end == 0 {
+                1
+            } else {
+                digits[..end].parse().ok()?
+            };
+            row = if *sign == b'+' {
+                row.checked_add(n)?
+            } else {
+                row.checked_sub(n)?
+            };
+            rest = &digits[end..];
+        }
     }
-    let end = text.bytes().take_while(u8::is_ascii_digit).count();
-    let row = text[..end].parse::<usize>().ok()?.saturating_sub(1);
-    Some((row, &text[end..]))
 }
 
 /// Read one delimiter-terminated field, unescaping only its delimiter.
-fn delimited(text: &str, delimiter: char) -> Option<(String, &str)> {
+pub(super) fn delimited(text: &str, delimiter: char) -> Option<(String, &str)> {
     let mut field = String::new();
     let mut chars = text.char_indices().peekable();
     while let Some((at, ch)) = chars.next() {
@@ -450,9 +871,22 @@ enum Syntax {
 }
 
 /// Translate Vim grouping, quantifiers, word boundaries and magic/case switches into regex.
-fn compile(input: &str, case: Option<bool>) -> Result<Regex, String> {
+pub(super) fn compile(input: &str, case: Option<bool>) -> Result<Regex, String> {
+    compile_with_magic(input, case, true)
+}
+
+/// Translate a Vim pattern with the initial magic forced by an Ex substitution form.
+fn compile_with_magic(
+    input: &str,
+    case: Option<bool>,
+    initial_magic: bool,
+) -> Result<Regex, String> {
     let mut translated = String::new();
-    let mut magic = Syntax::Normal;
+    let mut magic = if initial_magic {
+        Syntax::Normal
+    } else {
+        Syntax::NoMagic
+    };
     let mut ignore_case = case.unwrap_or(false);
     let mut class = false;
     let mut counted = false;

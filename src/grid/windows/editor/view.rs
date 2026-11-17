@@ -1,6 +1,6 @@
 //! Derive the editor header, line numbers and text from the active Tabpage.
 
-use super::{EditorWindow, TEXT_OVERSCAN, buffer::FOLD_ELLIPSIS};
+use super::{EditorWindow, TEXT_OVERSCAN};
 use crate::{
     grid::{
         render::{Frame, Rect},
@@ -15,6 +15,8 @@ use nanobug_plugin_sdk::language::Highlight;
 
 /// Empty source columns between the rendered text and the Markdown split divider.
 const MARKDOWN_SOURCE_RIGHT_PADDING: usize = 1;
+/// Reserve two digits before expanding the gutter for longer documents.
+const MIN_LINE_NUMBER_COLUMNS: usize = 2;
 
 /// Resolve the foreground role at document byte `offset` from sorted `highlights`.
 fn syntax_foreground(highlights: &[Highlight], offset: usize) -> Option<u32> {
@@ -61,7 +63,20 @@ impl EditorWindow {
     /// Return the text viewport within `area`, accounting for the gutter, divider gap and view height.
     pub(in crate::grid) fn text_area(&self, area: Rect) -> Rect {
         let body = self.source_body(area);
-        let gutter = (self.vim().line_count().to_string().len().max(4) + 2).min(body.w);
+        if self.terminal().is_some() {
+            return body;
+        }
+        let options = self.window_options();
+        let number_width = if options.number || options.relativenumber {
+            self.vim()
+                .line_count()
+                .to_string()
+                .len()
+                .max(MIN_LINE_NUMBER_COLUMNS)
+        } else {
+            1 // Retain the fold and diagnostic gutter without reserving digits.
+        };
+        let gutter = (number_width + 2).min(body.w);
         let width = body.w - gutter;
         let padding = if self.markdown_view_mode() == Some(super::MarkdownViewMode::Split) {
             MARKDOWN_SOURCE_RIGHT_PADDING.min(width.saturating_sub(1))
@@ -114,43 +129,64 @@ impl EditorWindow {
 
     /// Draw text and line numbers for `context`, using `color_at` for optional syntax colors by byte offset.
     /// Built-in Markdown colors fill gaps left by the provider and `color_at`.
-    /// The caret row shows its document line number. Other rows show the number of j/k steps to reach them.
+    /// Show line numbers on the first visual row of each line and highlight the caret's visual row.
     pub(in crate::grid) fn content_frames(
         &self,
         context: WindowFrame<'_>,
         color_at: impl Fn(usize) -> Option<u32>,
     ) -> (Frame, Frame) {
         let buffer = &self.buffers[self.active];
+        if let Some(terminal) = &buffer.terminal {
+            let composition = if context.selected {
+                self.composition.text.as_str()
+            } else {
+                ""
+            };
+            return (
+                Frame::new(0, 0),
+                terminal.frame(self.text_area(context.area), composition),
+            );
+        }
         let vim = &buffer.vim;
-        let row = vim.doc.location(vim.doc.cursor).0;
-        let caret_display_row = vim.doc.display_row(row);
-        let last_display_row = vim
-            .doc
-            .display_row(vim.line_count() - 1)
-            .max(caret_display_row);
+        let caret_line = buffer.cursor_row();
+        let last_line = (vim.line_count() - 1).max(caret_line);
+        let caret_logical_row = vim.doc.display_row(caret_line);
         let active = context.selected;
         let selection_tint = context.selection_tint();
+        let options = self.window_options();
+        let tabstop = vim.doc.tabstop();
+        let substitution = vim.substitution_match();
         let body = self.text_area(context.area);
         let source = self.source_body(context.area);
         let gutter = body.x - source.x;
+        let number_width = gutter.saturating_sub(2);
         let divider_padding = source.x + source.w - (body.x + body.w);
         if body.h == 0 {
             return (Frame::new(0, 0), Frame::new(0, 0));
         }
+        let composition = self.composition.text.as_str();
+        let rows = self.visual_rows(body.w, context.spacing);
+        let caret_display_row = if rows.is_wrapped() {
+            buffer.visual_caret(&rows, context.spacing, composition).0
+        } else {
+            caret_logical_row
+        };
         let first = buffer.scroll.first_cell();
         let mut numbers = Frame::viewport(gutter, body.h + 1, first);
         numbers.set_theme_component(ThemeComponent::Gutter);
-        let left = buffer.columns.first_cell() - buffer.left_padding();
-        let width = body.w + buffer.left_padding() + TEXT_OVERSCAN;
+        let (left, left_padding) = if rows.is_wrapped() {
+            (0, 0)
+        } else {
+            (
+                buffer.columns.first_cell() - buffer.left_padding(),
+                buffer.left_padding(),
+            )
+        };
+        let width = body.w + left_padding + TEXT_OVERSCAN;
         let right = left + width;
         let mut text = Frame::viewport(width, body.h + 1, first);
         text.set_theme_component(ThemeComponent::Editor);
         text.keep_whole_graphemes(body.x..body.x + body.w);
-        let composition = if active {
-            self.composition.text.as_str()
-        } else {
-            ""
-        };
         let highlights = buffer.highlights();
         let markdown = buffer.markdown_highlights();
         let foreground = |offset| {
@@ -163,16 +199,21 @@ impl EditorWindow {
                 })
                 .unwrap_or(TEXT)
         };
+        let mut painted_line = None;
         for visible in 0..=body.h {
             let display_row = first + visible;
-            if display_row > last_display_row {
-                numbers.text(2, visible, "~", MUTED, 1);
+            let Some(visual_row) = rows.row(display_row).filter(|row| row.line <= last_line) else {
+                numbers.text(
+                    number_width.saturating_sub(1),
+                    visible,
+                    "~",
+                    MUTED,
+                    number_width.min(1),
+                );
                 continue;
-            }
-            let line = vim.doc.document_row(display_row);
-            let distance = display_row.abs_diff(caret_display_row);
-            let number = if distance == 0 { line + 1 } else { distance };
-            let current = row == line && active;
+            };
+            let line = visual_row.line;
+            let current = display_row == caret_display_row && active;
             if current {
                 numbers.tint(visible, 0, gutter, CURRENT);
                 if divider_padding > 0 {
@@ -180,74 +221,117 @@ impl EditorWindow {
                     text.extend_row_tint(visible, CURRENT);
                 }
             }
-            let number_color = if current { GOLD } else { MUTED };
-            let width = gutter.saturating_sub(2);
-            let folded = vim.doc.folded_at(line);
-            numbers.text(
-                0,
-                visible,
-                &format!("{number:>width$}"),
-                number_color,
-                width,
-            );
-            if let Some(column) = Self::fold_arrow_column(gutter) {
-                let diagnostic = buffer.diagnostic_on_line(line);
-                if folded {
-                    let icon = if diagnostic {
-                        DIAGNOSTIC_FOLD_ARROW
+            if visual_row
+                .segment
+                .as_ref()
+                .is_none_or(|segment| segment.bytes.start == 0)
+            {
+                let distance = vim.doc.display_row(line).abs_diff(caret_logical_row);
+                if options.number || options.relativenumber {
+                    let number = if options.relativenumber && (!options.number || distance != 0) {
+                        distance
                     } else {
-                        FOLD_ARROW
+                        line + 1
                     };
-                    numbers.right_aligned_icon(column, visible, icon, 56);
-                } else if diagnostic {
-                    numbers.text(column, visible, "!", WARNING_TEXT, 1);
+                    let number_color = if line == caret_line && active {
+                        GOLD
+                    } else {
+                        MUTED
+                    };
+                    numbers.text(
+                        0,
+                        visible,
+                        &format!("{number:>number_width$}"),
+                        number_color,
+                        number_width,
+                    );
+                }
+                if let Some(column) = Self::fold_arrow_column(gutter) {
+                    let diagnostic = buffer.diagnostic_on_line(line);
+                    if vim.doc.folded_at(line) {
+                        let icon = if diagnostic {
+                            DIAGNOSTIC_FOLD_ARROW
+                        } else {
+                            FOLD_ARROW
+                        };
+                        numbers.right_aligned_icon(column, visible, icon, 56);
+                    } else if diagnostic {
+                        numbers.text(column, visible, "!", WARNING_TEXT, 1);
+                    }
                 }
             }
-            let (mut displayed, preedit) = buffer.displayed_line(line, composition);
-            let mut source_len = displayed.len();
-            let closing_offset = buffer.folded_brace(line).map(|(offset, brace)| {
-                source_len = buffer.fold_header(line, &displayed).len();
-                // Append paint-only cells after the real line and any active IME text.
-                let displayed = displayed.to_mut();
-                displayed.truncate(source_len);
-                displayed.push_str(FOLD_ELLIPSIS);
-                displayed.push_str(brace);
-                offset
-            });
-            let closing_byte = source_len + FOLD_ELLIPSIS.len();
-            let selection = vim.selection_on_line(line);
+            // Several adjacent visual rows can share one composed or folded line.
+            if painted_line
+                .as_ref()
+                .is_none_or(|(previous, _, _, _)| *previous != line)
+            {
+                painted_line = Some((
+                    line,
+                    buffer.painted_line(line, composition),
+                    vim.selection_on_line(line),
+                    vim.search_highlights(vim.doc.line_range(line)),
+                ));
+            }
+            let (_, painted, selection, matches) = painted_line.as_ref().unwrap();
+            let (fragment, byte_start, tab_column) =
+                visual_row
+                    .segment
+                    .map_or((painted.text.as_ref(), 0, 0), |segment| {
+                        let byte_start = segment.bytes.start;
+                        (&painted.text[segment.bytes], byte_start, segment.tab_column)
+                    });
             let tint = if current { CURRENT } else { 0 };
             text.viewport_line(
                 visible,
-                context.spacing.cells(&displayed),
+                context
+                    .spacing
+                    .buffer_cells(fragment, byte_start, tab_column, tabstop),
                 left..right,
                 tint,
                 |byte| {
-                    if let Some(offset) = closing_offset.filter(|_| byte >= source_len) {
-                        return if byte < closing_byte {
+                    if let Some(suffix) = painted
+                        .fold_suffix
+                        .as_ref()
+                        .filter(|suffix| byte >= suffix.start_byte)
+                    {
+                        return if byte < suffix.closing_byte {
                             (0xffffff, tint, true)
                         } else {
-                            (foreground(offset + byte - closing_byte), tint, false)
+                            (
+                                foreground(suffix.closing_offset + byte - suffix.closing_byte),
+                                tint,
+                                false,
+                            )
                         };
                     }
-                    if preedit.as_ref().is_some_and(|range| range.contains(&byte)) {
+                    if painted
+                        .preedit
+                        .as_ref()
+                        .is_some_and(|range| range.contains(&byte))
+                    {
                         (GOLD, PREEDIT, false)
                     } else {
                         let byte = byte
-                            - preedit
+                            - painted
+                                .preedit
                                 .as_ref()
                                 .filter(|range| byte >= range.end)
                                 .map_or(0, |range| range.len());
                         let offset = vim.doc.starts[line] + byte;
-                        let background = if selection
+                        if selection
                             .as_ref()
+                            .or(substitution.as_ref())
                             .is_some_and(|range| range.contains(&offset))
                         {
-                            selection_tint
+                            (foreground(offset), selection_tint, false)
+                        } else if matches
+                            .get(matches.partition_point(|hit| hit.end <= offset))
+                            .is_some_and(|hit| hit.contains(&offset))
+                        {
+                            (GOLD, selection_tint, false)
                         } else {
-                            tint
-                        };
-                        (foreground(offset), background, false)
+                            (foreground(offset), tint, false)
+                        }
                     }
                 },
             );

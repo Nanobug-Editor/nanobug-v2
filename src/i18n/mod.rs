@@ -64,7 +64,7 @@ impl Locale {
     }
 
     /// Return the canonical TOML language tag for this locale.
-    fn tag(self) -> &'static str {
+    pub fn tag(self) -> &'static str {
         match self {
             Self::English => "en",
             Self::SimplifiedChinese => "zh-CN",
@@ -105,7 +105,7 @@ pub fn save_locale(locale: Locale) -> Result<()> {
 }
 
 /// Update `ui.language` at `path` to `locale`, keeping the other settings and comments.
-fn save_locale_to(path: &Path, locale: Locale) -> Result<()> {
+pub fn save_locale_to(path: &Path, locale: Locale) -> Result<()> {
     settings::save_ui_value(path, "language", locale.tag().into())
 }
 

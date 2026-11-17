@@ -218,7 +218,11 @@ impl Workspace {
 
     pub(in crate::grid::workspace) fn edit_plugin_credential(&mut self) {
         if let Some(draft) = self.plugins.credential_draft.take() {
-            self.plugins.credential_close = None;
+            if self.plugins.credential_close.take().is_some() {
+                self.forced_editor_close = None;
+                self.plugins.resume_project_windows_after_close();
+                self.plugins.open = true;
+            }
             self.plugins.manager.prompt = Some(Input {
                 kind: Prompt::Credential {
                     namespace: draft.namespace,

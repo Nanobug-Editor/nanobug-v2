@@ -14,6 +14,20 @@ use std::ops::Range;
 pub(super) const FOLD_OPERATOR: char = '\0';
 
 impl Vim {
+    /// Open or close one fold level in `rows`, recursing when the Ex command uses a bang.
+    pub(in crate::vim) fn ex_change_fold_rows(
+        &mut self,
+        rows: Range<usize>,
+        close: bool,
+        recursive: bool,
+    ) {
+        if self.doc.change_ex_fold_rows(rows, close, recursive) {
+            self.move_out_of_hidden_fold();
+        } else {
+            self.message = i18n::text("editor.no_fold").into();
+        }
+    }
+
     /// Open one collapsed depth at document `row` while retaining the cursor's source offset.
     pub fn open_fold_at_header(&mut self, row: usize) -> bool {
         if !self.doc.open_fold_at_header(row) {

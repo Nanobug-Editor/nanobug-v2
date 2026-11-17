@@ -1,6 +1,6 @@
 //! Retained row shaping, glyph painting, cursor text and backdrop stamping.
 
-use super::{Frame, FrameRow, LabelStyle, Metrics, ThemeBackground, exposed_regions};
+use super::{Frame, FrameRow, LabelStyle, Metrics, Rect, ThemeBackground, exposed_regions};
 use crate::{
     ui::icons::IconCache,
     ui::{
@@ -200,6 +200,29 @@ impl Panel {
             })),
         }
     }
+
+    /// Test the painted border title within the panel's grid area.
+    pub(in crate::grid) fn title_at(
+        &self,
+        area: Rect,
+        position: Point<Pixels>,
+        metrics: Metrics,
+    ) -> bool {
+        let data = self.data.borrow();
+        let columns = &data.frame.title_columns;
+        let title = Rect {
+            x: area.x + columns.start,
+            y: area.y,
+            w: columns.len(),
+            h: 1,
+        };
+        area.w > 0
+            && area.h > 0
+            && !columns.is_empty()
+            && title
+                .pixels(metrics)
+                .contains(&(position - point(px(0.), data.frame.title_offset(0))))
+    }
     /// Set the `frame` and notify through `cx`, reshaping rows whose cells changed.
     pub fn set(&mut self, frame: Frame, cx: &mut Context<Self>) {
         let next_style = frame.theme_style(style(cx));
@@ -275,6 +298,7 @@ impl Panel {
                     .tint_bounds(point(bounds.origin.x + x, y), width, metrics.lh);
                 raster.fill(area.intersect(&clip), color);
             }
+            let y = y + data.frame.title_offset(row);
             for run in prepared.runs.iter().chain(&prepared.label_runs) {
                 let baseline = point(bounds.origin.x + run.x, y + run.baseline(metrics.lh));
                 for shaped in &run.line.runs {
@@ -319,7 +343,8 @@ impl Panel {
             );
         }
         for icon in &data.frame.icons {
-            raster.icon(icon.icon, icon.bounds(bounds.origin, metrics, scale), clip);
+            let origin = bounds.origin + point(px(0.), data.frame.title_offset(icon.row));
+            raster.icon(icon.icon, icon.bounds(origin, metrics, scale), clip);
         }
     }
 
@@ -699,6 +724,7 @@ impl PanelData {
                         rgba(color),
                     ));
                 }
+                let y = y + self.frame.title_offset(i);
                 for run in row.runs.iter().chain(&row.label_runs) {
                     let origin = point(bounds.origin.x + run.x, y);
                     let waves_here = self.waves.iter().any(|wave| {
@@ -771,9 +797,10 @@ impl PanelData {
                 ));
             }
             for icon in &self.frame.icons {
+                let origin = bounds.origin + point(px(0.), self.frame.title_offset(icon.row));
                 cx.global::<IconCache>().paint(
                     icon.icon,
-                    icon.bounds(bounds.origin, self.metrics, scale),
+                    icon.bounds(origin, self.metrics, scale),
                     window,
                     cx,
                 );

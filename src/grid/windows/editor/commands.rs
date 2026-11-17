@@ -6,11 +6,16 @@ use nanobug::document::Document;
 use std::path::PathBuf;
 
 impl EditorWindow {
-    /// Format command or search input with its prompt, before any transient IME text.
+    /// Format command or search input with preedit and any completion output after the prompt.
     pub(in crate::grid) fn command_text(&self) -> String {
         let vim = self.vim();
         let (before, after) = vim.command.split_at(vim.command_cursor());
-        format!("{}{before}{}{after}", vim.prompt(), self.composition.text)
+        let mut text = format!("{}{before}{}{after}", vim.prompt(), self.composition.text);
+        if !vim.message.is_empty() {
+            text.push_str("  ");
+            text.push_str(&vim.message);
+        }
+        text
     }
 
     /// Command-line text up to the logical caret, for the IME candidate anchor.
@@ -21,12 +26,23 @@ impl EditorWindow {
 
     /// Open `path` at animation time `now`, reusing an existing buffer and retaining unsaved text.
     pub(in crate::grid) fn open(&mut self, path: PathBuf, now: f64) -> anyhow::Result<()> {
+        self.open_shared(path, None, now)
+    }
+
+    /// Open a matching `view` from this Session, or load `path` on a fresh buffer.
+    pub(in crate::grid) fn open_shared(
+        &mut self,
+        path: PathBuf,
+        view: Option<Buffer>,
+        now: f64,
+    ) -> anyhow::Result<()> {
         let previous = self.buffer().id;
         let replace_empty = self.buffers.len() == 1
+            && self.terminal().is_none()
             && self.buffer().vim.doc.path.is_none()
             && self.buffer().vim.doc.text.is_empty()
             && !self.buffer().vim.doc.modified();
-        let index = self.open_buffer(path)?;
+        let index = self.open_buffer(path, view)?;
         let id = self.buffers[index].id;
         self.select_buffer(id, now);
         if replace_empty && previous != id {
@@ -37,7 +53,7 @@ impl EditorWindow {
     }
 
     /// Find or load a buffer for `path` in this window.
-    fn open_buffer(&mut self, path: PathBuf) -> anyhow::Result<usize> {
+    fn open_buffer(&mut self, path: PathBuf, view: Option<Buffer>) -> anyhow::Result<usize> {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         if let Some(index) = self
             .buffers
@@ -46,16 +62,79 @@ impl EditorWindow {
         {
             return Ok(index);
         } else {
-            let doc = Document::open(&path)?;
-            self.buffers.push(Buffer::new(doc));
+            let buffer = match view {
+                Some(view) => view,
+                None => Buffer::new(Document::open(&path)?),
+            };
+            self.push_buffer(buffer);
         }
         Ok(self.buffers.len() - 1)
     }
 
     /// Retain a prepared `doc` in this window without changing focus or doing disk I/O.
     pub(in crate::grid) fn retain_document(&mut self, doc: Document) -> usize {
-        self.buffers.push(Buffer::new(doc));
+        self.retain_buffer_view(Buffer::new(doc))
+    }
+
+    /// Retain a new `view` of a Session buffer without changing the active label.
+    pub(in crate::grid) fn retain_buffer_view(&mut self, view: Buffer) -> usize {
+        self.push_buffer(view);
         self.buffers.len() - 1
+    }
+
+    /// Synchronize shared text, file names, and dirty status before consuming this pane's state.
+    pub(in crate::grid) fn refresh_shared_documents(&mut self) {
+        for buffer in &mut self.buffers {
+            let previous = buffer.vim.doc.path.clone();
+            buffer.refresh_shared_document();
+            if buffer.vim.doc.path != previous {
+                let doc = &buffer.vim.doc;
+                self.jump_history
+                    .update_path(doc.opening, doc.path.as_deref());
+            }
+        }
+    }
+
+    /// Reuse a restored buffer for each canonical filename while keeping window view state.
+    pub(in crate::grid) fn join_restored_buffers(
+        &mut self,
+        owners: &mut std::collections::HashMap<PathBuf, Buffer>,
+    ) {
+        use std::collections::hash_map::Entry;
+        for buffer in &mut self.buffers {
+            let Some(path) = buffer
+                .vim
+                .doc
+                .path
+                .clone()
+                .filter(|_| buffer.supports_shared_view())
+            else {
+                continue;
+            };
+            match owners.entry(path) {
+                Entry::Occupied(owner) => {
+                    let source = &owner.get().vim;
+                    buffer.vim.doc.join_buffer(&source.doc);
+                    buffer.vim.share_buffer_options(source);
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(buffer.shared_view());
+                }
+            }
+        }
+    }
+
+    /// Remove all local labels for the shared buffer `number`.
+    pub(in crate::grid) fn remove_session_buffer(&mut self, number: u64) -> bool {
+        let before = self.buffers.len();
+        let was_active = self.buffer().id;
+        self.buffers
+            .retain(|buffer| buffer.vim.doc.buffer_number() != number);
+        let changed = self.buffers.len() != before;
+        if changed {
+            self.reconcile_buffers(was_active);
+        }
+        changed
     }
 
     /// Move buffer `index` to another tab, retaining a valid editor in this tab.
@@ -68,15 +147,26 @@ impl EditorWindow {
     }
 
     /// Save buffer `index` to `path` or its filename, returning the path whose transfer history is stale.
+    /// `exclusive` requires an explicit, vacant destination.
     pub(in crate::grid) fn save(
         &mut self,
         index: usize,
         path: Option<PathBuf>,
+        exclusive: bool,
     ) -> anyhow::Result<Option<PathBuf>> {
         let doc = &mut self.buffers[index].vim.doc;
+        doc.refresh_shared();
         let previous = doc.path.clone();
         let dirty = doc.modified();
-        doc.save(path.as_deref())?;
+        if exclusive {
+            doc.save_new(path.as_deref().expect("explicit save target"))?;
+        } else {
+            doc.save(path.as_deref())?;
+        }
+        if doc.path != previous {
+            self.jump_history
+                .update_path(doc.opening, doc.path.as_deref());
+        }
         Ok(if dirty || doc.path != previous {
             doc.path.clone()
         } else {
@@ -84,12 +174,11 @@ impl EditorWindow {
         })
     }
 
-    /// Replace buffer `index` with its saved text and a fresh Vim session and viewport.
+    /// Restore the saved state of buffer `index` in every Session view.
     pub(in crate::grid) fn discard(&mut self, index: usize) {
         let buffer = &mut self.buffers[index];
-        let id = buffer.id;
-        *buffer = Buffer::new(buffer.vim.doc.saved_version());
-        buffer.id = id;
+        buffer.vim.discard_changes();
+        buffer.set_presentation(None);
     }
 
     /// Files with unsaved edits must not be overwritten by manager transfers.
@@ -127,7 +216,10 @@ impl EditorWindow {
                     } else {
                         to.join(relative)
                     };
-                    buffer.vim.doc.path = Some(path);
+                    buffer.vim.doc.relocate(path);
+                    let doc = &buffer.vim.doc;
+                    self.jump_history
+                        .update_path(doc.opening, doc.path.as_deref());
                     return true;
                 }
             } else if !buffer.vim.doc.path.as_ref().is_some_and(|path| {
@@ -155,10 +247,14 @@ impl EditorWindow {
     /// Preserve the active buffer when possible, otherwise select its neighbor or create a blank.
     fn reconcile_buffers(&mut self, was_active: u64) {
         if self.buffers.is_empty() {
-            self.buffers.push(Buffer::new(Document::new("")));
+            self.push_buffer(Buffer::new(Document::new("")));
         }
         let active = self.buffer_index(was_active);
         self.active = active.unwrap_or_else(|| self.active.min(self.buffers.len() - 1));
+        self.alternate = self.alternate.filter(|&id| {
+            self.buffer_index(id)
+                .is_some_and(|index| index != self.active)
+        });
         if active.is_none() {
             self.reset_buffer_input();
         }

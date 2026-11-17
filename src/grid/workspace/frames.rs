@@ -5,8 +5,8 @@ use super::{
     editor_splits::PaneId,
     layout::{
         FOOTER_BADGE_INSET_Y, FOOTER_CHIP_PAD, FOOTER_COLUMN_DIGITS, FOOTER_ENCODING,
-        FOOTER_ENCODING_GAP, FOOTER_LABEL_GAP, FOOTER_LINE_DIGITS, FOOTER_PROGRESS_DIGITS,
-        FOOTER_ROWS, Focus, ShellWindow,
+        FOOTER_LABEL_GAP, FOOTER_LINE_DIGITS, FOOTER_PROGRESS_DIGITS, FOOTER_ROWS, Focus,
+        ShellWindow, pane_border_offsets,
     },
 };
 use crate::{
@@ -26,6 +26,7 @@ use gpui::{AppContext, Context, Entity, px};
 use nanobug::{
     animation::scroll::ScrollInput, i18n, plugins::session::LanguageServerPhase, vim::Mode,
 };
+use std::collections::HashMap;
 
 /// Fixed border and clipped source layers of a visible editor outside the focused pane.
 pub(super) struct EditorPanePanels {
@@ -37,9 +38,9 @@ pub(super) struct EditorPanePanels {
     pub(super) markdown: MarkdownCache,
 }
 
-/// Format `progress` (0–100) and one-based `line` and `column` in fixed-width footer slots.
+/// Format `progress` (0–100) next to one-based `line` and `column` in the position badge.
 /// The colon anchors both coordinates. Values that exceed their field show a lower bound.
-fn footer_labels(line: usize, column: usize, progress: usize) -> (String, String) {
+fn footer_position_label(line: usize, column: usize, progress: usize) -> String {
     let line = if line < 10_000 {
         line.to_string()
     } else {
@@ -50,9 +51,8 @@ fn footer_labels(line: usize, column: usize, progress: usize) -> (String, String
     } else {
         "1k+".to_owned()
     };
-    (
-        format!("{FOOTER_ENCODING}{FOOTER_ENCODING_GAP}{progress:>FOOTER_PROGRESS_DIGITS$}%"),
-        format!("{line:>FOOTER_LINE_DIGITS$}:{column:<FOOTER_COLUMN_DIGITS$}"),
+    format!(
+        "{progress:>FOOTER_PROGRESS_DIGITS$}% {line:>FOOTER_LINE_DIGITS$}:{column:<FOOTER_COLUMN_DIGITS$}"
     )
 }
 
@@ -68,8 +68,49 @@ fn language_server_label(phase: LanguageServerPhase) -> (&'static str, u32) {
 }
 
 impl Workspace {
+    /// Resize each displayed terminal once for the widest and tallest view across its Session.
+    pub(super) fn resize_visible_terminals(&self) {
+        for project in self.projects.ordered() {
+            if !project
+                .editors()
+                .any(|(_, editor)| editor.terminal().is_some())
+            {
+                continue;
+            }
+            let mut sizes = HashMap::new();
+            for page in 0..project.page_count() {
+                let (_, region) = project.pane_regions_for_tabpage(page, self.layout);
+                for (pane, area) in project.editor_rects_for_tabpage(page, self.layout, region) {
+                    let Some(editor) = project.editor_by_id(pane) else {
+                        continue;
+                    };
+                    let Some(terminal) = editor.terminal() else {
+                        continue;
+                    };
+                    let body = self.layout.visible_region(editor.text_area(area));
+                    if body.w == 0 || body.h == 0 {
+                        continue;
+                    }
+                    let number = editor.vim().doc.buffer_number();
+                    let (_, columns, rows) = sizes.entry(number).or_insert((terminal, 0, 0));
+                    // The largest dimensions may come from different panes or inactive Tabpages.
+                    *columns = (*columns).max(body.w);
+                    *rows = (*rows).max(body.h);
+                }
+            }
+            for (terminal, columns, rows) in sizes.into_values() {
+                terminal.resize(columns, rows);
+            }
+        }
+    }
+
     /// Update the workspace and active popup frames through `cx`.
     pub(super) fn refresh_panels(&mut self, cx: &mut Context<Self>) {
+        self.refresh_vim_menu(cx);
+        if let Some((history, area)) = self.command_window.as_ref().zip(self.command_window_area())
+        {
+            history.refresh(area, &self.spacing, cx);
+        }
         self.refresh_tab_bar(cx);
         self.refresh_sequence_hint(cx);
         if self.file_picker.is_some() {
@@ -104,6 +145,9 @@ impl Workspace {
     /// Rebuild the retained layers of the other editors visible on this Tabpage.
     fn refresh_inactive_editor_panels(&mut self, cx: &mut Context<Self>) {
         let areas = self.editor_rects();
+        let pane_areas: Vec<_> = std::iter::once(self.layout.tree)
+            .chain(areas.iter().map(|&(_, area)| area))
+            .collect();
         let project = self.projects.active();
         let active = project.active_editor_id();
         let modal_open = self.modal_open();
@@ -115,7 +159,7 @@ impl Workspace {
             let Some(editor) = project.editor_by_id(pane) else {
                 continue;
             };
-            let frames = editor.frames(
+            let mut frames = editor.frames(
                 WindowFrame {
                     area,
                     selected: false,
@@ -125,6 +169,8 @@ impl Workspace {
                 },
                 self.layout.visible_cols,
             );
+            let (top, bottom) = pane_border_offsets(area, &pane_areas, metrics);
+            frames.chrome.offset_pane_borders(top, bottom);
             let panels = &mut self.inactive_editor_panels;
             let rendered = if let Some(index) = panels.iter().position(|entry| entry.pane == pane) {
                 &panels[index]
@@ -186,7 +232,10 @@ impl Workspace {
             pane != active
                 && project.editor_by_id(pane).is_some_and(|editor| {
                     let buffer = editor.buffer();
-                    editor.markdown_scroll_active(area)
+                    editor
+                        .terminal()
+                        .is_some_and(|terminal| terminal.scroll().is_active())
+                        || editor.markdown_scroll_active(area)
                         || editor.markdown_view_mode() != Some(MarkdownViewMode::Preview)
                             && (buffer.scroll.is_active() || buffer.columns.is_active())
                 })
@@ -240,7 +289,7 @@ impl Workspace {
         let (row, column) = doc.location(doc.cursor);
         let line = row + 1;
         let progress = line.min(vim.line_count()) * 100 / vim.line_count();
-        let (details, position) = footer_labels(line, column + 1, progress);
+        let position = footer_position_label(line, column + 1, progress);
         let slots = self.footer_slots();
         let blue = FOOTER_BLUE;
         footer.tint(
@@ -252,7 +301,7 @@ impl Workspace {
         footer.tint(0, slots.position_tip + 1, cols, blue);
         footer.chevron(0, slots.details_tip, true, FOOTER_DETAILS);
         footer.chevron(0, slots.position_tip, true, blue);
-        footer.label(0, slots.details, &details, TEXT, &self.spacing);
+        footer.label(0, slots.details, FOOTER_ENCODING, TEXT, &self.spacing);
         footer.right_label(0, slots.position.end, &position, CURSOR_TEXT, &self.spacing);
 
         if active.hidden_pane != Some(Focus::Editor)
@@ -270,6 +319,15 @@ impl Workspace {
 
         let (mode, mode_color) = if active.focus == Focus::Manager {
             (i18n::text("manager.title"), FOOTER_BLUE)
+        } else if let Some(terminal) = active.editor.terminal() {
+            (
+                terminal.mode_label(),
+                if terminal.accepts_text() {
+                    FOOTER_INSERT
+                } else {
+                    FOOTER_BLUE
+                },
+            )
         } else if active.editor.markdown_view_mode() == Some(MarkdownViewMode::Preview) {
             (i18n::text("editor.markdown_preview"), FOOTER_BLUE)
         } else {
@@ -280,6 +338,12 @@ impl Workspace {
             };
             (vim.mode.label(), color)
         };
+        let mode_with_keymap = (active.focus == Focus::Editor
+            && active.editor.terminal().is_none())
+        .then(|| vim.active_keymap_label())
+        .flatten()
+        .map(|keymap| format!("{mode} [{keymap}]"));
+        let mode = mode_with_keymap.as_deref().unwrap_or(mode);
         let mode_limit = slots.left.end.saturating_sub(FOOTER_CHIP_PAD + 1);
         let mode_end = (slots.left.start + self.spacing.columns(mode)).min(mode_limit);
         let tip = mode_end + FOOTER_CHIP_PAD;
@@ -335,6 +399,7 @@ impl Workspace {
     /// Compose the active project's panes and use `appearance` for the Explorer preview background.
     fn frames(&self, appearance: crate::ui::theme::Style) -> ([Frame; 6], Option<(Rect, Frame)>) {
         let layout = self.layout;
+        let pane_areas = self.workspace_pane_areas();
         let vim = self.projects.active().editor.vim();
         let help_open = self.help.is_open();
         let modal_open = self.modal_open();
@@ -344,26 +409,32 @@ impl Workspace {
             selected: !self.small_modal_open()
                 && ShellWindow::Pane(pane).is_selected(self.projects.active().focus, help_open),
             modal_open,
-            controls_hovered: self.hovered_controls == Some(ShellWindow::Pane(pane)),
+            controls_hovered: false,
             spacing: &self.spacing,
         };
         let (manager_chrome, manager_body, manager_preview) =
             self.projects.active().manager.as_ref().map_or_else(
                 || (Frame::new(0, 0), Frame::new(0, 0), None),
                 |manager| {
-                    let frames = manager.frames(
+                    let mut frames = manager.frames(
                         context(Focus::Manager, layout.tree),
                         layout.cols,
                         vim.doc.path.as_deref(),
                         appearance,
                     );
+                    let (top, bottom) = pane_border_offsets(layout.tree, &pane_areas, self.metrics);
+                    frames.chrome.offset_pane_borders(top, bottom);
                     (frames.chrome, frames.body, frames.preview)
                 },
             );
-        let editor = self.projects.active().editor.frames(
-            context(Focus::Editor, self.active_editor_area()),
-            layout.visible_cols,
-        );
+        let editor_area = self.active_editor_area();
+        let mut editor = self
+            .projects
+            .active()
+            .editor
+            .frames(context(Focus::Editor, editor_area), layout.visible_cols);
+        let (top, bottom) = pane_border_offsets(editor_area, &pane_areas, self.metrics);
+        editor.chrome.offset_pane_borders(top, bottom);
         (
             [
                 manager_chrome,
@@ -380,21 +451,19 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::footer_labels;
+    use super::footer_position_label;
 
-    /// Crossing digit boundaries keeps both labels and their punctuation in the same slots.
+    /// Crossing digit boundaries keeps the percent sign and colon in the same slots.
     #[test]
-    fn footer_labels_keep_fixed_columns() {
-        for (line, column, progress, expected_details, expected_position) in [
-            (9, 9, 9, "UTF-8    9%", "   9:9  "),
-            (10, 10, 10, "UTF-8   10%", "  10:10 "),
-            (9_999, 999, 99, "UTF-8   99%", "9999:999"),
-            (10_000, 999, 100, "UTF-8  100%", "10k+:999"),
-            (9_999, 1_000, 100, "UTF-8  100%", "9999:1k+"),
+    fn footer_position_label_keeps_fixed_columns() {
+        for (line, column, progress, expected) in [
+            (9, 9, 9, "  9%    9:9  "),
+            (10, 10, 10, " 10%   10:10 "),
+            (9_999, 999, 99, " 99% 9999:999"),
+            (10_000, 999, 100, "100% 10k+:999"),
+            (9_999, 1_000, 100, "100% 9999:1k+"),
         ] {
-            let (details, position) = footer_labels(line, column, progress);
-            assert_eq!(details, expected_details);
-            assert_eq!(position, expected_position);
+            assert_eq!(footer_position_label(line, column, progress), expected);
         }
     }
 }

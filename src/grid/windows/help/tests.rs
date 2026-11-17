@@ -140,7 +140,7 @@ fn help_tab_targets_follow_localized_title_widths() {
         w: 56,
         h: 16,
     };
-    let list = HelpList::for_window(file_picker::SHORTCUTS, "picker.help_title", true);
+    let mut list = HelpList::for_window(file_picker::SHORTCUTS, "picker.help_title", true);
     let [(left_scope, left), (right_scope, right)] =
         list.tab_targets(area, metrics, &spacing, true);
     assert!(left_scope == Scope::Window && right_scope == Scope::Global);
@@ -156,6 +156,36 @@ fn help_tab_targets_follow_localized_title_widths() {
     );
     let close = area.corner_controls(false).unwrap().close.pixels(metrics);
     assert!(right.right() < close.left());
+
+    assert!(matches!(
+        list.close_scope(Scope::Window, 0.),
+        HelpCommand::Update(_)
+    ));
+    let [(_, hidden), (_, remaining)] = list.tab_targets(area, metrics, &spacing, true);
+    assert!(hidden.is_empty());
+    assert_eq!(remaining.left(), left.left());
+    assert_eq!(remaining.size.width, right.size.width);
+}
+
+/// Closing a title removes its keyboard target and the last title requests a popup close.
+#[test]
+fn closing_help_tabs_preserves_the_remaining_catalog() {
+    for (closed, retained, row) in [
+        (Scope::Window, Scope::Global, 0),
+        (Scope::Global, Scope::Window, 2),
+    ] {
+        let mut list = HelpList::new(true, true);
+        list.select_row(2);
+        assert!(matches!(
+            list.close_scope(closed, 1.),
+            HelpCommand::Update(_)
+        ));
+        assert!(list.scope() == retained);
+        assert_eq!(list.selected, row);
+        assert!(!list.select_scope(closed, 2.));
+        assert!(matches!(list.close_scope(closed, 3.), HelpCommand::Ignore));
+        assert!(matches!(list.close_scope(retained, 4.), HelpCommand::Close));
+    }
 }
 
 /// Escape closes browsing help, while the filter handles Escape and printable text locally.

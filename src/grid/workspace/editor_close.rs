@@ -1,6 +1,9 @@
 //! Resolve modified buffers before closing an editor pane, project or window.
 
-use super::{Workspace, projects::WorkspaceTabs};
+use super::{
+    Workspace, buffer_management::BufferRange, editor_splits::PaneId, layout::Focus,
+    projects::WorkspaceTabs,
+};
 use crate::{
     grid::{
         mnemonic::Mnemonic,
@@ -112,23 +115,67 @@ pub(super) enum CloseTarget {
     Split(usize),
     /// Remove the active page and all of its panes.
     Page,
+    /// Remove all inactive tabpages in the current Session.
+    OtherPages,
     /// Remove the active page's other panes and retain the focused editor.
     OtherSplits,
     /// Close the active editor's file label with this stable buffer identity.
     Buffer(u64),
+    /// Remove all views of the stable buffer number from the current Session.
+    SessionBuffer(u64),
+    /// Close a file title in its owning editor, then close the pane when no titles remain.
+    EditorTitle(PaneId, u64),
+    /// Close the selected tab after removing its last file title from the saved session.
+    LastEditorTitle(u64),
+    /// Close a selection of file labels relative to this retained buffer identity.
+    BufferRange(u64, BufferRange),
     /// The selected tab, including start pages.
     Tab,
-    /// All workspace tabs, replaced by a fresh start page.
-    AllTabs,
     /// The native window and all its projects.
     Quit,
+    /// Close every project and return the Ex command's process exit status.
+    QuitWithCode(i32),
+    /// Close every project and restart the executable when approved.
+    Restart,
 }
 
 impl CloseTarget {
+    /// Whether closing the target is scoped to the selected workspace tab.
+    pub(super) fn closes_selected_tab(self) -> bool {
+        matches!(self, Self::Tab | Self::LastEditorTitle(_))
+    }
+
     /// Whether closing the target ends a project lifetime and must drain plugins.
     pub(super) fn closes_project(self) -> bool {
-        matches!(self, Self::Tab | Self::AllTabs | Self::Quit)
+        self.closes_selected_tab()
+            || matches!(self, Self::Quit | Self::QuitWithCode(_) | Self::Restart)
     }
+}
+
+/// Resolve the clicked title to a file, split, page, or project close.
+fn editor_title_close_target(
+    projects: &WorkspaceTabs,
+    pane: PaneId,
+    id: u64,
+) -> Option<CloseTarget> {
+    let project = projects.active_project()?;
+    if !project.splits().ids().contains(&pane) {
+        return None;
+    }
+    let editor = project.editor_by_id(pane)?;
+    editor.buffer_index(id)?;
+    Some(
+        if editor.buffers().len() > 1
+            || project.split_count() > 1
+            || project.manager.is_some() && project.hidden_pane != Some(Focus::Manager)
+        {
+            CloseTarget::EditorTitle(pane, id)
+        } else if project.page_count() > 1 {
+            CloseTarget::Page
+        } else {
+            CloseTarget::LastEditorTitle(id)
+        },
+    )
 }
 
 /// Identifies a modified buffer while the dialog holds tab, page and buffer order fixed.
@@ -136,22 +183,53 @@ impl CloseTarget {
 struct PendingBuffer {
     /// Project tab that owns the buffer.
     tab: usize,
-    /// Stable editor identity within the project.
-    pane: usize,
-    /// Buffer index in that editor.
-    index: usize,
+    /// Location of the buffer within the project.
+    location: PendingLocation,
+}
+
+/// A pane's retained label or a buffer that exists only in the Session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingLocation {
+    Pane(usize, usize),
+    Detached(u64),
 }
 
 impl PendingBuffer {
+    fn pane(tab: usize, pane: usize, index: usize) -> Self {
+        Self {
+            tab,
+            location: PendingLocation::Pane(pane, index),
+        }
+    }
+
+    #[cfg(test)]
+    fn index(self) -> usize {
+        let PendingLocation::Pane(_, index) = self.location else {
+            panic!("expected a labelled buffer");
+        };
+        index
+    }
+
     /// Read the document for this queued buffer in `projects`.
     fn document(self, projects: &WorkspaceTabs) -> &Document {
-        &projects
-            .project(self.tab)
-            .editor_by_id(self.pane)
-            .expect("pending editor is retained")
-            .buffers()[self.index]
-            .vim
-            .doc
+        let project = projects.project(self.tab);
+        match self.location {
+            PendingLocation::Pane(pane, index) => {
+                &project
+                    .editor_by_id(pane)
+                    .expect("pending editor is retained")
+                    .buffers()[index]
+                    .vim
+                    .doc
+            }
+            PendingLocation::Detached(number) => {
+                &project
+                    .session_buffer(number)
+                    .expect("pending buffer is retained")
+                    .vim
+                    .doc
+            }
+        }
     }
 }
 
@@ -176,22 +254,58 @@ impl EditorClose {
             .active_project()
             .map(|project| (projects.selected, project));
         let others = projects.indexed().filter(|(tab, _)| {
-            matches!(target, CloseTarget::AllTabs | CloseTarget::Quit) && *tab != projects.selected
+            matches!(
+                target,
+                CloseTarget::Quit | CloseTarget::QuitWithCode(_) | CloseTarget::Restart
+            ) && *tab != projects.selected
         });
         let mut pending = VecDeque::new();
         for (tab, project) in active.into_iter().chain(others) {
             let active_pane = project.active_editor_id();
             match target {
-                CloseTarget::Buffer(id) => {
-                    if let Some(index) = project.editor.buffer_index(id)
-                        && project.editor.buffers()[index].vim.doc.modified()
-                    {
-                        pending.push_back(PendingBuffer {
-                            tab,
-                            pane: active_pane,
-                            index,
-                        });
+                CloseTarget::SessionBuffer(number) => {
+                    for (pane, editor) in project.editors() {
+                        if let Some(index) = editor.buffers().iter().position(|buffer| {
+                            buffer.vim.doc.buffer_number() == number && buffer.vim.doc.modified()
+                        }) {
+                            pending.push_back(PendingBuffer::pane(tab, pane, index));
+                            break;
+                        }
                     }
+                    pending.extend(
+                        project
+                            .detached_documents()
+                            .filter(|doc| doc.buffer_number() == number && doc.modified())
+                            .map(|doc| PendingBuffer {
+                                tab,
+                                location: PendingLocation::Detached(doc.buffer_number()),
+                            }),
+                    );
+                }
+                CloseTarget::Buffer(id)
+                | CloseTarget::EditorTitle(_, id)
+                | CloseTarget::LastEditorTitle(id) => {
+                    let pane = if let CloseTarget::EditorTitle(pane, _) = target {
+                        pane
+                    } else {
+                        active_pane
+                    };
+                    if let Some(editor) = project.editor_by_id(pane)
+                        && let Some(index) = editor.buffer_index(id)
+                        && editor.buffers()[index].vim.doc.modified()
+                    {
+                        pending.push_back(PendingBuffer::pane(tab, pane, index));
+                    }
+                }
+                CloseTarget::BufferRange(reference, range) => {
+                    let editor = &project.editor;
+                    pending.extend(range.indices(editor, reference).filter_map(|index| {
+                        editor.buffers()[index]
+                            .vim
+                            .doc
+                            .modified()
+                            .then_some(PendingBuffer::pane(tab, active_pane, index))
+                    }));
                 }
                 CloseTarget::Editor => queue_dirty(&mut pending, tab, active_pane, &project.editor),
                 CloseTarget::Split(pane) => {
@@ -209,14 +323,61 @@ impl EditorClose {
                         queue_dirty(&mut pending, tab, pane, editor);
                     }
                 }
-                CloseTarget::Tab | CloseTarget::AllTabs | CloseTarget::Quit => {
+                CloseTarget::OtherPages => {
+                    let retained = project.splits().ids();
+                    for (pane, editor) in project.editors().filter(|(id, _)| !retained.contains(id))
+                    {
+                        queue_dirty(&mut pending, tab, pane, editor);
+                    }
+                }
+                CloseTarget::Tab
+                | CloseTarget::Quit
+                | CloseTarget::QuitWithCode(_)
+                | CloseTarget::Restart => {
                     queue_dirty(&mut pending, tab, active_pane, &project.editor);
                     for (pane, editor) in project.editors().filter(|(id, _)| *id != active_pane) {
                         queue_dirty(&mut pending, tab, pane, editor);
                     }
+                    pending.extend(
+                        project
+                            .detached_documents()
+                            .filter(|doc| doc.modified())
+                            .map(|doc| PendingBuffer {
+                                tab,
+                                location: PendingLocation::Detached(doc.buffer_number()),
+                            }),
+                    );
                 }
             }
         }
+        let mut seen = std::collections::HashSet::new();
+        pending.retain(|item| {
+            let project = projects.project(item.tab);
+            let number = item.document(projects).buffer_number();
+            let remaining = project.editors().any(|(pane, editor)| {
+                let survives = match target {
+                    CloseTarget::Split(closing) => pane != closing,
+                    CloseTarget::Page => !project.splits().ids().contains(&pane),
+                    CloseTarget::OtherSplits => {
+                        pane == project.active_editor_id()
+                            || !project.splits().ids().contains(&pane)
+                    }
+                    CloseTarget::OtherPages => project.splits().ids().contains(&pane),
+                    CloseTarget::Buffer(_)
+                    | CloseTarget::BufferRange(..)
+                    | CloseTarget::EditorTitle(..) => {
+                        !matches!(item.location, PendingLocation::Pane(own, _) if own == pane)
+                    }
+                    _ => false,
+                };
+                survives
+                    && editor
+                        .buffers()
+                        .iter()
+                        .any(|buffer| buffer.vim.doc.buffer_number() == number)
+            });
+            !remaining && seen.insert((item.tab, number))
+        });
         (!pending.is_empty()).then(|| Self {
             target,
             pending,
@@ -276,15 +437,33 @@ impl EditorClose {
         if !self.pending.is_empty() {
             return false;
         }
-        // The buffer close itself removes the draft after confirmation.
-        if !matches!(self.target, CloseTarget::Buffer(_)) {
+        // File label closures remove drafts outright after confirmation.
+        if !matches!(
+            self.target,
+            CloseTarget::Buffer(_)
+                | CloseTarget::SessionBuffer(_)
+                | CloseTarget::EditorTitle(..)
+                | CloseTarget::LastEditorTitle(_)
+                | CloseTarget::BufferRange(..)
+        ) {
             for buffer in self.discarded.drain(..) {
-                projects
-                    .project_mut(buffer.tab)
-                    .editor_by_id_mut(buffer.pane)
-                    .expect("pending editor is retained")
-                    .discard(buffer.index);
+                let project = projects.project_mut(buffer.tab);
+                match buffer.location {
+                    PendingLocation::Pane(pane, index) => project
+                        .editor_by_id_mut(pane)
+                        .expect("pending editor is retained")
+                        .discard(index),
+                    PendingLocation::Detached(number) => {
+                        project
+                            .detached_document_mut(number)
+                            .expect("pending text is retained")
+                            .discard_changes();
+                    }
+                }
             }
+        }
+        for project in projects.iter_mut() {
+            project.refresh_shared_documents();
         }
         true
     }
@@ -305,7 +484,7 @@ fn queue_dirty(
             .vim
             .doc
             .modified()
-            .then_some(PendingBuffer { tab, pane, index })
+            .then_some(PendingBuffer::pane(tab, pane, index))
     }));
 }
 
@@ -316,7 +495,14 @@ fn save_buffer(
     path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let save_as = path.is_some();
-    projects.save_editor_buffer(buffer.tab, buffer.pane, buffer.index, path)?;
+    match buffer.location {
+        PendingLocation::Pane(pane, index) => {
+            projects.save_editor_buffer(buffer.tab, pane, index, path)?;
+        }
+        PendingLocation::Detached(number) => {
+            projects.save_detached_buffer(buffer.tab, number, path)?;
+        }
+    }
     if save_as && let Some(manager) = &mut projects.project_mut(buffer.tab).manager {
         let _ = manager.refresh();
     }
@@ -324,6 +510,67 @@ fn save_buffer(
 }
 
 impl Workspace {
+    /// Resolve `target` by explicitly dropping changes in the closing buffers.
+    pub(super) fn force_ex_close(
+        &mut self,
+        target: CloseTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.forced_editor_close = Some(target);
+        self.request_close(target, window, cx);
+    }
+
+    /// Close the title identified by `pane` and `id`, prompting for its unsaved edits first.
+    pub(super) fn close_editor_title(
+        &mut self,
+        pane: PaneId,
+        id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = editor_title_close_target(&self.projects, pane, id) else {
+            return;
+        };
+        let project = self.projects.active();
+        if pane == project.active_editor_id() && id == project.editor.buffer().id {
+            self.finish_editor_input(window, cx);
+        }
+        self.request_close(target, window, cx);
+        self.sync(window, cx);
+    }
+
+    /// Remove a confirmed title and close an empty pane, retaining Explorer focus if selected.
+    pub(super) fn finish_close_editor_title(
+        &mut self,
+        pane: PaneId,
+        id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let now = self.scroll_epoch.elapsed().as_secs_f64();
+        let project = self.projects.active_mut();
+        let active = project.active_editor_id();
+        let explorer_focused = project.focus == Focus::Manager;
+        let Some(editor) = project.editor_by_id_mut(pane) else {
+            return;
+        };
+        let last = editor.buffers().len() == 1;
+        if editor.remove_buffer_tab(id, now) {
+            if pane == active {
+                self.last_cursor_space = None;
+            }
+            if last && project.split_count() > 1 {
+                self.finish_close_editor_split(pane, window, cx);
+                if explorer_focused {
+                    self.projects.active_mut().focus_pane(Focus::Manager);
+                }
+            } else if last {
+                self.hide_pane(Focus::Editor);
+            }
+        }
+    }
+
     /// Resolve dirty buffers before closing `target` in `window` through `cx`.
     pub(super) fn request_close(
         &mut self,
@@ -341,15 +588,24 @@ impl Workspace {
 
     /// Start confirmation for `target`, returning whether closure must wait.
     pub(super) fn begin_close(&mut self, target: CloseTarget) -> bool {
+        for project in self.projects.iter_mut() {
+            project.refresh_shared_documents();
+        }
+        let forced = self.forced_editor_close.take() == Some(target);
         let Some(close) = EditorClose::new(&self.projects, target) else {
             return false;
         };
+        if forced {
+            let mut close = close;
+            close.resolve(Choice::DiscardAll, None, &mut self.projects);
+            return false;
+        }
         self.editor_close = Some(close);
         self.remove_recent_project = None;
         self.help.close();
         self.language_selection = None;
         self.prefix = None;
-        self.resizing = false;
+        self.pane_resize = None;
         self.hovered_controls = None;
         if let Some(project) = self.projects.active_project_mut() {
             if let Some(manager) = &mut project.manager {
@@ -540,7 +796,11 @@ impl Workspace {
         if close.resolve(choice, path, &mut self.projects) {
             let target = close.target;
             self.editor_close = None;
-            if choice != Choice::Cancel {
+            if choice == Choice::Cancel {
+                if target.closes_project() {
+                    self.plugins.resume_project_windows_after_close();
+                }
+            } else {
                 self.finish_close(target, window, cx);
             }
         } else if close.picking_path {

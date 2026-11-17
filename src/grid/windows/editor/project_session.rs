@@ -1,6 +1,6 @@
 //! Save an editor pane's file labels and view positions without retaining document text.
 
-use super::{Buffer, EditorWindow, MarkdownViewMode};
+use super::{Buffer, EditorWindow, MarkdownViewMode, markdown::is_markdown};
 use nanobug::document::{Document, display_width};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -23,6 +23,9 @@ struct FileView {
     caret: (usize, usize),
     /// Zero-based source row at the top of the viewport.
     top: usize,
+    /// UTF-8 byte within `top` when the viewport starts at a wrapped continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    top_byte: Option<usize>,
     /// Horizontal offset in grid columns.
     left: usize,
     /// Markdown presentation and preview scroll offset in logical pixels.
@@ -30,6 +33,11 @@ struct FileView {
 }
 
 impl EditorWindow {
+    /// Resolve a view's saved top row in document coordinates for a portable Ex script.
+    pub(in crate::grid) fn ex_view_top_row(&self) -> usize {
+        viewport_anchor(self.buffer(), &self.composition.text).0
+    }
+
     /// Capture named files relative to project `root` and the current viewport of each file.
     pub(in crate::grid) fn snapshot_for_project(&self, root: &Path) -> EditorSnapshot {
         let mut active = 0;
@@ -40,15 +48,17 @@ impl EditorWindow {
             if index <= self.active {
                 active = files.len();
             }
+            let composition = if index == self.active {
+                self.composition.text.as_str()
+            } else {
+                ""
+            };
+            let (top, top_byte) = viewport_anchor(buffer, composition);
             files.push(FileView {
                 path: path.strip_prefix(root).unwrap_or(path).to_owned(),
                 caret: doc.location(doc.cursor),
-                top: doc.document_row(
-                    buffer
-                        .scroll
-                        .target()
-                        .min(doc.display_rows().saturating_sub(1)),
-                ),
+                top,
+                top_byte,
                 left: buffer.columns.target(),
                 markdown: (buffer.markdown.mode, buffer.markdown.scroll.target()),
             });
@@ -92,6 +102,12 @@ impl EditorWindow {
             buffer.scroll.snap(top, 0.);
             buffer.columns.snap(left, 0.);
             buffer.markdown.mode = file.markdown.0;
+            if is_markdown(&path) {
+                let line = buffer.vim.doc.line(top);
+                buffer.restored_wrap_byte = file
+                    .top_byte
+                    .map(|byte| line.floor_char_boundary(byte.min(line.len())));
+            }
             buffer
                 .markdown
                 .scroll
@@ -101,9 +117,84 @@ impl EditorWindow {
         let skipped = total - buffers.len();
         let mut editor = Self::new(Document::new(""));
         if !buffers.is_empty() {
+            for buffer in &mut buffers {
+                buffer.vim.set_jump_history(editor.jump_history.clone());
+            }
             editor.buffers = buffers;
             editor.active = active;
         }
         (editor, skipped)
+    }
+}
+
+/// Resolve the top row of `buffer` to a source line and byte, excluding any native `composition`.
+fn viewport_anchor(buffer: &Buffer, composition: &str) -> (usize, Option<usize>) {
+    let rows = buffer.retained_visual_rows();
+    let top = buffer.scroll.target().min(rows.len().saturating_sub(1));
+    let Some(row) = rows.row(top) else {
+        return (0, None);
+    };
+    let Some(segment) = row.segment else {
+        return (row.line, buffer.restored_wrap_byte);
+    };
+    let mut byte = segment.bytes.start;
+    if let Some(preedit) = buffer.displayed_line(row.line, composition).1 {
+        byte -= byte.saturating_sub(preedit.start).min(preedit.len());
+    }
+    let line = buffer.vim.doc.line(row.line);
+    let byte = line.floor_char_boundary(byte.min(line.len()));
+    (row.line, (byte > 0).then_some(byte))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::text::TextSpacing;
+    use gpui::{FontId, NoopTextSystem};
+    use std::sync::Arc;
+
+    /// Persist the source position of a continuation and read sessions saved before soft wrapping.
+    #[test]
+    fn markdown_session_keeps_the_top_continuation_as_a_source_byte() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let path = root.join("wrapped.md");
+        std::fs::write(&path, "lead\na中bcdefghijk\nnext").unwrap();
+        let mut editor = EditorWindow::new(Document::open(&path).unwrap());
+        assert!(editor.set_markdown_view_mode(MarkdownViewMode::Edit));
+        let spacing = TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 6.4);
+        editor.visual_rows(6, &spacing);
+        editor.buffers[0].scroll.snap(2, 0.);
+
+        let snapshot = editor.snapshot_for_project(&root);
+        assert_eq!(snapshot.files[0].top, 1);
+        assert_eq!(snapshot.files[0].top_byte, Some("a中bcd".len()));
+        let mut prior_format = serde_json::to_value(&snapshot).unwrap();
+        prior_format["files"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("top_byte");
+        let prior: EditorSnapshot = serde_json::from_value(prior_format).unwrap();
+        assert_eq!(prior.files[0].top_byte, None);
+
+        let (mut restored, skipped) = EditorWindow::restore_project_snapshot(snapshot, &root);
+        assert_eq!(skipped, 0);
+        assert_eq!(restored.buffer().scroll.target(), 1);
+        assert_eq!(restored.buffer().restored_wrap_byte, Some("a中bcd".len()));
+        let continuation = restored.vim().doc.starts[1] + "a中bcd".len();
+        restored.buffers[0].vim.set_cursor(continuation);
+        restored.track_view(
+            crate::grid::render::Rect {
+                w: 12,
+                h: 3,
+                ..Default::default()
+            },
+            true,
+            &spacing,
+            [nanobug::animation::scroll::ScrollInput::Reveal; 2],
+            0.,
+        );
+        assert_eq!(restored.buffer().scroll.target(), 2);
+        assert_eq!(restored.buffer().restored_wrap_byte, None);
     }
 }

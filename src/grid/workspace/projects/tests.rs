@@ -16,6 +16,99 @@ fn projects_in(directory: &Path) -> WorkspaceTabs {
     WorkspaceTabs::new(paths)
 }
 
+/// Restart restores the selected tab's role and never retargets Ex to another project.
+#[test]
+fn restart_preserves_selection_and_drops_commands_for_missing_targets() {
+    use crate::app::{Restart, RestartTab};
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_path_buf();
+    let file = root.join("standalone.txt");
+    fs::write(&file, "selected file").unwrap();
+    let (tabs, command) = WorkspaceTabs::restore_restart(
+        Restart {
+            tabs: vec![
+                RestartTab::Project(root.clone()),
+                RestartTab::File(file.clone()),
+            ],
+            selected: 1,
+            command: "write copy.txt".into(),
+        },
+        false,
+    );
+    assert_eq!(tabs.len(), 2);
+    assert!(tabs.project(0).manager.is_some());
+    assert!(tabs.active().manager.is_none());
+    assert_eq!(tabs.active().editor.vim().doc.text, "selected file");
+    assert_eq!(command.as_deref(), Some("write copy.txt"));
+
+    fs::remove_file(&file).unwrap();
+    let (tabs, command) = WorkspaceTabs::restore_restart(
+        Restart {
+            tabs: vec![RestartTab::Project(root), RestartTab::File(file)],
+            selected: 1,
+            command: "write copy.txt".into(),
+        },
+        false,
+    );
+    assert!(tabs.start().is_some());
+    assert!(command.is_none());
+}
+
+/// Inactive Tabpages keep their own Explorer geometry and visible editor panes.
+#[test]
+fn retained_tabpage_editor_rects_use_their_own_layout() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut project = Project::new(directory.path().into(), None);
+    let mut layout = Layout::default();
+    layout.cols = 100;
+    layout.rows = 30;
+    layout.visible_cols = 100;
+    layout.visible_rows = 30;
+    project.sidebar = 20;
+    project.open_page(None, 0.).unwrap();
+    project.stacked = true;
+    project.manager_height = Some(8);
+    let (_, active_region) = project.pane_regions_for_tabpage(1, layout);
+    assert_eq!((active_region.w, active_region.h), (100, 20));
+    assert!(
+        project
+            .open_split(
+                SplitAxis::Columns,
+                false,
+                SplitDocument::Empty,
+                active_region,
+                0.
+            )
+            .unwrap()
+    );
+
+    let (_, retained_region) = project.pane_regions_for_tabpage(0, layout);
+    assert_eq!((retained_region.w, retained_region.h), (79, 28));
+    assert_eq!(
+        project
+            .editor_rects_for_tabpage(0, layout, retained_region)
+            .len(),
+        1
+    );
+    assert_eq!(
+        project
+            .editor_rects_for_tabpage(1, layout, active_region)
+            .len(),
+        2
+    );
+
+    project.toggle_editor_zoom();
+    let zoomed = project.active_editor_id();
+    assert!(project.select_page(0, 0.));
+    project.hidden_pane = Some(Focus::Editor);
+    let (_, hidden) = project.pane_regions_for_tabpage(0, layout);
+    assert_eq!(hidden.w, 0);
+    assert!(
+        project.editor_rects_for_tabpage(1, layout, active_region) == [(zoomed, active_region)]
+    );
+}
+
 /// Reorder and revisit a project without losing its dirty buffer or pane focus.
 #[test]
 fn switching_and_reordering_retain_the_project() {
@@ -197,16 +290,102 @@ fn start_page_close_returns_to_the_most_recent_tab() {
     assert!(tabs.active().editor.modified());
 }
 
-/// Closing every resolved tab leaves a new start page selected.
+/// Closing the final project leaves a new start page selected.
 #[test]
-fn close_all_tabs_leaves_one_start_page() {
+fn closing_last_project_leaves_one_start_page() {
     let directory = tempfile::tempdir().unwrap();
-    let mut tabs = projects_in(directory.path());
-    let start = tabs.add_start();
-    assert!(tabs.select(start));
-    tabs.close_all_tabs();
+    let mut tabs = WorkspaceTabs::new(vec![directory.path().to_path_buf()]);
+    assert!(tabs.close_tab());
     assert_eq!(tabs.len(), 1);
     assert_eq!(tabs.selected, 0);
     assert!(tabs.start().is_some());
     assert_eq!(tabs.ordered().count(), 0);
+}
+
+/// Visit a file already edited on another Tabpage without changing its pane or rereading disk.
+#[test]
+fn session_file_jump_keeps_the_source_pane_and_reuses_undo() -> anyhow::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let root = folder.path().canonicalize()?;
+    let source = root.join("README.md");
+    let destination = root.join("destination.txt");
+    fs::write(&source, "source\n")?;
+    fs::write(&destination, "disk\n")?;
+    let mut project = Project::new(root, None);
+    let source_pane = project.active_editor_id();
+    project.open_page(Some(destination.clone()), 0.)?;
+    let destination_pane = project.active_editor_id();
+    project
+        .editor
+        .edit(|vim, register| vim.text("ifresh ", register));
+    let destination_cursor = project.editor.vim().doc.cursor;
+    let destination_number = project.editor.vim().doc.buffer_number();
+
+    assert!(project.select_page(0, 0.));
+    assert!(project.jump_file(&destination, true, 0., |_| Some(0))?);
+    assert_eq!(project.active_editor_id(), source_pane);
+    assert_eq!(project.editor.vim().doc.text, "fresh disk\n");
+    assert_eq!(project.editor.vim().doc.buffer_number(), destination_number);
+    assert_eq!(project.session_buffers().len(), 2);
+    assert_eq!(project.editor.buffers().len(), 2);
+    assert_eq!(
+        project
+            .editor_by_id(destination_pane)
+            .unwrap()
+            .buffers()
+            .len(),
+        1
+    );
+    assert_eq!(
+        project
+            .editor_by_id(destination_pane)
+            .unwrap()
+            .vim()
+            .doc
+            .cursor,
+        destination_cursor
+    );
+
+    project.editor.edit(|vim, register| vim.text("u", register));
+    project.refresh_shared_documents();
+    let peer = &project.editor_by_id(destination_pane).unwrap().vim().doc;
+    assert_eq!(peer.text, "disk\n");
+    assert!(!peer.modified());
+    assert!(project.visit_editor_jump(false, 1, 0.));
+    assert_eq!(
+        project.editor.vim().doc.path.as_deref(),
+        Some(source.as_path())
+    );
+    assert!(project.remove_session_buffer(destination_number, 0.));
+    assert_eq!(project.page_count(), 2);
+    assert!(
+        project
+            .editor_by_id(destination_pane)
+            .unwrap()
+            .vim()
+            .doc
+            .path
+            .is_none()
+    );
+    Ok(())
+}
+
+/// Start a new Tabpage with a blank editor and Explorer even if Explorer was hidden.
+#[test]
+fn tabnew_without_path_starts_blank() -> anyhow::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let root = folder.path().canonicalize()?;
+    fs::write(root.join("README.md"), "keep this file\n")?;
+    let mut project = Project::new(root, None);
+    project.hidden_pane = Some(Focus::Manager);
+    project.open_page(None, 0.)?;
+    assert_eq!(project.split_count(), 1);
+    assert!(project.manager.is_some());
+    assert_eq!(project.hidden_pane, None);
+    assert!(project.editor.vim().doc.path.is_none());
+    assert!(project.editor.vim().doc.text.is_empty());
+    assert!(project.select_page(0, 0.));
+    assert_eq!(project.hidden_pane, Some(Focus::Manager));
+    assert_eq!(project.editor.vim().doc.text, "keep this file\n");
+    Ok(())
 }

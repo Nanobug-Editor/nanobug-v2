@@ -1,34 +1,74 @@
 //! Nanobug's modal editor, built over its UTF-8 document and shared registers.
 
 mod bracket_commands;
+mod command_prompt;
 mod commands;
+mod comments;
 #[cfg(test)]
 mod compatibility;
+mod ex_batch;
+mod ex_buffer_lifecycle;
+mod ex_catalog;
+mod ex_files;
+mod ex_history;
+mod ex_message_modifiers;
+mod ex_state;
+mod ex_window_modifiers;
+mod ex_windows;
+mod expression;
+mod file_marks;
 mod filter;
 mod folds;
 mod g_commands;
+mod help_code;
 mod hint;
 mod input;
 mod insert;
+mod insert_argument;
+mod jumplist;
+mod keymap;
+mod mappings;
+mod menu;
 mod mode;
 mod motions;
 mod number;
 mod objects;
 mod operators;
+mod options;
 mod pattern;
 mod register;
 mod replay;
+mod script;
+mod session_export;
 pub mod shortcuts;
 mod spelling;
+mod syntax_selection;
 #[cfg(test)]
 mod tests;
 
-pub use commands::Action;
-pub use filter::run_filter;
+pub use commands::{Action, ArgumentCommand, BatchScope};
+pub use ex_buffer_lifecycle::{BufferCommand, BufferSet};
+pub use ex_files::search::{find_directory, find_file};
+pub use ex_files::{FileArgument, FileBuffer, FileCommand, FileDestination, FileOperation};
+pub use ex_message_modifiers::MessageModifier;
+pub use ex_window_modifiers::{WindowModifiers, WindowOrientation, WindowPlacement};
+pub use ex_windows::{ExModeChange, ViewInformation, ViewSize, WindowCommand};
+pub use file_marks::{FileMarkSnapshot, FileMarks};
+pub use filter::{run_ex_shell, run_filter};
 pub use hint::{Continuation, SequenceHint, VIEW_CONTINUATIONS};
+pub use jumplist::JumpHistory;
+pub use mappings::{
+    InputMappings, LEADER_KEY, MappingContinuation, PendingMappingHint, TerminalStroke,
+};
+pub use menu::MenuEntry;
 pub use mode::Mode;
-pub use motions::HorizontalScroll;
+pub use motions::{HorizontalScroll, ScreenMotion, ScreenMotionResolver};
+pub use options::{VimOptions, WindowOptions};
 pub use register::Register;
+pub use script::{
+    ScriptAutocmd, ScriptEvent, ScriptLine, ScriptProgram, ScriptTabScope, decode_ex_source,
+};
+pub use session_export::{ExportKind, SessionExport};
 pub use spelling::SPELL_SUGGESTION_KEYS;
 
 use crate::document::Document;
@@ -72,6 +112,8 @@ enum Pending {
     InsertControlG,
     /// Insert-mode Ctrl+x awaits a completion source.
     InsertCompletion,
+    /// Insert-mode Ctrl+k or Ctrl+v awaits literal characters or a codepoint.
+    InsertArgument(insert_argument::Argument),
     /// Ctrl+\ awaits a mode transition key while retaining the active mode.
     ControlBackslash,
     /// Insert or command-line Ctrl+r, optionally followed by a literal insertion modifier.
@@ -154,19 +196,39 @@ pub struct Vim {
     g: g_commands::State,
     /// Whether this buffer accepts navigation and yanks only.
     read_only: bool,
+    /// Read-only Vim Help buffer with executable example blocks.
+    help_buffer: bool,
     /// Current editing mode.
     pub mode: Mode,
     /// Command or pattern being entered, without the prompt.
     pub command: String,
     /// Visual range retained while an Ex command is being entered.
     command_selection: Option<Range<usize>>,
+    /// Visual or Select state when the current Ex prompt was opened.
+    command_menu_origin: Option<menu::Origin>,
     /// Last feedback shown in the status line.
     pub message: String,
+    /// Whether the latest programmatic Ex command reported an error.
+    ex_failed: bool,
     /// Fixed Visual endpoint in UTF-8 bytes.
     pub anchor: usize,
+    /// Resume Select mode once its one temporary Visual command has completed.
+    select_resume: bool,
+    /// Buffer-local definitions and per-mode input mapping state.
+    input_maps: mappings::State,
+    /// Defaults and global input preferences for this buffer.
+    options: InputMappings,
+    /// Options shared by all views of the same buffer, initialized from the workspace defaults.
+    buffer_options: Option<std::sync::Arc<std::sync::RwLock<options::BufferOptions>>>,
+    /// Window-local settings retained when this view's file label is inactive.
+    view_options: Option<WindowOptions>,
     /// Visible prompt and the byte position within its input.
     prompt: char,
     command_pos: usize,
+    /// Candidate and history cursors for the current prompt.
+    command_prompt: command_prompt::State,
+    /// Nested expression input and the command or mode it temporarily replaces.
+    expression_prompt: Option<expression::Prompt>,
     /// Pending command and its numeric prefix.
     pending: Option<Pending>,
     count: Option<usize>,
@@ -174,14 +236,28 @@ pub struct Vim {
     selected_register: Option<char>,
     /// Active Insert or Replace session.
     insert: insert::Session,
+    /// Insert or Replace session suspended for one Normal-mode command.
+    insert_resume: Option<insert::Resume>,
     /// Preferred display column retained during vertical movement.
     desired_column: Option<usize>,
+    /// Preferred horizontal position in measured units across consecutive screen-line motions.
+    screen_column: Option<usize>,
     /// Opening brace byte anchoring a caret drawn on the folded preview's closing brace.
     folded_closing_caret: Option<usize>,
     /// Saved character-find arguments and last accepted search/substitution.
     last_find: Option<Find>,
     last_search: Option<Search>,
+    /// Temporarily suppress search highlights until the next accepted search.
+    search_highlights_hidden: bool,
     last_substitution: Option<Substitution>,
+    /// A confirmed substitution owns keys until its remaining matches are resolved.
+    substitute_confirmation: Option<pattern::Confirmation>,
+    /// Original lines waiting for an Ex command and the revision of its first edit.
+    ex_lines: Option<ex_batch::Lines>,
+    /// Command-line input collection for :append, :change and :insert.
+    ex_line_input: Option<ex_batch::LineInput>,
+    /// Pane addressed by the interactive :options scratch view.
+    options_editor: Option<usize>,
     /// Original direction and repeat count of the prompt being edited.
     search_count: usize,
     /// Operator that will use the next submitted search as its motion.
@@ -190,12 +266,14 @@ pub struct Vim {
     filter_range: Option<Range<usize>>,
     /// Last shell filter command for :!! and !! followed by an empty prompt.
     last_filter: String,
-    /// Buffer-local marks and navigation history, in UTF-8 bytes.
+    /// Buffer-local marks, in UTF-8 bytes.
     marks: BTreeMap<char, usize>,
+    /// Individually deleted special marks until their next normal update.
+    ex_hidden_marks: std::collections::BTreeSet<char>,
     /// Byte range affected by the latest completed operator or put.
     operated: Option<Range<usize>>,
-    jumps: Vec<usize>,
-    jump_index: usize,
+    /// Jump locations shared with other buffers in this window.
+    jump_history: JumpHistory,
     /// Original text of the most recently edited line, used by U.
     line_undo: Option<LineUndo>,
     /// Whether the final LF represents the file terminator.
@@ -204,6 +282,8 @@ pub struct Vim {
     view: View,
     /// Last completed change and active replay capture.
     replay: Replay,
+    /// Named syntax selection ranges and any outstanding host parser request.
+    syntax_selection: syntax_selection::State,
 }
 
 impl Vim {
@@ -214,35 +294,60 @@ impl Vim {
             doc,
             g: g_commands::State::default(),
             read_only: false,
+            help_buffer: false,
             mode: Mode::Normal,
             command: String::new(),
             command_selection: None,
+            command_menu_origin: None,
             message: String::new(),
+            ex_failed: false,
             anchor: 0,
+            select_resume: false,
+            input_maps: mappings::State::default(),
+            options: InputMappings::default(),
+            buffer_options: None,
+            view_options: None,
             prompt: ':',
             command_pos: 0,
+            command_prompt: command_prompt::State::default(),
+            expression_prompt: None,
             pending: None,
             count: None,
             selected_register: None,
             insert: insert::Session::default(),
+            insert_resume: None,
             desired_column: None,
+            screen_column: None,
             folded_closing_caret: None,
             last_find: None,
             last_search: None,
+            search_highlights_hidden: false,
             last_substitution: None,
+            substitute_confirmation: None,
+            ex_lines: None,
+            ex_line_input: None,
+            options_editor: None,
             search_count: 1,
             search_operator: None,
             filter_range: None,
             last_filter: String::new(),
             marks: BTreeMap::new(),
+            ex_hidden_marks: std::collections::BTreeSet::new(),
             operated: None,
-            jumps: Vec::new(),
-            jump_index: 0,
+            jump_history: JumpHistory::default(),
             line_undo: None,
             final_newline,
             view: View::default(),
             replay: Replay::default(),
+            syntax_selection: syntax_selection::State::default(),
         }
+    }
+
+    /// Edit arbitrary scratch text, including the blank row after a trailing separator.
+    pub fn scratch(doc: Document) -> Self {
+        let mut vim = Self::new(doc);
+        vim.final_newline = false;
+        vim
     }
 
     /// Wrap a read-only snapshot in Normal mode, retaining navigation, search and yanks.
@@ -259,6 +364,7 @@ impl Vim {
 
     /// Report a blocked edit without requesting a host action.
     fn reject_edit(&mut self) -> Action {
+        self.ex_failed = true;
         self.message = crate::i18n::text("editor.read_only_preview").into();
         Action::None
     }
@@ -292,12 +398,21 @@ impl Vim {
 
     /// Whether a command prefix must consume the next key before workspace mappings.
     pub fn awaiting_key(&self) -> bool {
-        self.pending.is_some() || self.count.is_some() || self.selected_register.is_some()
+        self.substitute_confirmation_active()
+            || self.pending.is_some()
+            || self.count.is_some()
+            || self.selected_register.is_some()
+            || self.input_maps.has_prefix()
     }
 
     /// Take a command-mode count for a host window command if Vim owns no other pending input.
     pub fn take_window_count(&mut self) -> Option<Option<usize>> {
-        if self.accepts_text() || self.pending.is_some() || self.selected_register.is_some() {
+        if self.substitute_confirmation_active()
+            || self.accepts_text()
+            || self.pending.is_some()
+            || self.selected_register.is_some()
+            || self.input_maps.has_prefix()
+        {
             return None;
         }
         let count = self.count.take();
@@ -305,18 +420,65 @@ impl Vim {
         Some(count)
     }
 
-    /// Whether the next native input belongs to an editable text field.
+    /// Whether the pending command accepts a single literal grapheme from native input.
+    pub fn awaits_literal_argument(&self) -> bool {
+        matches!(
+            self.pending,
+            Some(
+                Pending::Argument('f' | 'F' | 't' | 'T' | 'r', ..)
+                    | Pending::GArgument(g_commands::Argument::Replace(_))
+                    | Pending::InsertArgument(_)
+            )
+        )
+    }
+
+    /// Whether native text belongs to an editable field or a pending literal argument.
     pub fn accepts_text(&self) -> bool {
-        (self.mode.accepts_text() || self.g.select) && self.pending.is_none()
+        !self.substitute_confirmation_active()
+            && (self.awaits_literal_argument()
+                || (self.mode.accepts_text() || self.g.select) && self.pending.is_none())
     }
 
     /// Clear an incomplete Normal command before leaving the editor's input layer.
     pub fn cancel_pending(&mut self) {
+        self.cancel_substitute_confirmation();
+        self.cancel_syntax_request();
+        self.input_maps.clear_prefix();
         self.pending = None;
+        self.select_resume = false;
         self.search_operator = None;
         self.count = None;
         self.selected_register = None;
         self.replay.sequence.clear();
+    }
+
+    /// Adopt text edited in another view and discard operators targeting its old revision.
+    pub fn refresh_shared_document(&mut self) -> bool {
+        if !self.doc.refresh_shared() {
+            return false;
+        }
+        self.revalidate_document();
+        true
+    }
+
+    /// Restore saved text and clear operations targeting the discarded revision.
+    pub fn discard_changes(&mut self) {
+        if self.doc.discard_changes() {
+            self.revalidate_document();
+        }
+    }
+
+    /// Clamp view selections and cancel pending operators when their source text changes.
+    fn revalidate_document(&mut self) {
+        self.anchor = self
+            .doc
+            .text
+            .floor_char_boundary(self.anchor.min(self.doc.text.len()));
+        self.command_selection = None;
+        self.filter_range = None;
+        self.operated = None;
+        self.line_undo = None;
+        self.cancel_pending();
     }
 
     /// Number of logical lines, excluding the empty slot after the file's terminating LF.
@@ -416,7 +578,7 @@ impl Vim {
                 text: self.doc.line(row).to_owned(),
             });
         }
-        for position in self.marks.values_mut().chain(self.jumps.iter_mut()) {
+        for position in self.marks.values_mut() {
             if *position >= range.end {
                 *position = *position - range.len() + text.len();
             } else if *position >= range.start {
@@ -424,7 +586,12 @@ impl Vim {
             }
         }
         self.g.shift_positions(&range, text.len());
+        let checkpoint = self
+            .ex_lines
+            .as_mut()
+            .map_or(checkpoint, |lines| lines.replace(&self.doc, &range, text));
         let checkpoint = self.replay.checkpoint(self.doc.revision, checkpoint);
-        self.doc.replace(range, text, checkpoint);
+        self.doc.replace(range.clone(), text, checkpoint);
+        self.jump_history.shift(&self.doc, range, text.len());
     }
 }

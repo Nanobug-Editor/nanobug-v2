@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 /// One manual or language-provider fold, including its visible header.
+#[derive(Clone)]
 struct Fold {
     /// Half-open range of document lines.
     rows: Range<usize>,
@@ -29,6 +30,7 @@ impl Fold {
 }
 
 /// Nested fold definitions and the flat hidden ranges derived from them.
+#[derive(Clone)]
 pub(super) struct Folds {
     /// Outer folds precede their inner folds, including equal-start ranges.
     definitions: Vec<Fold>,
@@ -239,6 +241,27 @@ impl Folds {
 }
 
 impl Document {
+    /// Snapshot manual fold ranges and their retained open or closed state for a View script.
+    pub fn ex_manual_fold_ranges(&self) -> Vec<(Range<usize>, bool)> {
+        self.folds
+            .definitions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, fold)| {
+                if fold.provided {
+                    return None;
+                }
+                let depth = self.folds.definitions[..index]
+                    .iter()
+                    .filter(|parent| {
+                        parent.rows.start <= fold.rows.start && parent.rows.end >= fold.rows.end
+                    })
+                    .count();
+                Some((fold.rows.clone(), fold.closed_at(depth, self.folds.level)))
+            })
+            .collect()
+    }
+
     /// Close a fold covering half-open hidden `rows` and their preceding header.
     pub fn collapse_rows(&mut self, rows: Range<usize>) {
         if rows.start > 0 && rows.start < rows.end && rows.end <= self.starts.len() {
@@ -408,6 +431,11 @@ impl Document {
         self.starts.len() - self.folds.hidden.iter().map(Range::len).sum::<usize>()
     }
 
+    /// Disjoint physical row ranges hidden by the current fold projection.
+    pub fn hidden_rows(&self) -> &[Range<usize>] {
+        &self.folds.hidden
+    }
+
     /// Whether a collapsed fold starts just below document `row`.
     pub fn folded_at(&self, row: usize) -> bool {
         self.folded_end_row(row).is_some()
@@ -539,6 +567,76 @@ impl Document {
             changed |= self.change_fold(row, change, count, recursive);
         }
         changed
+    }
+
+    /// Apply an Ex fold command over addressed rows, stepping past each fold changed once.
+    pub(crate) fn change_ex_fold_rows(
+        &mut self,
+        rows: Range<usize>,
+        close: bool,
+        recursive: bool,
+    ) -> bool {
+        let mut row = rows.start;
+        let mut found = false;
+        while row < rows.end {
+            let containing: Vec<_> = self.folds.containing(row).collect();
+            if containing.is_empty() {
+                let next = self
+                    .folds
+                    .definitions
+                    .partition_point(|fold| fold.rows.start <= row);
+                let Some(fold) = self.folds.definitions.get(next) else {
+                    break;
+                };
+                row = fold.rows.start;
+                continue;
+            }
+            found = true;
+            let last_open = containing.iter().take_while(|(_, closed)| !closed).last();
+            let first_closed = containing.iter().find(|(_, closed)| *closed);
+            let next_row = if recursive {
+                row + 1
+            } else if close {
+                last_open.or(first_closed).map_or(row + 1, |&(index, _)| {
+                    self.folds.definitions[index].rows.end
+                })
+            } else {
+                first_closed.map_or(row + 1, |&(index, _)| {
+                    self.folds.definitions[index].rows.end
+                })
+            };
+            if close && recursive {
+                for (index, _) in containing {
+                    let fold = &mut self.folds.definitions[index];
+                    fold.closed = Some(true);
+                    fold.search_open = false;
+                }
+            } else if close {
+                if let Some(&(index, _)) = last_open {
+                    let fold = &mut self.folds.definitions[index];
+                    fold.closed = Some(true);
+                    fold.search_open = false;
+                }
+            } else if let Some(&(index, _)) = first_closed {
+                let end = self.folds.definitions[index].rows.end;
+                for fold in &mut self.folds.definitions[index..] {
+                    if fold.rows.start >= end {
+                        break;
+                    }
+                    fold.closed = Some(false);
+                    fold.search_open = false;
+                    if !recursive {
+                        break;
+                    }
+                }
+            }
+            row = next_row;
+        }
+        if found {
+            self.folds.enabled |= close;
+            self.folds.refresh();
+        }
+        found
     }
 
     /// Pick one row from each outer fold intersecting the selection `rows`.

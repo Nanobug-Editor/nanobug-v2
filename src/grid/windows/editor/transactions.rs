@@ -32,6 +32,7 @@ impl EditorWindow {
         &mut self,
         changes: Vec<TextChange>,
     ) -> anyhow::Result<(EditReceipt, Vec<PathBuf>)> {
+        self.refresh_shared_documents();
         let mut targets = Vec::with_capacity(changes.len());
         for change in &changes {
             targets.push(match change.target {
@@ -61,6 +62,7 @@ impl EditorWindow {
 
     /// Undo `receipt` only while every participant still has its exact post-edit revision.
     pub(in crate::grid) fn undo_text_changes(&mut self, receipt: &EditReceipt) -> bool {
+        self.refresh_shared_documents();
         let indices: Option<Vec<_>> = receipt
             .documents
             .iter()

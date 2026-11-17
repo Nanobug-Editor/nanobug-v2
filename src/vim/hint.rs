@@ -10,7 +10,7 @@ pub type Continuation = (&'static str, &'static str, bool);
 pub struct SequenceHint {
     /// Command keys entered so far, excluding counts and register selection.
     pub prefix: String,
-    /// Translation key for the group name shown after the prefix.
+    /// Translation key for the current group's title.
     pub group: &'static str,
     /// The available next keys, their translation keys and whether they open a group.
     pub continuations: Vec<Continuation>,
@@ -164,8 +164,31 @@ impl Vim {
                 }
                 if key == 'g' {
                     bindings.extend_from_slice(super::g_commands::G_MOTIONS);
-                    if operator.is_none() {
+                    if operator.is_some() {
+                        bindings.push(("c", "vim_hint.comment_object", false));
+                    } else {
                         bindings.extend_from_slice(super::g_commands::G_CONTINUATIONS);
+                        if self.help_buffer && self.mode == Mode::Normal {
+                            bindings.push(("=", "vim_g.help_run", true));
+                        }
+                        if self.mode.is_visual() && !self.read_only {
+                            bindings.extend([
+                                ("Ctrl+a", "vim_g.increment_sequence", false),
+                                ("Ctrl+x", "vim_g.decrement_sequence", false),
+                            ]);
+                        }
+                        if self.mode.is_visual()
+                            && let Some(comment) =
+                                bindings.iter_mut().find(|(key, _, _)| *key == "c")
+                        {
+                            comment.2 = false;
+                        }
+                        if self.mode.is_visual()
+                            && let Some(custom) =
+                                bindings.iter_mut().find(|(key, _, _)| *key == "@")
+                        {
+                            custom.2 = false;
+                        }
                         if self.read_only {
                             bindings.retain(|(key, _, _)| {
                                 !matches!(
@@ -175,6 +198,7 @@ impl Vim {
                                         | "?"
                                         | "q"
                                         | "w"
+                                        | "c"
                                         | "J"
                                         | "I"
                                         | "i"
@@ -196,10 +220,21 @@ impl Vim {
                 }
                 if operator.is_some() && matches!(key, '[' | ']') {
                     bindings.retain(|(keys, _, _)| super::bracket_commands::is_motion_hint(keys));
-                } else if self.read_only && matches!(key, '[' | ']') {
-                    bindings.retain(|(label, _, _)| {
-                        !matches!(*label, "p P" | "p" | "P" | "Space" | "b" | "B" | "d" | "D")
+                } else if matches!(key, '[' | ']') {
+                    bindings.retain(|(label, _, _)| match *label {
+                        "Space" | "a" | "A" | "b" | "B" | "d" | "D" => {
+                            self.mode == Mode::Normal && !self.read_only
+                        }
+                        "p P" | "p" | "P" | "MiddleMouse" => !self.read_only,
+                        _ => true,
                     });
+                }
+                if self.mode.is_visual() && operator.is_none() {
+                    if key == '[' {
+                        bindings.push(("n", "vim_hint.syntax_previous", false));
+                    } else if key == ']' {
+                        bindings.push(("n", "vim_hint.syntax_next", false));
+                    }
                 }
                 (group, bindings)
             }
@@ -233,7 +268,17 @@ impl Vim {
                 } else {
                     "vim_hint.inner_group"
                 };
-                (group, OBJECT_CONTINUATIONS.to_vec())
+                let mut bindings = OBJECT_CONTINUATIONS.to_vec();
+                bindings.push((
+                    "n",
+                    if around {
+                        "vim_hint.syntax_parent"
+                    } else {
+                        "vim_hint.syntax_child"
+                    },
+                    false,
+                ));
+                (group, bindings)
             }
             Pending::ZHeight { rows, .. } => {
                 prefix = format!("z{rows}");
@@ -258,15 +303,67 @@ impl Vim {
                 prefix.push_str("Ctrl+x");
                 (
                     "vim_hint.insert_group",
-                    vec![("Ctrl+o", "vim_hint.insert_omni_completion", false)],
+                    vec![
+                        ("Ctrl+o Ctrl+u", "vim_hint.insert_omni_completion", false),
+                        ("Ctrl+f", "vim_hint.insert_file_completion", false),
+                        ("Ctrl+l", "vim_hint.insert_line_completion", false),
+                        ("Ctrl+n Ctrl+p", "vim_hint.insert_word_completion", false),
+                        ("Ctrl+i", "vim_hint.insert_identifier_completion", false),
+                        ("Ctrl+d", "vim_hint.insert_definition_completion", false),
+                        ("Ctrl+k", "vim_hint.insert_dictionary_completion", false),
+                        ("Ctrl+t", "vim_hint.insert_thesaurus_completion", false),
+                        ("Ctrl+r", "vim_hint.insert_register_completion", false),
+                        ("Ctrl+v Ctrl+q", "vim_hint.insert_ex_completion", false),
+                        ("Ctrl+s s", "vim_hint.insert_spelling_completion", false),
+                        ("Ctrl+z", "vim_hint.insert_completion_cancel", false),
+                        ("Ctrl+e Ctrl+y", "vim_hint.insert_scroll", false),
+                    ],
                 )
+            }
+            Pending::InsertArgument(argument) => {
+                use super::insert_argument::{Argument, Target};
+
+                let target = match argument {
+                    Argument::Digraph { target, .. }
+                    | Argument::Literal { target, .. }
+                    | Argument::Number { target, .. } => target,
+                };
+                if let Target::Find(_, _, Some(operator)) = target {
+                    push_operator(&mut prefix, operator);
+                }
+                prefix.push_str(target.prefix());
+                let (source, key, description, nested) = match argument {
+                    Argument::Digraph { first: None, .. } => {
+                        ("Ctrl+k", "…", "vim_hint.digraph_first", true)
+                    }
+                    Argument::Digraph {
+                        first: Some(first), ..
+                    } => {
+                        prefix.push_str("Ctrl+k ");
+                        prefix.push(first);
+                        return Some(SequenceHint {
+                            prefix,
+                            group: "vim_hint.insert_group",
+                            continuations: vec![("…", "vim_hint.digraph_second", false)],
+                        });
+                    }
+                    Argument::Literal { prefix, .. } => (prefix, "…", "vim_hint.literal_key", true),
+                    Argument::Number { prefix, .. } => {
+                        (prefix, "0–9 a–f", "vim_hint.literal_number", false)
+                    }
+                };
+                prefix.push_str(source);
+                ("vim_hint.insert_group", vec![(key, description, nested)])
             }
             Pending::ControlBackslash => {
                 prefix.push_str("Ctrl+\\");
-                (
-                    "vim_hint.mode_group",
-                    vec![("Ctrl+n", "vim_hint.normal_mode", false)],
-                )
+                let mut bindings = vec![("Ctrl+n Ctrl+g", "vim_hint.normal_mode", false)];
+                if matches!(self.mode, Mode::Command | Mode::Search)
+                    && self.expression_prompt.is_none()
+                {
+                    bindings.push(("e", "vim_hint.expression_replace", true));
+                }
+                ("vim_hint.mode_group", bindings)
             }
             Pending::GArgument(ref argument) => return Some(argument.hint()),
             Pending::RegisterInput { modifier } => {
@@ -275,7 +372,10 @@ impl Vim {
                     prefix.push_str(" Ctrl+");
                     prefix.push(modifier);
                 }
-                let mut bindings = vec![("a–z 0–9 \" % /", "vim_hint.register_value", false)];
+                let mut bindings = vec![("a–z 0–9 \" % # : . /", "vim_hint.register_value", false)];
+                if self.expression_prompt.is_none() {
+                    bindings.push(("=", "vim_hint.expression_register", true));
+                }
                 if modifier.is_none() {
                     bindings.push(("Ctrl+r Ctrl+o", "vim_hint.register_literal", true));
                 }
@@ -287,6 +387,66 @@ impl Vim {
                     bindings.push(("Ctrl+w/a/l/f/p", "vim_hint.register_cursor", false));
                 }
                 ("vim_hint.register_group", bindings)
+            }
+            Pending::Argument('q', ..) => {
+                prefix.push('q');
+                (
+                    "vim_hint.record_group",
+                    vec![
+                        (":", "vim_hint.command_window", false),
+                        ("/ ?", "vim_hint.search_window", false),
+                        ("a–z A–Z 0–9 \"", "vim_hint.record_register", false),
+                    ],
+                )
+            }
+            Pending::Argument(key @ ('f' | 'F' | 't' | 'T' | 'r'), operator, _) => {
+                if let Some(operator) = operator {
+                    push_operator(&mut prefix, operator);
+                }
+                prefix.push(key);
+                let mut bindings = vec![
+                    ("…", "vim_hint.literal_key", false),
+                    ("Ctrl+k", "vim_hint.digraph_first", true),
+                ];
+                if key == 'r' {
+                    bindings.push(("Ctrl+v Ctrl+q", "vim_hint.literal_key", true));
+                    bindings.push(("Ctrl+e Ctrl+y", "vim_hint.replace_adjacent", false));
+                }
+                ("vim_hint.character_group", bindings)
+            }
+            Pending::Argument('@', ..) => {
+                prefix.push('@');
+                (
+                    "vim_hint.macro_group",
+                    vec![
+                        ("a–z 0–9 \"", "vim_hint.play_register", false),
+                        ("@", "vim_hint.repeat_playback", false),
+                        (":", "vim_hint.repeat_ex", false),
+                        ("=", "vim_hint.expression_execute", true),
+                    ],
+                )
+            }
+            Pending::Argument('"', ..) => {
+                prefix.push('"');
+                (
+                    "vim_hint.register_group",
+                    vec![
+                        ("a–z 0–9 \" % # : . /", "vim_hint.register_value", false),
+                        ("=", "vim_hint.expression_register", true),
+                    ],
+                )
+            }
+            Pending::Argument(key @ ('m' | '\'' | '`'), operator, _) => {
+                if let Some(operator) = operator {
+                    push_operator(&mut prefix, operator);
+                }
+                prefix.push(key);
+                let bindings = if key == 'm' {
+                    vec![("a–z A–Z [ ] < > ' `", "vim_hint.set_mark", false)]
+                } else {
+                    vec![("a–z A–Z 0–9 [ ] < > ( ) { }", "vim_g.mark_argument", false)]
+                };
+                ("vim_g.mark_group", bindings)
             }
             Pending::Argument(..) | Pending::SpellSuggestions(_) => return None,
         };
@@ -359,9 +519,48 @@ mod tests {
         let hint = vim.sequence_hint().unwrap();
         assert_eq!(hint.prefix, "i");
         assert_eq!(hint.group, "vim_hint.inner_group");
+        assert!(
+            hint.continuations
+                .contains(&("n", "vim_hint.syntax_child", false))
+        );
         vim.key("w", &mut register);
         assert!(vim.sequence_hint().is_none());
         vim.key("f", &mut register);
-        assert!(vim.sequence_hint().is_none());
+        let hint = vim.sequence_hint().unwrap();
+        assert_eq!(hint.prefix, "f");
+        assert!(
+            hint.continuations
+                .contains(&("Ctrl+k", "vim_hint.digraph_first", true))
+        );
+    }
+
+    /// Syntax nodes use translated text-object entries and Visual-only sibling motions.
+    #[test]
+    fn syntax_hints_follow_visual_and_operator_modes() {
+        let mut vim = Vim::new(Document::new("alpha"));
+        let mut register = Register::default();
+        vim.key("[", &mut register);
+        assert!(
+            !vim.sequence_hint()
+                .unwrap()
+                .continuations
+                .iter()
+                .any(|item| item.0 == "n")
+        );
+        vim.key("Escape", &mut register);
+        vim.text("v[", &mut register);
+        assert!(vim.sequence_hint().unwrap().continuations.contains(&(
+            "n",
+            "vim_hint.syntax_previous",
+            false
+        )));
+        vim.key("Escape", &mut register);
+        vim.text("da", &mut register);
+        let hint = vim.sequence_hint().unwrap();
+        assert_eq!(hint.prefix, "da");
+        assert!(
+            hint.continuations
+                .contains(&("n", "vim_hint.syntax_parent", false))
+        );
     }
 }

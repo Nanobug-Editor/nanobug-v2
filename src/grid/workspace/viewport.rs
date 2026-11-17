@@ -10,11 +10,7 @@ use crate::grid::{
     },
 };
 
-use super::{
-    Workspace,
-    language::language_list_bounds,
-    layout::{FOOTER_ROWS, Focus},
-};
+use super::{Workspace, language::language_list_bounds, layout::Focus};
 use crate::ui::{text::UNITS_PER_COLUMN, theme::ThemeComponent};
 use gpui::{Bounds, Context, Window, px, size};
 use nanobug::{
@@ -36,6 +32,10 @@ pub(super) enum CursorSpace {
     Document(usize),
     /// Fixed command/search row.
     CommandLine,
+    /// Editable command-line history viewport.
+    CommandWindow,
+    /// Fixed prompt row within the command-line history window.
+    CommandWindowPrompt,
     /// Shortcut-help list viewport.
     HelpList,
     /// First character of the binding in the editor keyboard's description.
@@ -66,6 +66,10 @@ pub(super) enum CursorSpace {
 impl Workspace {
     /// Resolve the logical caret's position and width in visual grid columns, plus its input state.
     pub(super) fn caret(&self) -> (f32, f32, f32, bool, bool) {
+        if let Some((history, area)) = self.command_window.as_ref().zip(self.command_window_area())
+        {
+            return history.caret(area, &self.spacing);
+        }
         if let Some(caret) = self.plugin_caret() {
             return caret;
         }
@@ -152,8 +156,7 @@ impl Workspace {
                 .map_or(0, |cell| cell.end);
             return (
                 slot.start as f32 + units as f32 / UNITS_PER_COLUMN as f32,
-                (self.layout.rows - FOOTER_ROWS) as f32
-                    + f32::from(self.layout.footer_offset) / self.metrics.lh,
+                f32::from(self.footer_bounds().top() - self.metrics.origin.y) / self.metrics.lh,
                 1.,
                 true,
                 true,
@@ -166,6 +169,13 @@ impl Workspace {
 
     /// Coordinate system that should move with a scrolling viewport.
     fn cursor_space(&self) -> CursorSpace {
+        if let Some(history) = &self.command_window {
+            return if matches!(history.editor.vim().mode, Mode::Command | Mode::Search) {
+                CursorSpace::CommandWindowPrompt
+            } else {
+                CursorSpace::CommandWindow
+            };
+        }
         if self.plugins.manager_accepts_text() {
             return CursorSpace::PluginPrompt;
         }
@@ -215,7 +225,12 @@ impl Workspace {
 
     /// Rebuild changed panel cells and retarget the independent animated cursor.
     pub(super) fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.layout = self.derive_layout(window);
+        self.observe_script_buffer(window, cx);
+        if let Some(project) = self.projects.active_project_mut() {
+            project.set_input_mappings(&self.input_mappings);
+            project.refresh_shared_documents();
+        }
+        self.update_layout(window);
         self.refresh_document_presentation();
         #[cfg(feature = "plugin-probe")]
         self.sync_probe_projects();
@@ -251,6 +266,14 @@ impl Workspace {
             manager.track_view(tree_input, ManagerWindow::body(self.layout.tree).h, now)
         });
 
+        let bound_correction = if project.focus == Focus::Editor {
+            project.editor.scrollbind_focus_correction()
+        } else {
+            0
+        };
+        let bound_before = (project.focus == Focus::Editor)
+            .then(|| project.editor.scrollbind_target())
+            .flatten();
         let (document_changed, document_delta, column_delta) = project.editor.track_view(
             area,
             project.focus == Focus::Editor,
@@ -261,6 +284,11 @@ impl Workspace {
         let (preview_source_changed, preview_source_delta) = project
             .editor
             .advance_markdown_preview(&self.markdown_cache, area, now);
+        let bound_shift = bound_before
+            .zip(project.editor.scrollbind_target())
+            .map_or(bound_correction, |(before, after)| {
+                bound_correction.saturating_add(after as isize - before as isize)
+            });
 
         let space = self.cursor_space();
         let project = self.projects.active();
@@ -271,13 +299,21 @@ impl Workspace {
                     .manager
                     .as_ref()
                     .map(|manager| (manager.scroll(), tree_delta, None)),
-                CursorSpace::Document(_) => Some((
-                    &buffer.scroll,
-                    document_delta + preview_source_delta,
-                    Some((&buffer.columns, column_delta)),
-                )),
+                CursorSpace::Document(_) => {
+                    Some(if let Some(terminal) = project.editor.terminal() {
+                        (terminal.scroll(), document_delta, None)
+                    } else {
+                        (
+                            &buffer.scroll,
+                            document_delta + preview_source_delta,
+                            Some((&buffer.columns, column_delta)),
+                        )
+                    })
+                }
                 CursorSpace::Start(_)
                 | CursorSpace::CommandLine
+                | CursorSpace::CommandWindow
+                | CursorSpace::CommandWindowPrompt
                 | CursorSpace::HelpList
                 | CursorSpace::HelpKeyboard
                 | CursorSpace::HelpFilter
@@ -304,7 +340,41 @@ impl Workspace {
                     .manager
                     .as_ref()
                     .map_or(0, |manager| manager.scroll().first_cell());
+        if bound_shift != 0 {
+            self.shift_scrollbound_editors(bound_shift, None);
+        }
         self.advance_inactive_editor_scrolling() || changed
+    }
+
+    /// Synchronize bound editors' relative offsets in the selected Tabpage.
+    pub(super) fn sync_scrollbound_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.active_project() else {
+            return;
+        };
+        let align = project.editor.scrollbind_target().or_else(|| {
+            project
+                .page_editors()
+                .find_map(|(_, editor)| editor.scrollbind_target())
+        });
+        if let Some(row) = align {
+            self.shift_scrollbound_editors(0, Some(row));
+            self.repaint([ScrollInput::Advance; 3], window, cx);
+        }
+    }
+
+    /// Retarget independently animated views using the focused editor's scroll delta.
+    fn shift_scrollbound_editors(&mut self, shift: isize, align: Option<usize>) {
+        let areas = self.editor_rects();
+        let now = self.scroll_epoch.elapsed().as_secs_f64();
+        let project = self.projects.active_mut();
+        let active = project.active_editor_id();
+        for (pane, area) in areas {
+            if (pane != active || align.is_some())
+                && let Some(editor) = project.editor_by_id_mut(pane)
+            {
+                editor.scrollbind_rows(area, &self.spacing, shift, align, now);
+            }
+        }
     }
 
     /// Keep the animated cursor in its scrolling viewport through `cx`.
@@ -372,7 +442,7 @@ impl Workspace {
                 cell.origin,
                 width,
                 space == CursorSpace::Start(StartFocus::Filter),
-                !self.small_modal_open(),
+                !self.small_modal_open() && space != CursorSpace::Start(StartFocus::Preview),
             )
         } else {
             let target = keyboard_caret.map_or_else(|| metrics.at(x, y), |cell| cell.origin);
@@ -388,16 +458,41 @@ impl Workspace {
                     0.,
                 )
             }),
-            CursorSpace::Document(_) => Some((
-                &self.bodies[2],
-                self.projects
-                    .active()
-                    .editor
-                    .text_area(self.active_editor_area()),
-                &self.projects.active().editor.buffer().scroll,
-                self.projects.active().editor.vim().line_count(),
-                self.projects.active().editor.buffer().text_displacement(),
-            )),
+            CursorSpace::Document(_) => {
+                let editor = &self.projects.active().editor;
+                let area = editor.text_area(self.active_editor_area());
+                Some(if let Some(terminal) = editor.terminal() {
+                    (
+                        &self.bodies[2],
+                        area,
+                        terminal.scroll(),
+                        terminal.line_count(),
+                        0.,
+                    )
+                } else {
+                    (
+                        &self.bodies[2],
+                        area,
+                        &editor.buffer().scroll,
+                        editor.vim().line_count(),
+                        editor.buffer().text_displacement(),
+                    )
+                })
+            }
+            CursorSpace::CommandWindow => self
+                .command_window
+                .as_ref()
+                .zip(self.command_window_area())
+                .map(|(history, area)| {
+                    let buffer = history.editor.buffer();
+                    (
+                        history.text_panel(),
+                        history.editor.text_area(area),
+                        &buffer.scroll,
+                        buffer.vim.line_count(),
+                        buffer.text_displacement(),
+                    )
+                }),
             CursorSpace::FilePreviewText => self.file_picker.as_ref().and_then(|session| {
                 let editor = session.focused_editor()?;
                 let buffer = editor.buffer();
@@ -420,6 +515,7 @@ impl Workspace {
             }),
             CursorSpace::Start(_)
             | CursorSpace::CommandLine
+            | CursorSpace::CommandWindowPrompt
             | CursorSpace::HelpKeyboard
             | CursorSpace::HelpFilter
             | CursorSpace::FilePicker
@@ -488,6 +584,11 @@ impl Workspace {
                 ),
                 None,
             )
+        } else if space == CursorSpace::CommandWindowPrompt {
+            let clip = self
+                .command_window_area()
+                .map(|area| area.pixels(self.metrics));
+            (None, clip, clip)
         } else if space == CursorSpace::FilePreviewInput {
             let bounds = self.footer_bounds();
             (
@@ -565,13 +666,13 @@ impl Workspace {
         );
         self.cursor.update(cx, |cursor, cx| {
             let component = match space {
-                CursorSpace::Document(_) | CursorSpace::FilePreviewText => {
-                    Some(ThemeComponent::Editor)
-                }
+                CursorSpace::Document(_)
+                | CursorSpace::FilePreviewText
+                | CursorSpace::CommandWindow => Some(ThemeComponent::Editor),
                 CursorSpace::Manager => Some(ThemeComponent::ExplorerTree),
-                CursorSpace::CommandLine | CursorSpace::FilePreviewInput => {
-                    Some(ThemeComponent::Footer)
-                }
+                CursorSpace::CommandLine
+                | CursorSpace::FilePreviewInput
+                | CursorSpace::CommandWindowPrompt => Some(ThemeComponent::Footer),
                 _ => None,
             };
             cursor.set_theme_component(component, cx);
@@ -583,7 +684,14 @@ impl Workspace {
                 self.last_cursor_space != Some(space),
                 cx,
             );
-            cursor.set(geometry, visible, cell_width, !insert, window, cx)
+            cursor.set(
+                geometry,
+                visible && !self.sleep_hides_caret(),
+                cell_width,
+                !insert,
+                window,
+                cx,
+            )
         });
         self.last_cursor_space = Some(space);
         window.notify_text_input_changed(&self.focus_handle);
@@ -599,12 +707,13 @@ impl Workspace {
         // Explorer opens files through this path to preserve its own scroll position.
         self.sync_plugin_projects();
         self.sync_text_input(window, cx);
+        self.resize_visible_terminals();
         #[cfg(windows)]
         if let Some(shortcut) = &self.alt_escape {
             shortcut.set_enabled(self.editor_accepts_alt_escape());
         }
         if self.hovered_controls.is_some() {
-            self.hovered_controls = if self.resizing
+            self.hovered_controls = if self.pane_resize.is_some()
                 || self
                     .projects
                     .active_project()
@@ -615,7 +724,11 @@ impl Workspace {
                 self.corner_controls_at(window.mouse_position())
             };
         }
-        if self.help.is_open() {
+        if self.vim_menu.is_some() {
+            self.advance_vim_menu(ScrollInput::Reveal);
+        } else if self.command_window.is_some() {
+            self.advance_command_window(inputs, cx);
+        } else if self.help.is_open() {
             self.advance_help_scrolling(ScrollInput::Advance, cx);
         } else {
             self.advance_scrolling(inputs, cx);
@@ -666,7 +779,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.advance_definition_hover_scroll();
-        if self.help.is_open() {
+        if self.vim_menu.is_some() {
+            self.advance_vim_menu(inputs[1]);
+            self.refresh_vim_menu(cx);
+        } else if self.command_window.is_some() {
+            if self.advance_command_window(inputs, cx) {
+                self.refresh_panels(cx);
+            }
+        } else if self.help.is_open() {
             if self.advance_help_scrolling(ScrollInput::Advance, cx) {
                 self.refresh_help_panels(cx);
             }
@@ -685,7 +805,12 @@ impl Workspace {
 
     /// Animate body transforms in `window` through `cx`, retaining cells between grid steps.
     pub(super) fn schedule_scroll(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let active = if let Some(list) = &self.help.list {
+        let active = if let Some(menu) = &self.vim_menu {
+            menu.scrolling()
+        } else if let Some(history) = &self.command_window {
+            let buffer = history.editor.buffer();
+            buffer.scroll.is_active() || buffer.columns.is_active()
+        } else if let Some(list) = &self.help.list {
             list.scroll.is_active()
         } else if let Some(session) = &self.file_picker {
             session.focused_editor().is_some_and(|editor| {
@@ -698,6 +823,10 @@ impl Workspace {
                 .manager
                 .as_ref()
                 .is_some_and(|manager| manager.scroll().is_active())
+                || project
+                    .editor
+                    .terminal()
+                    .is_some_and(|terminal| terminal.scroll().is_active())
                 || project.editor.markdown_view_mode() != Some(MarkdownViewMode::Preview)
                     && (buffer.scroll.is_active() || buffer.columns.is_active())
                 || project

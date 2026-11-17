@@ -2,6 +2,48 @@
 
 use super::*;
 
+/// Stacked and side-by-side strokes have equal clearance, with less space on the title side.
+#[test]
+fn stacked_path_clearance_matches_side_by_side_outlines() {
+    let upper = Rect {
+        x: 0,
+        y: 1,
+        w: 26,
+        h: 12,
+    };
+    let lower = Rect { y: 13, ..upper };
+    let side = Rect {
+        x: 27,
+        h: 25,
+        ..upper
+    };
+    let panes = [upper, lower, side];
+    for (cw, lh, font_size) in [(9., 21., 16.), (9.5, 22., 16.), (13.5, 30.5, 25.)] {
+        let metrics = Metrics {
+            cw,
+            lh,
+            font_size,
+            origin: point(px(14.), px(9.)),
+        };
+        let stroke = solid_stroke_width(font_size);
+        let (upper_top, upper_bottom) = pane_border_offsets(upper, &panes, metrics);
+        let (lower_top, lower_bottom) = pane_border_offsets(lower, &panes, metrics);
+        let seam = lower.pixels(metrics).top();
+        let bottom = seam - px(lh * 0.5) + stroke * 0.5 + upper_bottom;
+        let top = seam + px(lh * 0.5) - stroke * 0.5 + lower_top;
+        let side_gap =
+            side.pixels(metrics).left() - upper.pixels(metrics).right() + px(cw) - stroke;
+        assert!(f32::from(top - bottom - side_gap).abs() < 0.001);
+        assert!(top - seam < seam - bottom);
+        assert!(lower_bottom > px(0.));
+        assert_eq!(
+            pane_border_offsets(side, &panes, metrics),
+            (px(0.), lower_bottom)
+        );
+        assert_eq!(upper_top, px(0.));
+    }
+}
+
 /// Split panes preserve their outer bounds and smallest usable size when moved or resized.
 #[test]
 fn split_panes_fit_the_retained_grid() {
@@ -24,34 +66,67 @@ fn split_panes_fit_the_retained_grid() {
         assert_eq!(last.x + last.w, area.w);
 
         let (manager, editor) = split_panes(area, true, editor_first, 28, Some(0));
-        assert_eq!((manager.h, editor.h), (4, 9));
+        assert_eq!((manager.h, editor.h), (4, 10));
         assert_eq!(manager.x, editor.x);
         let (first, last) = if editor_first {
             (editor, manager)
         } else {
             (manager, editor)
         };
-        assert_eq!(first.y + first.h + 1, last.y);
+        assert_eq!(first.y + first.h, last.y);
         assert_eq!(last.y + last.h, area.y + area.h);
+
+        let short = Rect { h: 7, ..area };
+        let (manager, editor) = split_panes(short, true, editor_first, 28, Some(usize::MAX));
+        assert_eq!((manager.h, editor.h), (4, 3));
+        assert_eq!(
+            (manager.y + manager.h).max(editor.y + editor.h),
+            short.y + short.h
+        );
     }
 }
 
-/// Whole pane rows leave clearance above the footer while it stays aligned to the outer inset.
+/// Resizing matches the visible title gap above the pane to the outline gap below it.
 #[test]
-fn footer_keeps_clearance_across_window_heights() {
-    for line_height in [20., 21., 22.] {
+fn footer_and_tabs_keep_centered_panes_across_window_heights() {
+    for (line_height, font_size) in [(12., 9.), (20., 15.), (22., 16.), (22.4, 16.5), (48., 36.)] {
         for height in 480..=840 {
             let height = height as f32;
-            let (rows, offset) = footer_geometry(px(height), line_height);
-            let origin = OUTER_INSET_Y + TAB_GAP_Y;
-            let footer = origin + (rows - FOOTER_ROWS) as f32 * line_height + f32::from(offset);
-            let border = origin + ((rows - FOOTER_ROWS) as f32 - 0.5) * line_height;
-            assert!(footer + FOOTER_BADGE_INSET_Y - border >= FOOTER_GAP_Y);
-            let badge_bottom = footer + line_height - FOOTER_BADGE_INSET_Y;
-            assert_eq!(height - badge_bottom, OUTER_INSET_Y);
+            let (rows, grid_origin_y, footer_top) = vertical_geometry(px(height), line_height);
+            let metrics = Metrics {
+                cw: 10.,
+                lh: line_height,
+                font_size,
+                origin: point(px(14.), grid_origin_y),
+            };
+            let pane = Rect {
+                x: 0,
+                y: 1,
+                w: 60,
+                h: rows - 1 - FOOTER_ROWS,
+            };
+            let bounds = pane.pixels(metrics);
+            let (_, bottom_offset) = pane_border_offsets(pane, &[pane], metrics);
+            let tab_bottom = OUTER_INSET_Y + line_height;
+            let footer_badge_top = f32::from(footer_top) + FOOTER_BADGE_INSET_Y;
+            let grid_gap = f32::from(bounds.top()) - tab_bottom;
+            let stroke_inset = (line_height - f32::from(solid_stroke_width(font_size))) * 0.5;
+            let top_gap = grid_gap + (line_height - font_size) * 0.5;
+            let bottom_gap =
+                footer_badge_top - (f32::from(bounds.bottom() + bottom_offset) - stroke_inset);
+            assert!(
+                (top_gap - bottom_gap).abs() < 0.001,
+                "height {height}, row height {line_height}: top gap {top_gap}, bottom gap {bottom_gap}"
+            );
+            assert!(grid_gap + 0.001 >= PANE_GAP_Y);
+            assert!(grid_gap < PANE_GAP_Y + line_height * 0.5 + 0.001);
+            let footer_bottom = f32::from(footer_top) + line_height;
+            assert!(footer_bottom < height);
+            assert!(
+                (height - (footer_bottom - FOOTER_BADGE_INSET_Y) - OUTER_INSET_Y).abs() < 0.001
+            );
         }
     }
-    assert_eq!(footer_geometry(px(840.), 22.).0, 38);
 }
 
 /// Pane controls include a separate help target, while a popup has only its close target.

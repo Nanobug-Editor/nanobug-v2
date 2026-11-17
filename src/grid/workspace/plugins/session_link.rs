@@ -101,6 +101,9 @@ impl Workspace {
                 let (session, changes) = Session::start(options);
                 workspace.plugins.session = Some(session);
                 workspace.sync_plugin_projects();
+                if workspace.plugins.open {
+                    workspace.plugin_refresh(window, cx);
+                }
                 cx.spawn_in(window, async move |view, cx| {
                     while changes.recv().await.is_ok() {
                         if cx
@@ -108,6 +111,7 @@ impl Workspace {
                                 view.update(cx, |workspace, cx| {
                                     let previous_server = workspace.active_language_server_status();
                                     workspace.plugins.update_view();
+                                    let restored_surface = workspace.reattach_project_surface();
                                     let server_changed =
                                         previous_server != workspace.active_language_server_status();
                                     if let Some(session) = &workspace.plugins.session {
@@ -145,6 +149,9 @@ impl Workspace {
                                     if workspace.plugins.open || workspace.plugins.surface.key.is_some()
                                         || !workspace.plugins.retired_images.is_empty()
                                     {
+                                        if restored_surface {
+                                            workspace.sync_text_input(window, cx);
+                                        }
                                         workspace.update_cursor(window, cx);
                                         cx.notify();
                                     }
@@ -166,6 +173,7 @@ impl Workspace {
         if self.plugins.session.is_none() {
             return;
         }
+        self.sync_project_plugin_windows();
         let active = self
             .projects
             .active_project()
@@ -278,11 +286,8 @@ impl Workspace {
                 .as_ref()
                 .is_some_and(|key| Some(key.instance.project) != active)
             {
-                self.plugins.surface.key = None;
-                self.plugins.surface.focused = false;
+                self.plugins.surface.clear_attachment();
                 self.plugins.composition.clear();
-                self.plugins.surface.pending_draft = None;
-                self.plugins.surface.viewport = None;
             }
             self.plugins.active = active;
             self.plugins.projects = projects;
@@ -297,6 +302,7 @@ impl Workspace {
                     self.plugins.sql_dialects.clone(),
                 );
         }
+        self.reattach_project_surface();
     }
 
     /// Observe native composition length without recording text or credential metadata.

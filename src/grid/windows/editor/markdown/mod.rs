@@ -247,7 +247,7 @@ mod tests {
         assert_eq!(source.x + source.w + 2, preview.x);
         assert_eq!(preview.x + preview.w, area.x + area.w - 1);
         let narrow = Rect { w: 12, ..area };
-        assert_eq!(editor.text_area(narrow).w, 1);
+        assert_eq!(editor.text_area(narrow).w, 3);
         assert!(editor.set_markdown_view_mode(MarkdownViewMode::Edit));
         let other = EditorWindow::new(editor.vim().doc.fork());
         assert_eq!(other.markdown_view_mode(), Some(MarkdownViewMode::Split));
@@ -337,7 +337,7 @@ impl EditorWindow {
         let bounds = self.markdown_preview_area(area)?.pixels(metrics);
         let split = self.markdown_view_mode() == Some(MarkdownViewMode::Split);
         let preview_leads = self.source_follows_markdown_preview(area);
-        let source_height = self.text_area(area).h;
+        let source = self.text_area(area);
         let buffer = &mut self.buffers[self.active];
         let doc = &buffer.vim.doc;
         let appearance = style(cx);
@@ -376,21 +376,25 @@ impl EditorWindow {
             cache.layout = Some((key, Rc::new(layout)));
         }
         let (_, layout) = cache.layout.as_ref().expect("laid out active Markdown");
-        let view = &mut buffer.markdown;
         let maximum = f32::from(layout.height() - bounds.size.height).ceil() as usize;
+        let preview_top = (split && !preview_leads)
+            .then(|| {
+                ScrollMap::new(
+                    layout.scroll_points(),
+                    buffer.cached_visual_rows(source.w),
+                    source.h,
+                    maximum,
+                )
+                .map(|map| map.preview_top(buffer.scroll.position()))
+            })
+            .flatten();
+        let view = &mut buffer.markdown;
         let resized = view.maximum != maximum;
         view.source_sync_pending |= preview_leads && (reflow || resized);
         view.maximum = maximum;
-        let source_map = split
-            .then(|| ScrollMap::new(layout.scroll_points(), doc, source_height, maximum))
-            .flatten();
-        if !preview_leads && let Some(map) = source_map {
-            view.scroll.follow(
-                map.preview_top(buffer.scroll.position()),
-                maximum,
-                buffer.scroll.is_active(),
-                now,
-            );
+        if let Some(preview_top) = preview_top {
+            view.scroll
+                .follow(preview_top, maximum, buffer.scroll.is_active(), now);
         } else if resized || view.scroll.target() > maximum {
             view.scroll.request(view.scroll.target(), maximum, now);
         }
@@ -448,7 +452,7 @@ impl EditorWindow {
         if !follows && !preview_only || self.markdown_preview_area(area).is_none() {
             return (false, 0.);
         }
-        let source_height = self.text_area(area).h;
+        let source = self.text_area(area);
         let buffer = &mut self.buffers[self.active];
         let view = &mut buffer.markdown;
         let preview_before = view.scroll.position();
@@ -464,26 +468,30 @@ impl EditorWindow {
             return (false, 0.);
         }
         let reflow = std::mem::take(&mut view.source_sync_pending);
-        let Some(map) = ScrollMap::new(layout.scroll_points(), doc, source_height, view.maximum)
-        else {
-            return (false, 0.);
-        };
         let first = buffer.scroll.first_cell();
         let before = buffer.scroll.position();
-        if reflow {
-            view.preview_scroll_origin = None;
-        }
-        let origin = *view
-            .preview_scroll_origin
-            .get_or_insert(PreviewScrollOrigin {
-                preview: preview_before,
-                source: before,
-            });
-        let (position, maximum) =
-            map.follow_preview(origin, view.scroll.position(), view.scroll.target() as f32);
-        if !moving {
-            view.preview_scroll_origin = None;
-        }
+        let origin =
+            view.preview_scroll_origin
+                .filter(|_| !reflow)
+                .unwrap_or(PreviewScrollOrigin {
+                    preview: preview_before,
+                    source: before,
+                });
+        let (current, target, preview_maximum) = (
+            view.scroll.position(),
+            view.scroll.target() as f32,
+            view.maximum,
+        );
+        let Some(map) = ScrollMap::new(
+            layout.scroll_points(),
+            buffer.cached_visual_rows(source.w),
+            source.h,
+            preview_maximum,
+        ) else {
+            return (false, 0.);
+        };
+        let (position, maximum) = map.follow_preview(origin, current, target);
+        buffer.markdown.preview_scroll_origin = moving.then_some(origin);
         buffer.scroll.follow(position, maximum, moving, now);
         (
             first != buffer.scroll.first_cell(),

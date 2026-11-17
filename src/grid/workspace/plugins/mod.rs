@@ -21,6 +21,7 @@ mod native_editing_tests;
 mod native_field;
 mod outline;
 mod presentation;
+mod project_session;
 mod prompts;
 #[cfg(all(test, windows))]
 mod rust_analyzer_test;
@@ -30,6 +31,7 @@ mod session_link;
 mod shortcuts;
 mod sql_dialect;
 mod surface_link;
+mod syntax_selection;
 mod workflow;
 
 use super::{Workspace, editor_close::CloseTarget, view::positioned};
@@ -38,6 +40,7 @@ use crate::grid::windows::plugin_manager::{
     SEARCH_BUTTONS, comparison, prompt_button_at, rows, secondary_description,
     secondary_list_entries,
 };
+use crate::grid::windows::plugin_surface::SurfaceSnapshot;
 use crate::{
     grid::render::{Metrics, Panel, Rect, dashed_outline_element},
     ui::{
@@ -59,6 +62,7 @@ use nanobug_plugin_sdk::{
     DocumentSnapshot, Permission,
     canvas::{Appearance, EditorFont, EditorTheme, Language, ThemeColors, Viewport},
 };
+pub(super) use project_session::PluginWindowsSnapshot;
 use rows::{Row, Target};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use unicode_segmentation::UnicodeSegmentation;
@@ -91,6 +95,12 @@ pub(super) struct PluginCoordinator {
     view: Arc<View>,
     panel: Entity<Panel>,
     manager: ManagerWindow,
+    /// Directory project whose navigation currently occupies the native plugin windows.
+    project_windows_scope: Option<u64>,
+    /// Window to reattach when the new plugin instance publishes its first scene.
+    pending_project_surface: Option<SurfaceSnapshot>,
+    /// Browsing state before close confirmation temporarily borrows the plugin manager.
+    closing_project_windows: Option<PluginWindowsSnapshot>,
     snapshots: BTreeMap<u64, Arc<DocumentSnapshot>>,
     open_snapshots: BTreeMap<(u64, u64), Arc<DocumentSnapshot>>,
     active: Option<u64>,
@@ -147,6 +157,9 @@ impl PluginCoordinator {
             view: Arc::new(View::default()),
             panel: cx.new(|_| Panel::new(metrics)),
             manager: ManagerWindow::default(),
+            project_windows_scope: None,
+            pending_project_surface: None,
+            closing_project_windows: None,
             snapshots: BTreeMap::new(),
             open_snapshots: BTreeMap::new(),
             active: None,

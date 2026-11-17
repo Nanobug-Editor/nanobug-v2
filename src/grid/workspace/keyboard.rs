@@ -8,20 +8,19 @@ use crate::ui::keys::normal_character;
 
 use super::{
     Workspace,
+    buffer_management::BufferClose,
     editor_close::CloseTarget,
     layout::{Focus, ShellWindow},
+    sleep::Source,
     tabs::ProjectShortcut,
     window_keys::{WindowSequence, direction_target},
 };
-use gpui::{Context, KeyDownEvent, Keystroke, Window};
+use gpui::{Context, KeyDownEvent, Keystroke, Modifiers, Window};
 use nanobug::{
     animation::{cursor::CursorConfig, scroll::ScrollInput},
     i18n,
-    vim::{Action, Mode},
+    vim::{Action, ArgumentCommand, LEADER_KEY, Mode, SequenceHint},
 };
-
-/// Default printable key for the workspace's `<leader>` mappings.
-const LEADER_KEY: &str = " ";
 
 /// A sequence awaiting its next key in the workspace or Explorer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +40,7 @@ pub(super) enum PendingPrefix {
 pub(super) struct LeaderPrefix(&'static str);
 
 /// Targets available to the leader hint and keyboard dispatcher.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(super) struct LeaderAvailability {
     /// The selected tab has an Explorer.
     manager: bool,
@@ -53,10 +52,16 @@ pub(super) struct LeaderAvailability {
     close_only: bool,
     /// File selection keeps shell actions scoped to the picker.
     choosing_file: bool,
-    /// A grid window is available to close.
-    grid_window: bool,
     /// Top-level tab actions are available on this surface.
     tabs: bool,
+    /// The active editor can receive normal-mode buffer and split commands.
+    editor: bool,
+    /// The active project can receive window commands.
+    windows: bool,
+    /// The current editor shares its page with another editor pane.
+    editor_splits: bool,
+    /// The focused window can close through the normal window command.
+    close_window: bool,
 }
 
 /// One continuation shared by keyboard dispatch and the leader hint.
@@ -92,6 +97,16 @@ const LEADER_BINDINGS: &[LeaderBinding] = &[
         shortcut: None,
     },
     LeaderBinding {
+        sequence: "b",
+        description_key: "leader.buffer_group",
+        shortcut: None,
+    },
+    LeaderBinding {
+        sequence: "w",
+        description_key: "leader.window_group",
+        shortcut: None,
+    },
+    LeaderBinding {
         sequence: "m",
         description_key: "leader.markdown_group",
         shortcut: None,
@@ -103,18 +118,13 @@ const LEADER_BINDINGS: &[LeaderBinding] = &[
     },
     LeaderBinding {
         sequence: "q",
-        description_key: "leader.close_focused",
-        shortcut: Some(ShellShortcut::CloseFocused),
+        description_key: "leader.quit_group",
+        shortcut: None,
     },
     LeaderBinding {
-        sequence: "x",
-        description_key: "leader.close_tab",
-        shortcut: Some(ShellShortcut::CloseTabs(CloseTarget::Tab)),
-    },
-    LeaderBinding {
-        sequence: "X",
-        description_key: "leader.close_all_tabs",
-        shortcut: Some(ShellShortcut::CloseTabs(CloseTarget::AllTabs)),
+        sequence: "qq",
+        description_key: "leader.quit_app",
+        shortcut: Some(ShellShortcut::CloseTabs(CloseTarget::Quit)),
     },
     LeaderBinding {
         sequence: "L",
@@ -127,9 +137,89 @@ const LEADER_BINDINGS: &[LeaderBinding] = &[
         shortcut: Some(ShellShortcut::OpenHelp),
     },
     LeaderBinding {
+        sequence: "-",
+        description_key: "leader.split_below",
+        shortcut: Some(ShellShortcut::SplitWindow { stacked: true }),
+    },
+    LeaderBinding {
+        sequence: "|",
+        description_key: "leader.split_right",
+        shortcut: Some(ShellShortcut::SplitWindow { stacked: false }),
+    },
+    LeaderBinding {
+        sequence: "`",
+        description_key: "leader.alternate_buffer",
+        shortcut: Some(ShellShortcut::AlternateBuffer),
+    },
+    LeaderBinding {
         sequence: "pa",
         description_key: "leader.open_start",
         shortcut: Some(ShellShortcut::OpenStart),
+    },
+    LeaderBinding {
+        sequence: "bb",
+        description_key: "leader.alternate_buffer",
+        shortcut: Some(ShellShortcut::AlternateBuffer),
+    },
+    LeaderBinding {
+        sequence: "bd",
+        description_key: "leader.close_buffer",
+        shortcut: Some(ShellShortcut::CloseBuffers(BufferClose::Current)),
+    },
+    LeaderBinding {
+        sequence: "bo",
+        description_key: "leader.close_other_buffers",
+        shortcut: Some(ShellShortcut::CloseBuffers(BufferClose::Others)),
+    },
+    LeaderBinding {
+        sequence: "bl",
+        description_key: "leader.close_left_buffers",
+        shortcut: Some(ShellShortcut::CloseBuffers(BufferClose::Left)),
+    },
+    LeaderBinding {
+        sequence: "br",
+        description_key: "leader.close_right_buffers",
+        shortcut: Some(ShellShortcut::CloseBuffers(BufferClose::Right)),
+    },
+    LeaderBinding {
+        sequence: "bD",
+        description_key: "leader.close_buffer_window",
+        shortcut: Some(ShellShortcut::CloseBuffers(BufferClose::WithWindow)),
+    },
+    LeaderBinding {
+        sequence: "wd",
+        description_key: "vim_window.close",
+        shortcut: Some(ShellShortcut::CloseWindow),
+    },
+    LeaderBinding {
+        sequence: "wm",
+        description_key: "leader.zoom_window",
+        shortcut: Some(ShellShortcut::ZoomWindow),
+    },
+    LeaderBinding {
+        sequence: "wh",
+        description_key: "vim_window.left",
+        shortcut: Some(ShellShortcut::FocusWindow("h")),
+    },
+    LeaderBinding {
+        sequence: "wj",
+        description_key: "vim_window.down",
+        shortcut: Some(ShellShortcut::FocusWindow("j")),
+    },
+    LeaderBinding {
+        sequence: "wk",
+        description_key: "vim_window.up",
+        shortcut: Some(ShellShortcut::FocusWindow("k")),
+    },
+    LeaderBinding {
+        sequence: "wl",
+        description_key: "vim_window.right",
+        shortcut: Some(ShellShortcut::FocusWindow("l")),
+    },
+    LeaderBinding {
+        sequence: "w=",
+        description_key: "vim_window.equalize",
+        shortcut: Some(ShellShortcut::EqualizeWindows),
     },
     LeaderBinding {
         sequence: "ma",
@@ -169,9 +259,12 @@ impl LeaderPrefix {
     /// The menu opened by the leader key alone.
     pub(super) const ROOT: Self = Self("");
 
-    /// Return the group keys already entered after Space.
-    pub(super) fn suffix(self) -> &'static str {
-        self.0
+    /// Return the current group's description key, or None for the root.
+    pub(super) fn group_description_key(self) -> Option<&'static str> {
+        LEADER_BINDINGS
+            .iter()
+            .find(|binding| binding.sequence == self.0 && binding.is_group())
+            .map(|binding| binding.description_key)
     }
 
     /// Remove the most recent group key, returning None when already at the root.
@@ -188,14 +281,23 @@ impl LeaderPrefix {
         LEADER_BINDINGS.iter().filter_map(move |binding| {
             let key = binding.sequence.strip_prefix(self.0)?;
             let available = match binding.shortcut {
-                Some(ShellShortcut::CloseFocused) => availability.grid_window,
-                Some(ShellShortcut::CloseTabs(CloseTarget::Tab)) => {
-                    availability.tabs && availability.grid_window
-                }
+                None if binding.sequence == "q" => availability.tabs,
                 Some(ShellShortcut::CloseTabs(_)) => availability.tabs,
                 _ if availability.close_only => false,
                 Some(ShellShortcut::OpenHelp) => availability.help,
                 _ if availability.choosing_file => false,
+                Some(
+                    ShellShortcut::CloseBuffers(BufferClose::WithWindow)
+                    | ShellShortcut::ZoomWindow,
+                ) => availability.editor_splits,
+                Some(
+                    ShellShortcut::SplitWindow { .. }
+                    | ShellShortcut::AlternateBuffer
+                    | ShellShortcut::CloseBuffers(_),
+                ) => availability.editor,
+                Some(ShellShortcut::CloseWindow) => availability.close_window,
+                None if binding.sequence == "b" => availability.editor,
+                _ if binding.sequence.starts_with('w') => availability.windows,
                 _ if binding.sequence.starts_with('m') => availability.markdown,
                 _ if binding.sequence.starts_with('\t') => {
                     availability.manager && availability.tabs
@@ -237,10 +339,24 @@ enum ShellShortcut {
     CloseTabpage,
     /// Select the source and preview layout for the active Markdown document.
     SetMarkdownView(MarkdownViewMode),
-    /// Close the grid surface that owns input.
-    CloseFocused,
     /// Close the selected scope of top-level tabs after resolving unsaved buffers.
     CloseTabs(CloseTarget),
+    /// Return to the current pane's previously displayed buffer.
+    AlternateBuffer,
+    /// Close the indicated buffers or their owning pane through the save prompt.
+    CloseBuffers(BufferClose),
+    /// Create a split on the lower or right side of the focused editor.
+    SplitWindow { stacked: bool },
+    /// Close the focused window using the normal pane close command.
+    CloseWindow,
+    /// Fill the editor region with the active split, or restore its siblings.
+    ZoomWindow,
+    /// Move focus toward an adjacent window in the given Vim direction.
+    FocusWindow(&'static str),
+    /// Grow or shrink the focused pane along one axis.
+    ResizeWindow { stacked: bool, grow: bool },
+    /// Give sibling windows equal sizes using the existing window command.
+    EqualizeWindows,
 }
 
 impl ShellShortcut {
@@ -264,7 +380,7 @@ impl ShellShortcut {
         if editing
             || modifiers.alt
             || modifiers.platform
-            || (character != Some("?") && modifiers.shift != uppercase)
+            || (!matches!(character, Some("?" | "|")) && modifiers.shift != uppercase)
             || modifiers.function
         {
             return None;
@@ -273,11 +389,27 @@ impl ShellShortcut {
             if visual || availability.close_only {
                 return None;
             }
-            let direction = key.key.as_str();
-            if !matches!(direction, "h" | "j" | "k" | "l") {
-                return None;
+            if availability.windows && focus.is_some() {
+                let resize = match key.key.as_str() {
+                    "up" => Some((true, true)),
+                    "down" => Some((true, false)),
+                    "left" => Some((false, false)),
+                    "right" => Some((false, true)),
+                    _ => None,
+                };
+                if let Some((stacked, grow)) = resize {
+                    return Some(Self::ResizeWindow { stacked, grow });
+                }
             }
-            let target = direction_target(focus?, split, direction).filter(|target| {
+            let direction = ["h", "j", "k", "l"]
+                .into_iter()
+                .find(|&direction| direction == key.key)?;
+            let focus = focus?;
+            // Use the same split-aware movement as Leader+w before falling back to Explorer.
+            if focus == Focus::Editor && availability.editor_splits {
+                return Some(Self::FocusWindow(direction));
+            }
+            let target = direction_target(focus, split, direction).filter(|target| {
                 *target == Focus::Editor
                     || availability.manager && hidden_pane != Some(Focus::Manager)
             });
@@ -329,15 +461,15 @@ impl Workspace {
             .is_some_and(|session| session.state.busy || session.state.delete.is_some());
         let project = self.projects.active_project();
         let modal_open = self.modal_open();
-        let markdown = !modal_open
-            && !self.plugins.owns_input()
-            && project.is_some_and(|project| {
-                project.focus == Focus::Editor
-                    && project.editor.vim().mode == Mode::Normal
-                    && project.editor.markdown_view_mode().is_some()
-            });
+        let windows = !modal_open && !self.plugins.owns_input() && project.is_some();
         #[cfg(feature = "plugin-probe")]
-        let markdown = markdown && !self.probe_has_focus();
+        let windows = windows && !self.probe_has_focus();
+        let editor = windows
+            && project.is_some_and(|project| {
+                project.focus == Focus::Editor && project.editor.vim().mode == Mode::Normal
+            });
+        let markdown =
+            editor && project.is_some_and(|project| project.editor.markdown_view_mode().is_some());
         let visual = project.is_some_and(|project| {
             project.focus == Focus::Editor
                 && matches!(
@@ -358,14 +490,21 @@ impl Workspace {
                 .file_picker
                 .as_ref()
                 .is_some_and(|session| session.choosing_file()),
-            grid_window: project.is_some() || modal_open || project_picker,
             tabs: !modal_open && !project_picker,
+            editor,
+            windows,
+            editor_splits: editor && self.can_zoom_leader_window(),
+            close_window: windows && self.can_close_leader_window(),
         }
     }
 
     /// Route committed native `text` to the active input in `window` through `cx`.
     pub(super) fn commit_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_input_mappings();
+        self.hint_page = 0;
         self.deliver_text(text, true, window, cx);
+        self.sync_sequence_hint_delay(cx);
+        self.track_mapping_timeout(window, cx);
     }
 
     /// Route clipboard `text` to the active input without requesting editor completion.
@@ -375,7 +514,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.activate_input_mappings();
         self.deliver_text(text, false, window, cx);
+        self.sync_sequence_hint_delay(cx);
+        self.track_mapping_timeout(window, cx);
     }
 
     /// Deliver `text` to its focused surface. `typed` enables completion in the project editor.
@@ -387,6 +529,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if !self.accepts_native_text() {
+            return;
+        }
+        if self.terminal_keys_active() {
+            self.commit_terminal_text(text, !typed, window, cx);
+            self.sync(window, cx);
+            return;
+        }
+        if self.command_window.is_some() {
+            self.commit_command_window_text(text, typed, window, cx);
             return;
         }
         if self.plugin_commit(text, window, cx) {
@@ -402,7 +553,7 @@ impl Workspace {
             return;
         }
         if self.file_picker.is_some() {
-            self.file_picker_commit(text, window, cx);
+            self.file_picker_commit(text, typed, window, cx);
             return;
         }
         if let Some(page) = self.projects.start_mut()
@@ -435,7 +586,17 @@ impl Workspace {
             .update(cx, |cursor, cx| cursor.activity(window, cx));
         self.projects.active_mut().status.clear();
         let text = text.replace("\r\n", "\n");
-        self.run_vim(|vim, register| vim.commit_text(&text, register), window, cx);
+        self.run_vim(
+            |vim, register| {
+                if typed {
+                    vim.commit_text(&text, register)
+                } else {
+                    vim.paste_text(&text, register)
+                }
+            },
+            window,
+            cx,
+        );
         if suggest && self.projects.active().editor.vim().doc.revision != revision {
             self.refresh_automatic_completion((revision, caret), window, cx);
         } else {
@@ -478,7 +639,7 @@ impl Workspace {
         project.editor.stop_drag();
         project.editor.composition_mut().clear();
         self.hovered_controls = None;
-        self.resizing = false;
+        self.pane_resize = None;
         self.help
             .open(pane == Focus::Manager, self.projects.manager_available());
         self.help
@@ -494,8 +655,52 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.activate_input_mappings();
+        if self.editor_sleep.is_none()
+            && self.prefix.is_none()
+            && self.active_vim_input().is_some_and(|(source, editor)| {
+                source == Source::Editor
+                    && editor.vim().mapping_timeout_token().is_some()
+                    && editor.composition().is_empty()
+                    && !editor.wants_native_mapping(&event.keystroke)
+            })
+        {
+            // Paging leaves the held keys in Vim, including prefixes shared with Leader or Ctrl+w.
+            if let Some(direction) = hint_page_direction(&event.keystroke)
+                && self.page_sequence_hint(direction, cx)
+            {
+                cx.stop_propagation();
+                return;
+            }
+            self.restore_mapped_shell_prefix(window, cx);
+        }
         self.dispatch_key_down(event, window, cx);
         self.sync_sequence_hint_delay(cx);
+        self.track_mapping_timeout(window, cx);
+    }
+
+    /// Replay the built-in shortcut if a reserved prefix matched only longer custom mappings.
+    pub(super) fn restore_mapped_shell_prefix(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(keys) = self
+            .projects
+            .active_mut()
+            .editor
+            .take_unmapped_shell_prefix()
+        else {
+            return false;
+        };
+        let mut keys = keys.iter().map(|key| mapping_fallback_event(key));
+        if let Some(first) = keys.next() {
+            self.pane_key_down(&first, self.leader_availability(), window, cx);
+        }
+        for event in keys {
+            self.dispatch_key_down(&event, window, cx);
+        }
+        true
     }
 
     /// Route `event` through the current modal or pane in `window` through `cx`.
@@ -505,16 +710,29 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let raw = event.keystroke.key.as_str();
-        let page = if event.keystroke.modifiers.modified() {
-            None
-        } else {
-            match raw {
-                "pageup" => Some(-1),
-                "pagedown" => Some(1),
-                _ => None,
+        if self.vim_menu.is_some() {
+            self.vim_menu_key(event, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self.pause_editor_input(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.command_window.is_some() {
+            if self.command_window_key(event, window, cx) {
+                cx.stop_propagation();
             }
-        };
+            return;
+        }
+        if let Some(consumed) = self.terminal_key_down(event, window, cx) {
+            if consumed {
+                cx.stop_propagation();
+            }
+            return;
+        }
+        let raw = event.keystroke.key.as_str();
+        let page = hint_page_direction(&event.keystroke);
         if let Some(direction) = page
             && self.scroll_definition_hover(direction, window, cx)
         {
@@ -534,6 +752,26 @@ impl Workspace {
                 cx.stop_propagation();
             }
             return;
+        }
+        if let Some((Source::Editor, editor)) = self.active_vim_input()
+            && self.prefix.is_none()
+            && editor.markdown_view_mode() != Some(MarkdownViewMode::Preview)
+            && !(event.is_held && self.held_close_key.as_deref() == Some(raw))
+        {
+            let modifiers = event.keystroke.modifiers;
+            let confirming = editor.vim().substitute_confirmation_active();
+            let composing = !editor.composition().is_empty()
+                && !modifiers.control
+                && !(cfg!(windows) && raw == "escape" && !modifiers.modified());
+            if confirming || !composing && editor.wants_native_mapping(&event.keystroke) {
+                self.hint_page = 0;
+                self.cursor
+                    .update(cx, |cursor, cx| cursor.activity(window, cx));
+                if self.editor_key_down(event, false, window, cx) || confirming {
+                    cx.stop_propagation();
+                    return;
+                }
+            }
         }
         if !self.modal_open() && self.completion_keydown(event, window, cx) {
             cx.stop_propagation();
@@ -555,6 +793,11 @@ impl Workspace {
             return;
         }
         if let Some(direction) = page
+            && !self.active_vim_input().is_some_and(|(_, editor)| {
+                editor.wants_native_mapping(&event.keystroke)
+                    || editor.vim().mapping_timeout_token().is_some()
+                        && !editor.composition().is_empty()
+            })
             && self.page_sequence_hint(direction, cx)
         {
             cx.stop_propagation();
@@ -749,6 +992,9 @@ impl Workspace {
             && (modifiers.control || modifiers.platform)
             && raw == "v"
             && self.projects.active().editor.vim().accepts_text()
+            && (modifiers.platform
+                || modifiers.shift
+                || !self.projects.active().editor.vim().mode.is_insert())
         {
             if let Some(item) = cx.read_from_clipboard()
                 && let Some(text) = item.text()
@@ -822,7 +1068,7 @@ impl Workspace {
                 _ => None,
             };
             if let Some(input) = self.manager_key(key, manager_prefix, window, cx) {
-                self.layout = self.derive_layout(window);
+                self.update_layout(window);
                 self.repaint(
                     [input, ScrollInput::Reveal, ScrollInput::Reveal],
                     window,
@@ -838,16 +1084,42 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
+        if self.editor_key_down(event, keyboard_help, window, cx) {
+            cx.stop_propagation();
+        }
+    }
+
+    /// Dispatch a native key to Vim, applying host effects and revealing the resulting viewport.
+    fn editor_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        keyboard_help: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let doc = &self.projects.active().editor.vim().doc;
         let (revision, caret) = (doc.revision, doc.cursor);
         let area = self.active_editor_area();
-        let Some(input) = self.projects.active_mut().editor.key(
+        let directory = self.ex_current_dir().to_owned();
+        let project = self.projects.active_mut();
+        let mode = project.editor.vim().mode;
+        project
+            .editor
+            .set_numbered_marks(self.numbered_marks.clone());
+        if !project.status.is_empty() {
+            project.editor.edit(|vim, _| {
+                vim.remember_host_message(&project.status);
+                Action::None
+            });
+        }
+        let Some(input) = project.editor.key(
             &event.keystroke,
             area,
             &self.spacing,
+            &directory,
             keyboard_help,
         ) else {
-            return;
+            return false;
         };
         if input.clear_status {
             self.projects.active_mut().status.clear();
@@ -866,15 +1138,16 @@ impl Workspace {
             );
         }
         self.apply_edit(input.edit, window, cx);
+        self.finish_terminal_normal();
         if mode.is_insert()
-            && raw == "backspace"
-            && !modifiers.modified()
+            && event.keystroke.key == "backspace"
+            && !event.keystroke.modifiers.modified()
             && self.projects.active().editor.vim().doc.revision != revision
         {
             self.refresh_automatic_completion((revision, caret), window, cx);
         }
         self.repaint_editor_input(input.view_top, input.view_left, window, cx);
-        cx.stop_propagation();
+        true
     }
 
     /// Interpret `event` and its printable `character` as preview or file navigation.
@@ -888,6 +1161,17 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let key = &event.keystroke;
+        if key.key == "tab"
+            && key.modifiers
+                == (gpui::Modifiers {
+                    control: true,
+                    ..Default::default()
+                })
+        {
+            self.action(Action::TabNavigate(0, None), window, cx);
+            self.sync(window, cx);
+            return;
+        }
         if let Some(PendingPrefix::MarkdownNavigation(previous)) = prefix {
             if event.is_held {
                 self.prefix = prefix;
@@ -934,10 +1218,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let explicit = view_top.is_some() || view_left.is_some();
         if let Some(project) = self.projects.active_project_mut() {
             project.editor.markdown_source_takes_scroll();
+            if explicit {
+                project.refresh_shared_documents();
+            }
         }
-        let explicit = view_top.is_some() || view_left.is_some();
         let inputs = [
             if explicit {
                 ScrollInput::Advance
@@ -1145,16 +1432,73 @@ impl Workspace {
                 self.action(action, window, cx);
                 self.sync(window, cx);
             }
-            ShellShortcut::CloseFocused => {
-                self.held_close_key = Some(raw.into());
-                self.close_focused_grid(window, cx);
-            }
             ShellShortcut::CloseTabs(target) => {
                 self.held_close_key = Some(raw.into());
                 self.request_close(target, window, cx);
                 self.sync(window, cx);
             }
+            ShellShortcut::AlternateBuffer => self.switch_alternate_buffer(None, window, cx),
+            ShellShortcut::CloseBuffers(target) => {
+                self.held_close_key = Some(raw.into());
+                self.request_buffer_close(target, window, cx);
+            }
+            ShellShortcut::SplitWindow { stacked } => {
+                self.open_leader_editor_split(stacked, window, cx)
+            }
+            ShellShortcut::CloseWindow => {
+                self.held_close_key = Some(raw.into());
+                self.close_leader_window(window, cx);
+            }
+            ShellShortcut::ZoomWindow => self.toggle_leader_window_zoom(window, cx),
+            ShellShortcut::FocusWindow(direction) => {
+                self.leader_window_focus(direction, window, cx)
+            }
+            ShellShortcut::ResizeWindow { stacked, grow } => {
+                self.resize_window_by_key(stacked, grow, window, cx);
+            }
+            ShellShortcut::EqualizeWindows => self.equalize_leader_windows(window, cx),
         }
+    }
+}
+
+/// Return the page delta for the unmodified keys shared by hint and hover paging.
+pub(super) fn hint_page_direction(key: &Keystroke) -> Option<isize> {
+    if key.modifiers.modified() {
+        return None;
+    }
+    match key.key.as_str() {
+        "pageup" => Some(-1),
+        "pagedown" => Some(1),
+        _ => None,
+    }
+}
+
+/// Translate a held Vim key back to the native notation used by shell bindings.
+fn mapping_fallback_event(mut key: &str) -> KeyDownEvent {
+    let mut modifiers = Modifiers::default();
+    while let Some((modifier, tail)) = key.split_once('+') {
+        match modifier {
+            "Ctrl" => modifiers.control = true,
+            "Alt" => modifiers.alt = true,
+            "Shift" => modifiers.shift = true,
+            _ => break,
+        }
+        key = tail;
+    }
+    modifiers.shift |= matches!(key.as_bytes(), [b'A'..=b'Z']);
+    let raw = if key == " " {
+        "space".into()
+    } else {
+        key.to_ascii_lowercase()
+    };
+    KeyDownEvent {
+        keystroke: Keystroke {
+            modifiers,
+            key: raw,
+            key_char: (key.len() == 1).then(|| key.to_owned()),
+        },
+        is_held: false,
+        prefer_character_input: false,
     }
 }
 
@@ -1169,7 +1513,60 @@ fn markdown_navigation_action(prefix: char, key: Option<&str>) -> Option<Action>
             edge: key == "B",
             count: None,
         },
+        ('[' | ']', key @ ("a" | "A")) => Action::Arguments {
+            command: if key == "A" {
+                ArgumentCommand::Edge {
+                    last: prefix == ']',
+                }
+            } else {
+                ArgumentCommand::Step {
+                    forward: prefix == ']',
+                }
+            },
+            count: None,
+            arguments: String::new(),
+        },
         _ => return None,
+    })
+}
+
+/// List the navigation commands available after `prefix` in the Markdown preview.
+pub(super) fn markdown_navigation_hint(prefix: char) -> Option<SequenceHint> {
+    use nanobug::vim::Continuation;
+    let (group, continuations): (_, &[Continuation]) = match prefix {
+        '[' => (
+            "vim_hint.previous_group",
+            &[
+                ("b", "vim_bracket.previous_buffer", false),
+                ("B", "vim_bracket.first_buffer", false),
+                ("a", "vim_bracket.previous_argument", false),
+                ("A", "vim_bracket.first_argument", false),
+            ],
+        ),
+        ']' => (
+            "vim_hint.next_group",
+            &[
+                ("b", "vim_bracket.next_buffer", false),
+                ("B", "vim_bracket.last_buffer", false),
+                ("a", "vim_bracket.next_argument", false),
+                ("A", "vim_bracket.last_argument", false),
+            ],
+        ),
+        'g' => (
+            "vim_hint.goto_group",
+            &[
+                ("g", "vim_hint.first_line", false),
+                ("t", "vim_window.next_tab", false),
+                ("T", "vim_window.previous_tab", false),
+                ("Tab", "vim_window.last_tab", false),
+            ],
+        ),
+        _ => return None,
+    };
+    Some(SequenceHint {
+        prefix: prefix.to_string(),
+        group,
+        continuations: continuations.to_vec(),
     })
 }
 

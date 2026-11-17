@@ -9,10 +9,12 @@ description = "Native character-grid editor with Vim-style modal editing"
 plugin-probe = ["dep:nanobug-probe-wire"]
 
 [dependencies]
+alacritty_terminal = { version = "=0.26.0", default-features = false }
 anyhow = "1"
 async-channel = "2.5"
 nanobug-probe-wire = { path = "experiments/plugin-probe/wire", optional = true }
 dirs = "5.0.1"
+encoding_rs = "=0.8.42"
 ego-tree = "0.11"
 gpui = { package = "gpui-pre", version = "=0.3.10", default-features = false }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", default-features = false }
@@ -40,7 +42,7 @@ semver = { version = "1", features = ["serde"] }
 sha2 = "0.10.9"
 tempfile = "3.27.0"
 toml = "0.8.23"
-toml_edit = "0.22.27"
+toml_edit = { version = "0.22.27", features = ["serde"] }
 trash = "5.3.0"
 regex = "1"
 sqlformat = "0.5.0"
@@ -55,6 +57,7 @@ gpui_windows = { package = "gpui-pre-windows", version = "=0.3.10", default-feat
 keyring-core = "=1.0.1"
 raw-window-handle = "0.6.2"
 windows-sys = { version = "0.61.2", features = [
+    "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
     "Win32_Security",

@@ -19,6 +19,9 @@ impl Workspace {
     /// Clear preedit when the active surface stops accepting text and sync the system IME.
     pub(super) fn sync_text_input(&mut self, window: &Window, cx: &mut Context<Self>) {
         if !self.accepts_native_text() {
+            if let Some(history) = &mut self.command_window {
+                history.editor.composition_mut().clear();
+            }
             self.plugins.composition.clear();
             if let Some(project) = self.projects.active_project_mut() {
                 project.editor.composition_mut().clear();
@@ -48,6 +51,21 @@ impl Workspace {
 
     /// Read preedit from the surface that currently owns native input.
     fn composition(&self) -> Option<&Composition> {
+        if self.vim_menu.is_some() {
+            return None;
+        }
+        if self.terminal_keys_active() {
+            return self
+                .accepts_native_text()
+                .then_some(self.projects.active().editor.composition());
+        }
+        if let Some(history) = &self.command_window {
+            return history
+                .editor
+                .vim()
+                .accepts_text()
+                .then_some(history.editor.composition());
+        }
         if self.plugins.owns_input() {
             return self
                 .plugins
@@ -86,6 +104,21 @@ impl Workspace {
 
     /// Update preedit on the surface that currently owns native input.
     fn composition_mut(&mut self) -> Option<&mut Composition> {
+        if self.vim_menu.is_some() {
+            return None;
+        }
+        if self.terminal_keys_active() {
+            return self
+                .accepts_native_text()
+                .then(|| self.projects.active_mut().editor.composition_mut());
+        }
+        if let Some(history) = &mut self.command_window {
+            return history
+                .editor
+                .vim()
+                .accepts_text()
+                .then(|| history.editor.composition_mut());
+        }
         if self.plugins.owns_input() {
             return self
                 .plugins
@@ -130,6 +163,20 @@ impl Workspace {
 
     /// Whether the active surface accepts native text input at this moment.
     pub(super) fn accepts_native_text(&self) -> bool {
+        if self.vim_menu.is_some() {
+            return false;
+        }
+        if self.terminal_keys_active() {
+            return self
+                .projects
+                .active()
+                .editor
+                .terminal()
+                .is_some_and(|terminal| terminal.accepts_text());
+        }
+        if let Some(history) = &self.command_window {
+            return history.editor.vim().accepts_text();
+        }
         if self.plugins.owns_input() {
             return self.plugins.accepts_text();
         }
@@ -318,3 +365,6 @@ impl EntityInputHandler for Workspace {
         }
     }
 }
+
+#[cfg(all(test, windows))]
+mod tests;

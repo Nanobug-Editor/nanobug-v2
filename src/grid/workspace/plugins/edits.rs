@@ -139,7 +139,7 @@ impl Plan {
                         version: group.version,
                     },
                     title: path.display().to_string(),
-                    before: doc.text,
+                    before: doc.into_text(),
                     after,
                 });
             }

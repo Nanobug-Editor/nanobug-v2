@@ -11,7 +11,7 @@ use crate::{
 use gpui::{KeyDownEvent, Keystroke, Pixels, Point};
 use nanobug::animation::scroll::ScrollInput;
 
-/// Effect of a help key on the workspace and its native input handler.
+/// Effect of a help action on the workspace and its native input handler.
 pub(in crate::grid) enum HelpCommand {
     /// Close the popup and return input to its originating pane.
     Close,
@@ -60,11 +60,28 @@ impl HelpWindow {
         let Some(list) = &mut self.list else {
             return false;
         };
-        if scope == Scope::Window && self.keyboard.is_some() {
+        if scope == Scope::Window && self.keyboard.is_some() && list.has_scope(scope) {
             self.composition.clear();
             list.finish_filter(false, now);
         }
         list.select_scope(scope, now)
+    }
+
+    /// Dismiss one shortcut catalog at `now`, clearing the filter input if the keyboard takes over.
+    pub(in crate::grid) fn close_scope(&mut self, scope: Scope, now: f64) -> HelpCommand {
+        let Some(list) = &mut self.list else {
+            return HelpCommand::Ignore;
+        };
+        let command = list.close_scope(scope, now);
+        if matches!(command, HelpCommand::Update(_))
+            && list.scope() == Scope::Window
+            && let Some(keyboard) = &mut self.keyboard
+        {
+            keyboard.cancel_modifier_tap();
+            self.composition.clear();
+            list.finish_filter(false, now);
+        }
+        command
     }
 
     /// End search at animation time `now`; restore the old query when `cancel` is true.

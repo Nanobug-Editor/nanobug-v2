@@ -5,6 +5,27 @@ use super::*;
 impl Engine {
     pub(super) fn action(&mut self, action: Action) {
         match action {
+            Action::SyntaxNodes {
+                language,
+                document,
+                reply,
+            } => {
+                let id = self.next();
+                let syntax = Arc::clone(&self.syntax);
+                let on_busy = reply.clone();
+                if !self.syntax_io.submit(move || {
+                    if !reply.is_closed() {
+                        let result = syntax
+                            .lock()
+                            .unwrap()
+                            .node_ranges(id, language, document)
+                            .map_err(|error| error.to_string());
+                        let _ = reply.try_send(result);
+                    }
+                }) {
+                    let _ = on_busy.try_send(Err("Syntax worker is busy".into()));
+                }
+            }
             Action::InspectZip(path) => self.inspect(path, None, false),
             Action::InspectChosenZip(path) => self.inspect_chosen_zip(path),
             Action::InspectDevelopment(path) => self.inspect(path, None, true),

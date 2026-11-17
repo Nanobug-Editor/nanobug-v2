@@ -33,6 +33,7 @@ try {
             'Material Icon Theme' = 'assets\icons\material\Material-Icon-Theme-MIT.txt'
             'Leader hint icons'   = 'assets\icons\Leader-Icons-Licenses.txt'
             'Markdown preview'    = 'assets\markdown\Markdown-Preview-Notices.txt'
+            'Alacritty terminal (Apache-2.0)' = 'assets\terminal\Alacritty-APACHE-2.0.txt'
             'English Hunspell dictionary (SCOWL)' = 'assets\spelling\en_US-LICENSE.txt'
             '[Spellbook 0.4.2 source](https://crates.io/api/v1/crates/spellbook/0.4.2/download) (MPL-2.0)' = 'assets\spelling\Spellbook-MPL-2.0.txt'
         }

@@ -11,10 +11,12 @@ use crate::grid::windows::{
 
 use super::{
     Workspace,
+    editor_splits::SplitAxis,
     language::language_list_bounds,
-    layout::{Focus, ShellWindow},
+    layout::{ShellWindow, stacked_divider_bounds},
     leader_hint::border_gaps,
     markdown::external_markdown_url,
+    pointer::PaneResize,
 };
 use crate::ui::{
     icons::{Icon, IconCache},
@@ -23,18 +25,26 @@ use crate::ui::{
 #[cfg(windows)]
 use gpui::WindowControlArea;
 use gpui::{
-    AnyElement, Bounds, ClickEvent, Context, ElementInputHandler, Entity, InteractiveElement,
-    IntoElement, MouseButton, NavigationDirection, ParentElement, Pixels, Render,
-    StatefulInteractiveElement, StyleRefinement, Styled, Window, canvas, div, point, px, rgba,
-    size,
+    AnyElement, Bounds, ClickEvent, Context, CursorStyle, ElementInputHandler, Entity,
+    InteractiveElement, IntoElement, MouseButton, NavigationDirection, ParentElement, Pixels,
+    Render, StatefulInteractiveElement, StyleRefinement, Styled, Window, canvas, div, point, px,
+    rgba, size,
 };
 use nanobug::animation::scroll::ScrollInput;
 use std::rc::Rc;
 
-/// Cross drawn in the border gap for a hovered pane or popup.
+/// Cross drawn in the border gap for a hovered popup.
 const CLOSE_ICON: Icon = Icon::new(include_bytes!("../../../assets/icons/pane-close.svg"), 1.);
 /// The close icon's square size in logical pixels, excluding the clickable padding.
 const CLOSE_ICON_SIZE: f32 = 12.;
+
+/// Map the resized grid dimension to the corresponding native cursor.
+fn divider_cursor(axis: SplitAxis) -> CursorStyle {
+    match axis {
+        SplitAxis::Columns => CursorStyle::ResizeLeftRight,
+        SplitAxis::Rows => CursorStyle::ResizeUpDown,
+    }
+}
 
 impl Workspace {
     /// Route external links from the painted `popup` in `window` through the workspace `cx`.
@@ -222,9 +232,9 @@ fn layer_element(
     })
 }
 
-/// Exclude `popup` from the editor's text layer without changing adjacent retained layers.
+/// Exclude `popup` from a retained `layer` while painting it in `window`.
 /// The clipped strips have separate cache scopes inside this layer.
-fn editor_text_element(
+fn layer_around_popup(
     layer: GridLayer,
     popup: Option<Bounds<Pixels>>,
     window: &Window,
@@ -235,7 +245,7 @@ fn editor_text_element(
     };
     Some(
         div()
-            .id(("inline-popup-text-underlay", layer.panel.entity_id()))
+            .id(("popup-layer-underlay", layer.panel.entity_id()))
             .absolute()
             .left_0()
             .top_0()
@@ -341,6 +351,7 @@ impl Render for Workspace {
             ))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::middle_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::right_mouse_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_exit(cx.listener(|workspace, _, _, cx| {
                 workspace.set_controls_hover(None, cx);
@@ -349,10 +360,29 @@ impl Render for Workspace {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_scroll(cx.listener(Self::scroll));
+        if let Some(PaneResize::Editor(divider, _)) = self.pane_resize {
+            root = root.cursor(divider_cursor(divider.axis));
+        } else {
+            root = root.children(self.editor_dividers().into_iter().map(|(axis, area)| {
+                let bounds = if axis == SplitAxis::Rows {
+                    stacked_divider_bounds(area, self.metrics)
+                } else {
+                    area.pixels(self.metrics)
+                };
+                div()
+                    .absolute()
+                    .left(bounds.origin.x)
+                    .top(bounds.origin.y)
+                    .w(bounds.size.width)
+                    .h(bounds.size.height)
+                    .cursor(divider_cursor(axis))
+            }));
+        }
         if self.has_canvas_button_callbacks() {
-            root = root.on_mouse_up(MouseButton::Middle, cx.listener(Self::plugin_canvas_up));
+            root = root
+                .on_mouse_up(MouseButton::Middle, cx.listener(Self::plugin_canvas_up))
+                .on_mouse_up(MouseButton::Right, cx.listener(Self::plugin_canvas_up));
             for button in [
-                MouseButton::Right,
                 MouseButton::Navigate(NavigationDirection::Back),
                 MouseButton::Navigate(NavigationDirection::Forward),
             ] {
@@ -381,22 +411,26 @@ impl Render for Workspace {
         let picker_prompt = self.file_picker_prompt_area();
         let document_results = self.document_results_area();
         let plugin_popup = self.plugin_popup_area();
+        let command_window = self.command_window_area();
+        let vim_menu = self.vim_menu_area();
         let small_modal = document_results
             .or(confirmation)
             .or(language_picker)
-            .or(picker_prompt);
-        let small_popup = if self.help.is_open() {
-            None
-        } else {
-            small_modal.or_else(|| self.sequence_hint_area())
-        };
+            .or(picker_prompt)
+            .or(command_window)
+            .or(vim_menu);
+        let sequence_hint = self.sequence_hint_area();
+        let small_popup = (!self.help.is_open())
+            .then(|| small_modal.or(sequence_hint))
+            .flatten();
         let message = if self.help.is_open() {
             None
         } else {
             self.file_picker_message_layer()
         };
         let small_popup_bounds = small_popup.map(|area| area.pixels(self.metrics));
-        let leader_bounds = small_popup_bounds.filter(|_| small_modal.is_none());
+        let leader_bounds = sequence_hint.map(|area| area.pixels(self.metrics));
+        let modal_bounds = small_popup_bounds.filter(|_| small_modal.is_some());
         let message_bounds = message.as_ref().map(|layer| layer.bounds);
         let (completion_bounds, completion) =
             self.completion_menu(window)
@@ -534,12 +568,11 @@ impl Render for Workspace {
             };
             if small_popup_bounds.is_some() || message_bounds.is_some() {
                 let viewport = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
-                let popup_cuts = leader_bounds.map_or_else(
-                    || small_popup_bounds.into_iter().collect(),
-                    |popup| self.leader_cutouts(popup, start_layout),
-                );
-                let regions =
-                    visible_regions(viewport, popup_cuts.into_iter().chain(message_bounds));
+                let popup_cuts = leader_bounds
+                    .into_iter()
+                    .flat_map(|popup| self.leader_cutouts(popup, start_layout))
+                    .chain(modal_bounds);
+                let regions = visible_regions(viewport, popup_cuts.chain(message_bounds));
                 // Give each clip its own cached-view scope for the shared panels and cursor.
                 for (index, region) in regions.into_iter().enumerate() {
                     let visible = layers
@@ -558,7 +591,7 @@ impl Render for Workspace {
                                 clip: Some(clip),
                             };
                             if self.is_editor_text_panel(&layer.panel) {
-                                editor_text_element(layer, inline_popup_bounds, window)
+                                layer_around_popup(layer, inline_popup_bounds, window)
                             } else {
                                 layer_element(layer, window)
                             }
@@ -590,8 +623,9 @@ impl Render for Workspace {
                 }
                 if let Some(message) = message {
                     // An interactive popup can cover part of the message while the timer runs.
-                    let cuts = small_popup_bounds
+                    let cuts = modal_bounds
                         .into_iter()
+                        .chain(leader_bounds)
                         .chain(inline_popup_bounds)
                         .chain(leader_bounds.into_iter().flat_map(|popup| {
                             border_gaps(message.bounds, popup, self.metrics, self.metrics)
@@ -616,7 +650,22 @@ impl Render for Workspace {
                         );
                     }
                 }
-                if let Some(area) = small_popup.filter(|_| document_results.is_none()) {
+                if let Some((menu, area)) = self.vim_menu.as_ref().zip(vim_menu) {
+                    root = root.children(
+                        menu.layers(area, self.metrics)
+                            .into_iter()
+                            .filter_map(|layer| layer_element(layer, window)),
+                    );
+                } else if let Some((history, area)) =
+                    self.command_window.as_ref().zip(command_window)
+                {
+                    root = root.children(
+                        history
+                            .layers(area, self.metrics)
+                            .into_iter()
+                            .filter_map(|layer| layer_around_popup(layer, leader_bounds, window)),
+                    );
+                } else if let Some(area) = small_popup.filter(|_| document_results.is_none()) {
                     if self.small_modal_open() || picker_prompt.is_some() {
                         root = root.child(
                             self.popup_panel
@@ -642,7 +691,7 @@ impl Render for Workspace {
                             .chain(preview)
                             .filter_map(|layer| {
                                 if self.is_editor_text_panel(&layer.panel) {
-                                    editor_text_element(layer, inline_popup_bounds, window)
+                                    layer_around_popup(layer, inline_popup_bounds, window)
                                 } else {
                                     layer_element(layer, window)
                                 }
@@ -667,7 +716,7 @@ impl Render for Workspace {
         root = root.child(self.tabs.element(tab_metrics, window, cx));
         root = root.children(self.plugin_element(window, cx));
         self.plugin_after_frame(window, cx);
-        if let Some(area) = small_popup.filter(|_| small_modal.is_none()) {
+        if let Some(area) = sequence_hint {
             root = root.child(self.sequence_hint_element(area, cx));
         }
         if plugin_popup.is_some()
@@ -675,17 +724,42 @@ impl Render for Workspace {
                 && (language_picker.is_some()
                     || picker_prompt.is_some()
                     || document_results.is_some()
+                    || command_window.is_some()
                     || small_popup.is_none() && message_bounds.is_none())
         {
-            root = root.child(
-                self.cursor.clone().cached(
-                    StyleRefinement::default()
-                        .absolute()
-                        .left_0()
-                        .top_0()
-                        .size_full(),
-                ),
-            );
+            let history_hint = leader_bounds.filter(|hint| {
+                command_window
+                    .is_some_and(|area| !area.pixels(self.metrics).intersect(hint).is_empty())
+            });
+            if let Some(hint) = history_hint {
+                let viewport = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
+                for (index, region) in visible_regions(viewport, [hint]).into_iter().enumerate() {
+                    root = root.child(
+                        div()
+                            .id(("history-hint-cursor", index))
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .size_full()
+                            .child(clipped_entity(
+                                self.cursor.clone(),
+                                viewport,
+                                region,
+                                window,
+                            )),
+                    );
+                }
+            } else {
+                root = root.child(
+                    self.cursor.clone().cached(
+                        StyleRefinement::default()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .size_full(),
+                    ),
+                );
+            }
         }
         root = root.children(completion);
         if let Some(popup) = hover {
@@ -742,9 +816,8 @@ impl Render for Workspace {
                     }),
             );
         }
-        if let Some(target) = self.hovered_controls
-            && target != ShellWindow::Pane(Focus::Editor)
-            && let Some(controls) = self.window_area(target).corner_controls(target.has_help())
+        if self.hovered_controls == Some(ShellWindow::ShortcutHelp)
+            && let Some(controls) = self.help_layout().corner_controls(false)
         {
             let corner_button = |bounds: Bounds<Pixels>| {
                 div()
@@ -756,40 +829,11 @@ impl Render for Workspace {
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             };
-            if let Some(help) = controls.help {
-                let id = match target {
-                    ShellWindow::Pane(Focus::Manager) => "help-files",
-                    ShellWindow::Pane(Focus::Editor) => unreachable!("editor uses its title row"),
-                    ShellWindow::FilePicker => "help-file-picker",
-                    ShellWindow::ShortcutHelp => unreachable!("help only has a close button"),
-                };
-                root = root.child(corner_button(help.pixels(self.metrics)).id(id).on_click(
-                    cx.listener(move |workspace, _, window, cx| {
-                        if workspace.hovered_controls != Some(target) {
-                            return;
-                        }
-                        match target {
-                            ShellWindow::Pane(pane) if !workspace.modal_open() => {
-                                workspace.open_shortcut_help(pane, window, cx);
-                            }
-                            ShellWindow::FilePicker => workspace.open_file_picker_help(window, cx),
-                            _ => return,
-                        }
-                        cx.stop_propagation();
-                    }),
-                ));
-            }
-            let id = match target {
-                ShellWindow::Pane(Focus::Manager) => "close-files",
-                ShellWindow::Pane(Focus::Editor) => unreachable!("editor uses its title row"),
-                ShellWindow::FilePicker => "close-file-picker",
-                ShellWindow::ShortcutHelp => "close-shortcuts",
-            };
             root = root.child(
                 corner_button(controls.close.pixels(self.metrics))
-                    .id(id)
-                    .on_click(cx.listener(move |workspace, event, window, cx| {
-                        workspace.click_close_button(target, event, window, cx);
+                    .id("close-shortcuts")
+                    .on_click(cx.listener(|workspace, event, window, cx| {
+                        workspace.click_close_button(ShellWindow::ShortcutHelp, event, window, cx);
                     }))
                     .child(
                         canvas(

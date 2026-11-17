@@ -5,12 +5,10 @@ use super::{
     motions::{Kind as MotionKind, Motion},
     register::{Contents, Kind},
 };
-use crate::{document::display_width, i18n};
+use crate::i18n;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Match the existing document's four-column tab stops when shifting lines.
-const INDENT_WIDTH: usize = 4;
 /// Limit repeated puts to the editor's file size limit.
 const PUT_LIMIT: usize = 16 * 1024 * 1024;
 
@@ -158,6 +156,9 @@ impl Vim {
             self.operate_motion(operator, Motion::new(end, MotionKind::Line), register);
         } else {
             self.operate_range(operator.key, self.line_span(row, last), true, register);
+            if operator.key == super::comments::COMMENT_OPERATOR && count == 1 {
+                self.set_cursor(self.first_nonblank(row));
+            }
         }
     }
 
@@ -169,7 +170,12 @@ impl Vim {
         linewise: bool,
         register: &mut Register,
     ) {
-        self.operated = Some(range.clone());
+        self.set_operated_range(range.clone());
+        if key == super::script::USER_OPERATOR {
+            let kind = if linewise { "line" } else { "char" };
+            self.invoke_operator(kind, vec![range], register);
+            return;
+        }
         if key == super::folds::FOLD_OPERATOR {
             self.fold_operator(range);
             return;
@@ -259,7 +265,7 @@ impl Vim {
     }
 
     /// Copy a byte `range` with its linewise register shape when requested.
-    fn copy_range(&self, range: Range<usize>, linewise: bool) -> Contents {
+    pub(super) fn copy_range(&self, range: Range<usize>, linewise: bool) -> Contents {
         let mut text = self.doc.text[range].to_owned();
         let kind = if linewise {
             if !text.ends_with('\n') {
@@ -274,6 +280,21 @@ impl Vim {
 
     /// Yank, delete, change or shift the current Visual selection.
     pub(super) fn visual_operator(&mut self, key: char, register: &mut Register) {
+        if matches!(key, 'c' | 'd') {
+            self.skip_select_restore();
+        }
+        if key == super::script::USER_OPERATOR && self.mode == Mode::VisualBlock {
+            let (rows, columns) = self.block_bounds();
+            let ranges = rows.map(|row| self.block_range(row, &columns)).collect();
+            self.invoke_operator("block", ranges, register);
+            return;
+        }
+        if key == super::script::USER_OPERATOR {
+            if let Some(range) = self.selection() {
+                self.operate_range(key, range, self.mode == Mode::VisualLine, register);
+            }
+            return;
+        }
         if self.g_visual_operator(key) {
             return;
         }
@@ -366,7 +387,11 @@ impl Vim {
         after: bool,
         indent: bool,
     ) {
-        let mut value = register.read(self.selected_register.take());
+        let name = self.selected_register.take();
+        if self.mode.is_visual() {
+            self.skip_select_restore();
+        }
+        let mut value = self.text_register(name, register);
         if value.text.len().saturating_mul(count) > PUT_LIMIT {
             self.message = i18n::text("editor.paste_too_large").into();
             return;
@@ -382,7 +407,7 @@ impl Vim {
                 .lines()
                 .find(|line| !line.trim().is_empty())
                 .map_or(0, |line| {
-                    display_width(
+                    self.doc.display_width(
                         &line[..line.len() - line.trim_start_matches([' ', '\t']).len()],
                         0,
                     )
@@ -391,7 +416,9 @@ impl Vim {
             for line in value.text.split_inclusive('\n') {
                 let content = line.trim_start_matches([' ', '\t']);
                 if !content.trim().is_empty() {
-                    let width = display_width(&line[..line.len() - content.len()], 0);
+                    let width = self
+                        .doc
+                        .display_width(&line[..line.len() - content.len()], 0);
                     let indentation =
                         width.saturating_add_signed(destination as isize - base as isize);
                     if text
@@ -454,7 +481,7 @@ impl Vim {
                     at
                 };
                 self.replace(at..at, &text, checkpoint);
-                self.operated = Some(at..at + text.len());
+                self.set_operated_range(at..at + text.len());
                 if after {
                     self.first_nonblank(
                         self.doc
@@ -475,7 +502,7 @@ impl Vim {
                 let column = self.doc.location(at).1;
                 self.put_block(&value.text, width, row, column, count, checkpoint, trim);
                 let last = row + value.text.bytes().filter(|&byte| byte == b'\n').count();
-                self.operated = Some(
+                self.set_operated_range(
                     at..self
                         .doc
                         .offset(last, column.saturating_add(width.saturating_mul(count)))
@@ -496,7 +523,7 @@ impl Vim {
                 };
                 let text = value.text.repeat(count);
                 self.replace(at..at, &text, checkpoint);
-                self.operated = Some(at..at + text.len());
+                self.set_operated_range(at..at + text.len());
                 if after {
                     at + text.len()
                 } else if text.contains('\n') {
@@ -544,7 +571,7 @@ impl Vim {
         };
         self.mode = Mode::Normal;
         self.replace(range, &text, true);
-        self.operated = Some(start..start + text.len());
+        self.set_operated_range(start..start + text.len());
         let cursor = if after {
             start + text.len()
         } else if !linewise && value.kind == Kind::Character && cursor > start {
@@ -579,7 +606,7 @@ impl Vim {
             let right_pad = if trim {
                 0
             } else {
-                width.saturating_sub(display_width(segment, column))
+                width.saturating_sub(self.doc.display_width(segment, column))
             };
             if count > 1 {
                 piece.push_str(&" ".repeat(right_pad));
@@ -616,6 +643,51 @@ impl Vim {
             false,
             register,
         );
+    }
+
+    /// Replace up to `count` graphemes with characters at matching columns in a neighboring line.
+    pub(super) fn replace_from_adjacent_row(&mut self, below: bool, count: usize) {
+        if self.mode.is_visual() {
+            self.replace_chars(if below { "\u{5}" } else { "\u{19}" }, count);
+            return;
+        }
+        let start = self.doc.cursor;
+        let row = self.doc.location(start).0;
+        let limit = self.doc.line_range(row).end;
+        let mut after = start;
+        for _ in 0..count {
+            if after == limit {
+                return;
+            }
+            after = self.doc.next(after);
+        }
+        let last = self.doc.previous(after);
+        let Some(source) = row
+            .checked_add_signed(if below { 1 } else { -1 })
+            .filter(|&row| row < self.line_count())
+        else {
+            self.set_cursor(last);
+            return;
+        };
+        let source_end = self.doc.line_range(source).end;
+        let mut end = start;
+        let mut replacement = String::new();
+        while end < after {
+            let at = self.doc.offset(source, self.doc.location(end).1);
+            if at == source_end {
+                break;
+            }
+            replacement.push_str(&self.doc.text[at..self.doc.next(at).min(source_end)]);
+            end = self.doc.next(end);
+        }
+        if end != start {
+            self.replace(start..end, &replacement, true);
+        }
+        if last < end {
+            self.set_cursor(self.doc.previous(start + replacement.len()));
+        } else {
+            self.set_cursor(last - (end - start) + replacement.len());
+        }
     }
 
     /// Replace `count` graphemes with `text`, or replace selected graphemes in Visual mode.
@@ -666,9 +738,14 @@ impl Vim {
     /// Join `count` lines, inserting a space at each boundary when needed.
     pub(super) fn join_lines(&mut self, count: usize) {
         let row = self.doc.location(self.doc.cursor).0;
-        let last = row
-            .saturating_add(count.max(2) - 1)
-            .min(self.line_count() - 1);
+        let end = row.saturating_add(count.max(2)).min(self.line_count());
+        self.join_range(row..end, false);
+    }
+
+    /// Join the supplied `rows`, preserving spaces when `literal` is true.
+    pub(super) fn join_range(&mut self, rows: Range<usize>, literal: bool) {
+        let row = rows.start;
+        let last = rows.end - 1;
         if row == last {
             return;
         }
@@ -679,9 +756,14 @@ impl Vim {
         let mut space =
             !self.doc.line(row).is_empty() && !self.doc.line(row).ends_with([' ', '\t']);
         for next in row + 1..=last {
-            let line = self.doc.line(next).trim_start_matches([' ', '\t']);
+            let line = self.doc.line(next);
+            let line = if literal {
+                line
+            } else {
+                line.trim_start_matches([' ', '\t'])
+            };
             joined_at = start + result.len();
-            if space && !line.is_empty() && !line.starts_with(')') {
+            if !literal && space && !line.is_empty() && !line.starts_with(')') {
                 result.push(' ');
             }
             result.push_str(line);
@@ -729,6 +811,7 @@ impl Vim {
             .map(|row| self.doc.line(row))
             .find(|line| !line.trim().is_empty());
         let mut edits = Vec::new();
+        let shiftwidth = self.shiftwidth();
         for row in first..=last {
             let line = self.doc.line(row);
             let content = line.trim_start_matches([' ', '\t']);
@@ -736,22 +819,22 @@ impl Vim {
             if content.is_empty() {
                 continue;
             }
-            let column = display_width(&line[..old], 0);
+            let column = self.doc.display_width(&line[..old], 0);
             let desired = match key {
-                '>' => column.saturating_add(INDENT_WIDTH),
-                '<' => column.saturating_sub(INDENT_WIDTH),
+                '>' => column.saturating_add(shiftwidth),
+                '<' => column.saturating_sub(shiftwidth),
                 _ => {
                     let last = previous.unwrap_or("");
                     let base = edits.last().map(|(_, _, col)| *col).unwrap_or_else(|| {
-                        display_width(
+                        self.doc.display_width(
                             &last[..last.len() - last.trim_start_matches([' ', '\t']).len()],
                             0,
                         )
                     });
                     let opens = last.trim_end().ends_with(['{', '(', '[']);
                     let closes = content.starts_with(['}', ')', ']']);
-                    (base + if opens { INDENT_WIDTH } else { 0 }).saturating_sub(if closes {
-                        INDENT_WIDTH
+                    (base + if opens { shiftwidth } else { 0 }).saturating_sub(if closes {
+                        shiftwidth
                     } else {
                         0
                     })
@@ -763,7 +846,7 @@ impl Vim {
         let revision = self.doc.revision;
         for (row, old, column) in edits.into_iter().rev() {
             let at = self.doc.starts[row];
-            let indent = "\t".repeat(column / INDENT_WIDTH) + &" ".repeat(column % INDENT_WIDTH);
+            let indent = self.indentation(column);
             self.replace(at..at + old, &indent, self.doc.revision == revision);
         }
         self.set_cursor(self.doc.offset(first, column));

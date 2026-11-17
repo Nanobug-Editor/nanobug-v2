@@ -2,7 +2,7 @@
 
 use super::{
     super::{Shortcut, editor, manager},
-    shortcuts,
+    HelpCommand, shortcuts,
 };
 use nanobug::{
     animation::scroll::{GridScroll, ScrollInput},
@@ -29,6 +29,8 @@ pub(in crate::grid) struct HelpList {
     manager_available: bool,
     /// Current source of shortcut rows.
     scope: Scope,
+    /// The dismissed title, if the session is down to one catalog.
+    closed_scope: Option<Scope>,
     /// Localized key labels and descriptions in filtered catalog order.
     pub(super) rows: Vec<(&'static str, &'static str)>,
     /// Selected index in the filtered rows, or zero when there are no matches.
@@ -74,6 +76,7 @@ impl HelpList {
             title,
             manager_available,
             scope: Scope::Window,
+            closed_scope: None,
             rows: Vec::new(),
             selected: 0,
             scroll: GridScroll::default(),
@@ -106,15 +109,38 @@ impl HelpList {
         self.scope
     }
 
+    /// Whether `scope` still has a title in this browsing session.
+    pub(super) fn has_scope(&self, scope: Scope) -> bool {
+        self.closed_scope != Some(scope)
+    }
+
+    /// Remove `scope` at `now` and switch to the other catalog, or close after the last title.
+    pub(super) fn close_scope(&mut self, scope: Scope, now: f64) -> HelpCommand {
+        if !self.has_scope(scope) {
+            return HelpCommand::Ignore;
+        }
+        if self.closed_scope.is_some() {
+            return HelpCommand::Close;
+        }
+
+        self.closed_scope = Some(scope);
+        let remaining = match scope {
+            Scope::Window => Scope::Global,
+            Scope::Global => Scope::Window,
+        };
+        self.select_scope(remaining, now);
+        HelpCommand::Update(ScrollInput::Advance)
+    }
+
     /// Number of rows in the filtered list.
     pub(in crate::grid) fn len(&self) -> usize {
         self.rows.len()
     }
 
-    /// Select `scope`, preserving the filter and rebuilding rows at `now` if the tab changed.
+    /// Select an open `scope`, preserving the filter and rebuilding rows at `now` if it changed.
     pub(in crate::grid) fn select_scope(&mut self, scope: Scope, now: f64) -> bool {
         self.cancel_navigation();
-        if self.scope == scope {
+        if self.scope == scope || !self.has_scope(scope) {
             return false;
         }
         self.scope = scope;

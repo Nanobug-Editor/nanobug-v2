@@ -40,6 +40,8 @@ pub(super) struct CompletionPopup {
     retained: Candidates,
     /// The selected candidate's index in the displayed order.
     selection: usize,
+    /// Start of the typed prefix for a native word, line or path completion.
+    prefix_start: Option<usize>,
     /// Dropping the popup closes the reply receivers for superseded requests.
     replies: Vec<Task<()>>,
 }
@@ -354,8 +356,15 @@ impl LanguageResults {
 impl Workspace {
     /// Return the active identifier prefix used to highlight matching menu characters.
     pub(in crate::grid::workspace) fn completion_query(&self) -> &str {
-        self.completion_target()
-            .map_or("", |(_, doc)| completion_prefix(doc))
+        self.completion_target().map_or("", |(_, doc)| {
+            self.plugins
+                .completion
+                .as_ref()
+                .filter(|popup| popup.results.matches(doc))
+                .and_then(|popup| popup.prefix_start)
+                .and_then(|start| doc.text.get(start..doc.cursor))
+                .unwrap_or_else(|| completion_prefix(doc))
+        })
     }
 
     /// Return the document and project scope only while the main editor can show completion.
@@ -399,6 +408,62 @@ impl Workspace {
         }
     }
 
+    /// Display native Insert matches ordered in `values`, replacing text from `start` to the caret.
+    /// `reverse` begins selection from the final item. `cx` invalidates the popup layer.
+    pub(in crate::grid::workspace) fn show_insert_candidates(
+        &mut self,
+        start: usize,
+        values: Vec<String>,
+        reverse: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_completion(cx);
+        let Some((scope, doc)) = self.completion_target() else {
+            return;
+        };
+        if values.is_empty() || start > doc.cursor || !doc.text.is_char_boundary(start) {
+            return;
+        }
+        let selection = if reverse { values.len() - 1 } else { 0 };
+        let completions = values
+            .into_iter()
+            .map(|text| {
+                (
+                    Completion {
+                        label: text.clone(),
+                        edit: Edit {
+                            start,
+                            end: doc.cursor,
+                            text,
+                        },
+                    },
+                    Vec::new(),
+                )
+            })
+            .collect();
+        self.plugins.completion = Some(CompletionPopup {
+            results: LanguageResults {
+                scope,
+                opening: doc.opening,
+                revision: doc.revision,
+                path: doc.path.clone(),
+                cursor: doc.cursor,
+                request: 0,
+                kind: Provider::Complete,
+                pending: 0,
+                error: None,
+                completions,
+                diagnostics: Vec::new(),
+                definitions: Vec::new(),
+            },
+            retained: Vec::new(),
+            selection,
+            prefix_start: Some(start),
+            replies: Vec::new(),
+        });
+        cx.notify();
+    }
+
     /// Debounce completion after an insertion or backspace at the prior revision and caret.
     pub(in crate::grid::workspace) fn refresh_automatic_completion(
         &mut self,
@@ -428,7 +493,10 @@ impl Workspace {
             .is_some_and(|popup| !popup.candidates().is_empty());
         let (scope, doc) = self.completion_target().expect("eligible editor");
         if let Some(current) = popup.as_mut() {
-            if !retain || !current.rebase_after_caret_edit(scope, doc, previous) {
+            if !retain
+                || current.prefix_start.is_some()
+                || !current.rebase_after_caret_edit(scope, doc, previous)
+            {
                 popup = None;
             }
         }
@@ -479,7 +547,7 @@ impl Workspace {
             && !key.modifiers.platform
             && !key.modifiers.function;
         if ctrl
-            && key.key == "e"
+            && matches!(key.key.as_str(), "e" | "z")
             && (self.plugins.completion.is_some() || self.plugins.completion_delay.is_some())
         {
             self.dismiss_completion(cx);
@@ -493,7 +561,17 @@ impl Workspace {
         };
         let accept = matches!(chord, (true, _, "y") | (false, false, "enter" | "tab"));
         if (accept || movement.is_some())
-            && let Some((_, items, selected)) = self.completion_menu(window)
+            && let Some((count, selected)) = self
+                .completion_menu(window)
+                .map(|(_, items, selected)| (items.len(), selected))
+                .or_else(|| {
+                    // Explicit native completion chords work even when the popup cannot fit.
+                    if !ctrl || self.plugins.completion.as_ref()?.prefix_start.is_none() {
+                        return None;
+                    }
+                    self.completion_items()
+                        .map(|(items, selected)| (items.len(), selected))
+                })
         {
             if accept {
                 if !event.is_held {
@@ -501,11 +579,11 @@ impl Workspace {
                 }
                 return true;
             }
-            let count = items.len() as isize;
             if let Some(movement) = movement
                 && let Some(popup) = &mut self.plugins.completion
             {
-                popup.selection = (selected as isize + movement).rem_euclid(count) as usize;
+                popup.selection =
+                    (selected as isize + movement).rem_euclid(count as isize) as usize;
                 cx.notify();
             }
             return true;
@@ -702,6 +780,7 @@ impl Workspace {
                     results,
                     retained: Vec::new(),
                     selection: 0,
+                    prefix_start: None,
                     replies: Vec::new(),
                 });
             }
@@ -963,33 +1042,16 @@ impl Workspace {
             .definitions
             .iter()
             .any(|(_, offered)| *offered == definition);
-        if current && offered {
-            let from = results.path.as_deref();
-            let destination = if from == Some(definition.path.as_path()) {
-                // The current buffer can still hold the definition after its file was removed.
-                Some(definition.path.clone())
-            } else {
-                definition
-                    .path
-                    .canonicalize()
-                    .ok()
-                    .filter(|path| path.is_file())
-            };
-            if let Some(path) = destination {
-                if from != Some(&path) {
-                    self.open(path.clone(), window, cx);
-                }
-                let project = self.projects.active_mut();
-                let buffer = project.editor.buffer();
-                let doc = &buffer.vim.doc;
-                if doc.path.as_ref() == Some(&path)
-                    && let Some(target) = definition_offset(doc, &definition)
-                {
-                    project.editor.jump_to(target);
-                    self.sync(window, cx);
-                    return;
-                }
-            }
+        if current
+            && offered
+            && self
+                .jump_to_file(&definition.path, true, |doc| {
+                    definition_offset(doc, &definition)
+                })
+                .is_ok_and(|visited| visited)
+        {
+            self.sync(window, cx);
+            return;
         }
         self.set_status(i18n::text("editor.definition_unavailable").into());
         self.sync(window, cx);
@@ -1096,6 +1158,7 @@ mod tests {
             },
             retained: Vec::new(),
             selection: 1,
+            prefix_start: None,
             replies: Vec::new(),
         };
         let previous = (doc.revision, doc.cursor);

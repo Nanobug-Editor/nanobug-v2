@@ -66,6 +66,7 @@ impl Workspace {
             .projects
             .start()
             .and_then(|page| page.picker.as_ref())
+            .filter(|picker| picker.shows_preview())
             .and_then(|picker| picker.selected_root());
         if selected
             == self
@@ -237,7 +238,7 @@ impl Workspace {
     }
 
     /// If `confirm` is true, persist the removal, then restore picker focus in `window` through `cx`.
-    fn finish_remove_recent_project(
+    pub(super) fn finish_remove_recent_project(
         &mut self,
         confirm: bool,
         window: &mut Window,
@@ -257,6 +258,34 @@ impl Workspace {
             }
         }
         self.sync(window, cx);
+    }
+
+    /// Close the recent-project pane named by a middle click, returning to the launcher after both close.
+    pub(super) fn middle_close_start_title(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(StartLayout::Projects(layout)) = self.start_layout() else {
+            return false;
+        };
+        let page = self
+            .projects
+            .start_mut()
+            .expect("picker is on a start page");
+        let picker = page.picker.as_mut().expect("visible project picker");
+        let metrics = StartPage::content_metrics(self.metrics);
+        match picker.close_title_at(layout, position, metrics, &self.spacing) {
+            ProjectPickerAction::Close => {
+                page.picker = None;
+                page.status.clear();
+            }
+            ProjectPickerAction::Update => {}
+            _ => return false,
+        }
+        self.sync(window, cx);
+        true
     }
 
     /// Apply a press to a launcher row, the project filter, or a project row in `window`.
@@ -306,13 +335,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(layout @ StartLayout::Projects(projects)) = self.start_layout() else {
+        let Some(StartLayout::Projects(projects)) = self.start_layout() else {
             return;
         };
         let (x, y) = StartPage::content_metrics(self.metrics).cell(position);
-        if !layout.area().contains(x, y) {
-            return;
-        }
         let picker = self
             .projects
             .start_mut()
@@ -326,8 +352,10 @@ impl Workspace {
                 .and_then(|result| result.as_ref().ok())
                 .map_or(0, Vec::len);
             picker.scroll_preview(offset, count, projects.preview_rows());
-        } else {
+        } else if projects.over_list(x, y) {
             picker.move_selection(offset, projects.project_rows());
+        } else {
+            return;
         }
         self.sync(window, cx);
     }

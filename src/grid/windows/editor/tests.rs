@@ -4,7 +4,151 @@ use super::{EditorWindow, input::NativeKeyResult};
 use crate::{grid::render::Rect, ui::text::TextSpacing};
 use gpui::{FontId, Keystroke, NoopTextSystem};
 use nanobug::{document::Document, vim::Mode};
-use std::{fs, sync::Arc};
+use std::{fs, path::Path, sync::Arc};
+
+/// Page keys can traverse a Markdown paragraph that spans more than one screen without newlines.
+#[test]
+fn markdown_pages_through_one_wrapped_source_line() {
+    use nanobug::animation::scroll::ScrollInput;
+
+    let text = "abcdefghij".repeat(14);
+    let mut doc = Document::new(&text);
+    doc.path = Some("long.md".into());
+    let mut editor = EditorWindow::new(doc);
+    editor.set_markdown_view_mode(super::MarkdownViewMode::Edit);
+    let area = Rect {
+        w: 16,
+        h: 8,
+        ..Rect::default()
+    };
+    let spacing = TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 9.);
+    let page_down = Keystroke::parse("pagedown").unwrap();
+    let result = editor
+        .key(&page_down, area, &spacing, Path::new("."), false)
+        .unwrap();
+    assert_eq!(result.view_top, Some(4));
+    editor.track_view(
+        area,
+        true,
+        &spacing,
+        [ScrollInput::PositionWithTail(4), ScrollInput::Reveal],
+        0.,
+    );
+    assert_eq!(editor.buffer().scroll.target(), 4);
+    assert!(editor.vim().doc.cursor > editor.text_area(area).w);
+    assert_eq!(editor.vim().doc.starts, [0]);
+    assert_eq!(editor.vim().doc.text, text);
+
+    let page_up = Keystroke::parse("pageup").unwrap();
+    assert_eq!(
+        editor
+            .key(&page_up, area, &spacing, Path::new("."), false)
+            .unwrap()
+            .view_top,
+        Some(0),
+    );
+}
+
+/// Counted screen-row motions preserve the measured column through short rows and closed folds.
+#[test]
+fn markdown_gj_gk_use_measured_rows_across_wide_text_and_folds() {
+    let source = "ab中文cdefghié\n{\ninside\n}\nafterx";
+    let mut doc = Document::new(source);
+    doc.path = Some("wrapped.md".into());
+    doc.cursor = source.find('中').unwrap();
+    doc.collapse_rows(2..4);
+    let mut editor = EditorWindow::new(doc);
+    assert!(editor.set_markdown_view_mode(super::MarkdownViewMode::Edit));
+    let area = Rect {
+        w: 12,
+        h: 7,
+        ..Rect::default()
+    };
+    let spacing = TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 9.);
+    assert_eq!(editor.text_area(area).w, 6);
+    let input = |editor: &mut EditorWindow, keys: &[&'static str], offset| {
+        for key in keys {
+            fold_test_key(editor, key, area, &spacing);
+        }
+        assert_eq!(editor.vim().doc.cursor, offset, "{keys:?}");
+    };
+
+    input(&mut editor, &["g", "j"], source.find('f').unwrap());
+    input(&mut editor, &["g", "j"], source.find('é').unwrap());
+    input(&mut editor, &["g", "up"], source.find('f').unwrap());
+    input(&mut editor, &["g", "k"], source.find('中').unwrap());
+    input(&mut editor, &["2", "g", "down"], source.find('é').unwrap());
+    input(&mut editor, &["g", "j"], source.find('{').unwrap());
+    input(&mut editor, &["g", "j"], source.find("afterx").unwrap() + 2);
+    assert!(editor.vim().doc.folded_end_row(1).is_some());
+}
+
+/// Visual, operators and both replay paths use the same screen-row endpoints as direct input.
+#[test]
+fn markdown_gj_keeps_visual_operators_and_replay_on_wrapped_rows() {
+    let mut doc = Document::new("abcdefghijklmnopqr");
+    doc.path = Some("wrapped.md".into());
+    doc.cursor = 2;
+    let mut editor = EditorWindow::new(doc);
+    assert!(editor.set_markdown_view_mode(super::MarkdownViewMode::Edit));
+    let area = Rect {
+        w: 12,
+        h: 10,
+        ..Rect::default()
+    };
+    let spacing = TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 9.);
+    let input = |editor: &mut EditorWindow, keys: &[&'static str]| {
+        for key in keys {
+            fold_test_key(editor, key, area, &spacing);
+        }
+    };
+
+    input(&mut editor, &["v", "g", "j"]);
+    assert_eq!(editor.vim().selection(), Some(2..9));
+    input(
+        &mut editor,
+        &["escape", "0", "l", "l", "q", "a", "g", "j", "q"],
+    );
+    assert_eq!(editor.vim().doc.cursor, 8);
+    input(&mut editor, &["0", "l", "l", "shift-2", "a"]);
+    assert_eq!(editor.vim().doc.cursor, 8);
+    input(&mut editor, &["0", "l", "l", "d", "g", "j"]);
+    assert_eq!(editor.vim().doc.text, "abijklmnopqr");
+    input(&mut editor, &["."]);
+    assert_eq!(editor.vim().doc.text, "abopqr");
+}
+
+/// Horizontal g motions use only the measured current or counted Markdown screen row.
+#[test]
+fn markdown_g_row_edges_and_middle_follow_measured_wrapping() {
+    let source = "abcdef  xyz uvwxyz12";
+    let mut doc = Document::new(source);
+    doc.path = Some("wrapped.md".into());
+    doc.cursor = 10;
+    let mut editor = EditorWindow::new(doc);
+    assert!(editor.set_markdown_view_mode(super::MarkdownViewMode::Edit));
+    let area = Rect {
+        w: 12,
+        h: 7,
+        ..Rect::default()
+    };
+    let spacing = TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 9.);
+    let input = |editor: &mut EditorWindow, keys: &[&'static str], offset| {
+        for key in keys {
+            fold_test_key(editor, key, area, &spacing);
+        }
+        assert_eq!(editor.vim().doc.cursor, offset, "{keys:?}");
+    };
+    input(&mut editor, &["g", "0"], 6);
+    input(&mut editor, &["g", "shift-6"], 8);
+    input(&mut editor, &["g", "m"], 9);
+    input(&mut editor, &["g", "shift-4"], 11);
+    input(&mut editor, &["g", "end"], 10);
+    input(&mut editor, &["2", "g", "shift-4"], 17);
+    input(&mut editor, &["g", "home"], 12);
+    input(&mut editor, &["d", "g", "shift-4"], 12);
+    assert_eq!(editor.vim().doc.text, "abcdef  xyz 12");
+}
 
 impl EditorWindow {
     /// Send a native `key` to a fixture with `rows` visible and optional `help` filtering.
@@ -18,8 +162,69 @@ impl EditorWindow {
                 ..Rect::default()
             },
             &spacing,
+            Path::new("."),
             help,
         )
+    }
+}
+
+/// Native Tab and Shift+Tab reach the Ex prompt while committed IME text stays intact.
+#[test]
+fn native_ex_tab_and_history_use_the_project_root() {
+    use nanobug::vim::Action;
+
+    let project = tempfile::tempdir().unwrap();
+    fs::write(project.path().join("文 甲.txt"), "").unwrap();
+    fs::write(project.path().join("文 乙.txt"), "").unwrap();
+    let spacing = TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 9.);
+    let area = Rect {
+        w: 88,
+        h: 25,
+        ..Rect::default()
+    };
+    let mut editor = EditorWindow::new(Document::new(""));
+    editor.edit(|vim, register| {
+        vim.key(":", register);
+        vim.commit_text("edit 文", register)
+    });
+    for (key, want) in [("shift-tab", "edit 文 甲.txt"), ("tab", "edit 文 乙.txt")] {
+        editor
+            .key(
+                &Keystroke::parse(key).unwrap(),
+                area,
+                &spacing,
+                project.path(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(editor.vim().command, want);
+    }
+    assert_eq!(
+        editor
+            .key(
+                &Keystroke::parse("enter").unwrap(),
+                area,
+                &spacing,
+                project.path(),
+                false
+            )
+            .unwrap()
+            .edit
+            .action,
+        Action::Open("文 乙.txt".into())
+    );
+    editor.edit(|vim, register| vim.key(":", register));
+    for (key, want) in [("up", "edit 文 乙.txt"), ("down", "")] {
+        editor
+            .key(
+                &Keystroke::parse(key).unwrap(),
+                area,
+                &spacing,
+                project.path(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(editor.vim().command, want);
     }
 }
 
@@ -73,18 +278,18 @@ fn gutter_counts_visible_steps_from_the_absolute_caret_line() {
     };
 
     let expected_gutter = |labels: [&str; 4]| {
-        let mut frame = Frame::viewport(6, 5, 0);
+        let mut frame = Frame::viewport(4, 5, 0);
         frame.set_theme_component(ThemeComponent::Gutter);
         for (row, label) in labels.into_iter().enumerate() {
-            frame.text(0, row, label, MUTED, 4);
+            frame.text(0, row, label, MUTED, 2);
         }
-        frame.right_aligned_icon(4, 1, super::view::FOLD_ARROW, 56);
-        frame.text(2, 4, "~", MUTED, 1);
+        frame.right_aligned_icon(2, 1, super::view::FOLD_ARROW, 56);
+        frame.text(1, 4, "~", MUTED, 1);
         frame
     };
 
     let (gutter, _) = editor.content_frames(context, |_| None);
-    assert!(gutter == expected_gutter(["   2", "   1", "   5", "   1"]));
+    assert!(gutter == expected_gutter([" 2", " 1", " 5", " 1"]));
 
     for key in ["2", "k"] {
         editor
@@ -93,7 +298,7 @@ fn gutter_counts_visible_steps_from_the_absolute_caret_line() {
     }
     assert_eq!(editor.vim().doc.cursor, 0);
     let (gutter, _) = editor.content_frames(context, |_| None);
-    assert!(gutter == expected_gutter(["   1", "   1", "   2", "   3"]));
+    assert!(gutter == expected_gutter([" 1", " 1", " 2", " 3"]));
 
     for key in ["2", "j"] {
         editor
@@ -102,7 +307,91 @@ fn gutter_counts_visible_steps_from_the_absolute_caret_line() {
     }
     assert_eq!(editor.vim().doc.location(editor.vim().doc.cursor).0, 4);
     let (gutter, _) = editor.content_frames(context, |_| None);
-    assert!(gutter == expected_gutter(["   2", "   1", "   5", "   1"]));
+    assert!(gutter == expected_gutter([" 2", " 1", " 5", " 1"]));
+}
+
+/// Markdown continuations keep whole graphemes and byte-based colors with one line number.
+#[test]
+fn markdown_source_wraps_retained_text_at_grapheme_boundaries() {
+    use crate::{
+        grid::{render::Frame, windows::WindowFrame},
+        ui::theme::{CURRENT, GOLD, MUTED, TEXT, ThemeComponent},
+    };
+
+    let mut doc = Document::new("abcde中\tx\nok");
+    doc.path = Some("wrapped.md".into());
+    doc.cursor = "abcde".len();
+    let mut editor = EditorWindow::new(doc);
+    assert!(editor.set_markdown_view_mode(super::MarkdownViewMode::Edit));
+    let spacing = TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 6.4);
+    let area = Rect {
+        w: 12,
+        h: 5,
+        ..Rect::default()
+    };
+    let context = WindowFrame {
+        area,
+        selected: true,
+        modal_open: false,
+        controls_hovered: false,
+        spacing: &spacing,
+    };
+    let (numbers, text) = editor.content_frames(context, |byte| (byte == 5).then_some(GOLD));
+    let body = editor.text_area(area);
+    assert_eq!(body.w, 6);
+
+    let mut expected_numbers = Frame::viewport(4, 4, 0);
+    expected_numbers.set_theme_component(ThemeComponent::Gutter);
+    expected_numbers.text(0, 0, " 1", GOLD, 2);
+    expected_numbers.tint(1, 0, 4, CURRENT);
+    expected_numbers.text(0, 2, " 1", MUTED, 2);
+    expected_numbers.text(1, 3, "~", MUTED, 1);
+    assert!(numbers == expected_numbers);
+
+    let width = body.w + super::TEXT_OVERSCAN;
+    let mut expected_text = Frame::viewport(width, 4, 0);
+    expected_text.set_theme_component(ThemeComponent::Editor);
+    expected_text.keep_whole_graphemes(body.x..body.x + body.w);
+    expected_text.viewport_line(0, spacing.cells("abcde"), 0..width, 0, |_| (TEXT, 0, false));
+    expected_text.viewport_line(
+        1,
+        spacing.cells_from("中\tx", 5, 5),
+        0..width,
+        CURRENT,
+        |byte| (if byte == 5 { GOLD } else { TEXT }, CURRENT, false),
+    );
+    expected_text.viewport_line(2, spacing.cells("ok"), 0..width, 0, |_| (TEXT, 0, false));
+    assert!(text == expected_text);
+}
+
+/// An ordinary source pane can opt into wrapping, hide digits and measure its own tabs.
+#[test]
+fn local_display_options_control_source_layout() {
+    let mut editor = EditorWindow::new(Document::new("\tabcdefghijk"));
+    let spacing = TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 6.4);
+    let area = Rect {
+        w: 14,
+        h: 5,
+        ..Rect::default()
+    };
+    let original = editor.text_area(area);
+    assert!(!editor.visual_rows(original.w, &spacing).is_wrapped());
+    editor.edit(|vim, register| {
+        vim.text(
+            ":setlocal wrap nonumber norelativenumber tabstop=8",
+            register,
+        );
+        vim.key("Enter", register)
+    });
+    let body = editor.text_area(area);
+    assert_eq!(body.w, original.w + 1);
+    assert!(editor.visual_rows(body.w, &spacing).is_wrapped());
+    editor.edit(|vim, register| vim.key("l", register));
+    assert_eq!(
+        editor.buffer().caret_span(0, "\tabc", &spacing).start,
+        8 * crate::ui::text::UNITS_PER_COLUMN
+    );
+    assert_eq!(editor.vim().doc.location(1), (0, 8));
 }
 
 /// A folded brace block retains its terminator and source syntax colors on the visible header.
@@ -239,7 +528,13 @@ fn fold_test_key(editor: &mut EditorWindow, key: &'static str, area: Rect, spaci
     use nanobug::animation::scroll::ScrollInput;
 
     editor
-        .key(&Keystroke::parse(key).unwrap(), area, spacing, false)
+        .key(
+            &Keystroke::parse(key).unwrap(),
+            area,
+            spacing,
+            Path::new("."),
+            false,
+        )
         .unwrap();
     editor.track_view(area, true, spacing, [ScrollInput::Reveal; 2], 1.);
 }
@@ -473,6 +768,30 @@ fn closing_an_inactive_buffer_preserves_the_active_draft() {
     assert_eq!(editor.vim().doc.text, "!draft");
 }
 
+/// Keep the alternate label keyed to its buffer when unrelated labels are removed or reindexed.
+#[test]
+fn alternate_buffer_follows_identity_until_its_label_closes() {
+    let mut editor = EditorWindow::new(Document::new("one"));
+    let one = editor.buffer().id;
+    let two = editor.retain_document(Document::new("two"));
+    let two = editor.buffers()[two].id;
+    let three = editor.retain_document(Document::new("three"));
+    let three = editor.buffers()[three].id;
+    assert_eq!(editor.alternate_buffer_id(), None);
+
+    assert!(editor.select_buffer(two, 0.));
+    assert!(editor.select_buffer(three, 0.));
+    assert_eq!(editor.alternate_buffer_id(), Some(two));
+    assert!(editor.remove_buffer_tab(one, 0.));
+    assert_eq!(editor.alternate_buffer_id(), Some(two));
+
+    assert!(editor.select_buffer(two, 0.));
+    assert_eq!(editor.alternate_buffer_id(), Some(three));
+    assert!(editor.remove_buffer_tab(three, 0.));
+    assert_eq!(editor.alternate_buffer_id(), None);
+    assert_eq!(editor.buffer().id, two);
+}
+
 /// Normal-mode brackets navigate retained buffers and only current diagnostic positions.
 #[test]
 fn bracket_navigation_uses_native_keys_and_current_buffer_data() {
@@ -663,26 +982,32 @@ fn native_z_scroll_places_measured_columns_and_limits_rendered_rows() {
     };
     let input = |editor: &mut EditorWindow, key: &'static str| {
         editor
-            .key(&Keystroke::parse(key).unwrap(), area, &spacing, false)
+            .key(
+                &Keystroke::parse(key).unwrap(),
+                area,
+                &spacing,
+                Path::new("."),
+                false,
+            )
             .unwrap()
     };
     input(&mut editor, "z");
     let result = input(&mut editor, "shift-l");
-    assert_eq!(result.view_left, Some(5));
+    assert_eq!(result.view_left, Some(6));
     editor.track_view(
         area,
         true,
         &spacing,
-        [ScrollInput::Reveal, ScrollInput::PositionWithTail(5)],
+        [ScrollInput::Reveal, ScrollInput::PositionWithTail(6)],
         1.,
     );
-    assert_eq!(editor.buffer().columns.target(), 5);
+    assert_eq!(editor.buffer().columns.target(), 6);
 
     input(&mut editor, "z");
     input(&mut editor, "2");
     input(&mut editor, "enter");
     assert_eq!(editor.text_area(area).h, 2);
     editor.track_view(area, true, &spacing, [ScrollInput::Reveal; 2], 2.);
-    assert_eq!(editor.buffer().columns.target(), 5);
+    assert_eq!(editor.buffer().columns.target(), 6);
     assert!(editor.body_caret(area, &spacing).4);
 }

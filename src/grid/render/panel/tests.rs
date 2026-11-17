@@ -28,7 +28,6 @@ fn keyboard_icons_use_visible_path_heights() {
 
     let svg = SvgRenderer::new(Arc::new(()));
     for (key, target_height) in [
-        (KeyIcon::SPACE, 8.),
         (KeyIcon::ESC, 9.),
         (KeyIcon::BACKSPACE, 12.),
         (KeyIcon::ENTER, 12.),

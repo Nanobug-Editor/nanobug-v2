@@ -23,7 +23,9 @@ use crate::{
     ui::keys::normal_character,
 };
 use focused::FocusedFile;
-use gpui::{AppContext, Context, Entity, KeyDownEvent, MouseDownEvent, Task, Window};
+use gpui::{
+    AppContext, ClipboardItem, Context, Entity, KeyDownEvent, MouseDownEvent, Task, Window,
+};
 use nanobug::filesystem::{FileTransfers, TransferKind};
 use nanobug::{animation::scroll::ScrollInput, i18n};
 use operations::Operation;
@@ -236,7 +238,7 @@ impl Workspace {
         };
         self.prefix = None;
         self.hovered_controls = None;
-        self.resizing = false;
+        self.pane_resize = None;
         self.wheel = 0.;
         self.file_picker = Some(PickerSession::new(mode, self.metrics, cx));
         if let Some(initial) = initial {
@@ -308,17 +310,16 @@ impl Workspace {
             .floating_prompt_area(self.file_picker_layout())
     }
 
-    /// Whether the picker can expose its border controls without interrupting an operation.
-    pub(super) fn file_picker_controls_available(&self) -> bool {
+    /// Whether opening the picker shortcuts would leave the current operation intact.
+    fn file_picker_help_available(&self) -> bool {
         self.file_picker
             .as_ref()
             .is_some_and(|session| !session.state.busy && session.state.delete.is_none())
     }
 
-    /// Open the picker shortcuts from its keyboard binding or border button.
+    /// Open the picker shortcuts from its keyboard binding.
     pub(super) fn open_file_picker_help(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.small_modal_open() || self.help.is_open() || !self.file_picker_controls_available()
-        {
+        if self.small_modal_open() || self.help.is_open() || !self.file_picker_help_available() {
             return;
         }
         self.dismiss_leader_hint(cx);
@@ -346,17 +347,11 @@ impl Workspace {
         let Some(session) = &mut self.file_picker else {
             return;
         };
-        let controls = self.hovered_controls == Some(ShellWindow::FilePicker);
         let frame = if let Some(file) = &session.focused {
             file.refresh(layout, active, &self.spacing, &session.text_panel, cx);
-            session.state.file_frame(
-                layout,
-                &file.path,
-                file.status(),
-                active,
-                controls,
-                &self.spacing,
-            )
+            session
+                .state
+                .file_frame(layout, &file.path, file.status(), active, &self.spacing)
         } else {
             session.state.reveal(layout.current.h);
             session.state.scroll_preview(0, layout.preview.h);
@@ -365,7 +360,7 @@ impl Workspace {
                     .text_panel
                     .update(cx, |panel, cx| panel.set(frame, cx));
             }
-            session.state.frame(layout, active, controls, &self.spacing)
+            session.state.frame(layout, active, &self.spacing)
         };
         session.panel.update(cx, |panel, cx| panel.set(frame, cx));
         let footer = session.footer_frame(self.layout.cols, &self.spacing);
@@ -599,7 +594,7 @@ impl Workspace {
         if session.state.prompt.is_some() {
             if (modifiers.control || modifiers.platform) && !modifiers.alt && raw == "v" {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                    self.file_picker_commit(&text, window, cx);
+                    self.file_picker_commit(&text, false, window, cx);
                 }
                 return true;
             }
@@ -869,18 +864,30 @@ impl Workspace {
         state.composition.clear();
     }
 
-    /// Commit native `text` to the current prompt and update its live matches in `window`.
+    /// Commit `text` to the preview or picker prompt and refresh `window` through `cx`.
+    /// `typed` indicates whether the preview may apply language maps and abbreviations.
     pub(super) fn file_picker_commit(
         &mut self,
         text: &str,
+        typed: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let session = self.file_picker.as_mut().expect("active picker");
         if let Some(editor) = session.focused_editor_mut() {
             editor.composition_mut().clear();
-            editor.edit(|vim, register| vim.commit_text(text, register));
-            self.sync(window, cx);
+            let before = editor.register().yank_revision();
+            let edit = editor.edit(|vim, register| {
+                if typed {
+                    vim.commit_text(text, register)
+                } else {
+                    vim.paste_text(text, register)
+                }
+            });
+            if editor.register().yank_revision() != before {
+                cx.write_to_clipboard(ClipboardItem::new_string(editor.register().text.clone()));
+            }
+            self.finish_focused_file_action(edit.action, "", [ScrollInput::Reveal; 2], window, cx);
             return;
         }
         let state = &mut session.state;
@@ -895,7 +902,12 @@ impl Workspace {
     }
 
     /// Apply or `cancel` the prompt, dispatching filesystem work only for committed edits.
-    fn finish_picker_prompt(&mut self, cancel: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn finish_picker_prompt(
+        &mut self,
+        cancel: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let state = &mut self.file_picker.as_mut().expect("active picker").state;
         if cancel && state.clear_filter() {
             self.update_picker(window, cx);

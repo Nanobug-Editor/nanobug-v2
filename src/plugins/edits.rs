@@ -20,7 +20,7 @@ pub fn read_project_text(root: &Path, path: String) -> Result<ProjectText> {
     Ok(ProjectText {
         path,
         version,
-        text: doc.text,
+        text: doc.into_text(),
     })
 }
 

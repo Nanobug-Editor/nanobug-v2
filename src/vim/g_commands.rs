@@ -1,7 +1,8 @@
 //! Buffer-local commands and motions entered after g.
 
 use super::{
-    Action, Mode, Operator, Pending, Register, Vim,
+    Action, Mode, Operator, Pending, Register, ScreenMotion, ScreenMotionResolver, Vim,
+    comments::COMMENT_OPERATOR,
     hint::{Continuation, SequenceHint},
     motions::{Kind, Motion},
 };
@@ -17,6 +18,8 @@ const OPERATORS: &[(char, &str, &str)] = &[
     ('\u{5}', "g?", "vim_g.rot13"),
     ('\u{6}', "gq", "vim_g.format"),
     ('\u{7}', "gw", "vim_g.format_keep"),
+    (COMMENT_OPERATOR, "gc", "vim_g.comment"),
+    (super::script::USER_OPERATOR, "g@", "vim_g.user_operator"),
 ];
 
 /// Resolve the accepted key following g to the pending operator identity.
@@ -68,6 +71,8 @@ pub(super) const G_CONTINUATIONS: &[Continuation] = &[
     ("?", "vim_g.rot13", true),
     ("q", "vim_g.format", true),
     ("w", "vim_g.format_keep", true),
+    ("c", "vim_g.comment", true),
+    ("@", "vim_g.user_operator", true),
     ("J", "vim_g.join", false),
     ("I", "vim_g.insert_start", false),
     ("i", "vim_g.last_insert", false),
@@ -83,13 +88,15 @@ pub(super) const G_CONTINUATIONS: &[Continuation] = &[
     (",", "vim_g.change_next", false),
     (";", "vim_g.change_previous", false),
     ("v", "vim_g.reselect", false),
+    ("V", "vim_mapping.keep_visual_exit", false),
     ("h", "vim_g.select_character", false),
     ("H", "vim_g.select_line", false),
-    ("Ctrl+h", "vim_g.select_block", false),
+    ("Ctrl+h Backspace", "vim_g.select_block", false),
     ("Q", "vim_g.ex_mode", false),
     ("a", "vim_g.codepoint", false),
     ("8", "vim_g.utf8", false),
     ("<", "vim_g.previous_message", false),
+    ("s", "vim_g.sleep", false),
     ("Ctrl+g", "vim_g.file_stats", false),
     ("f", "vim_g.open_path", false),
     ("F", "vim_g.open_path_line", false),
@@ -118,9 +125,43 @@ pub(super) struct State {
 }
 
 impl State {
+    /// Return the last Visual mode and its original anchor and caret.
+    pub(super) fn saved_visual(&self) -> Option<(Mode, usize, usize)> {
+        self.visual
+    }
+
     /// The byte position of the most recent recorded change.
     pub(super) fn last_change(&self) -> Option<usize> {
         self.changes.last().copied()
+    }
+
+    /// Clear local marks backed by change, insertion and Visual state.
+    pub(super) fn clear_mark_history(&mut self) {
+        self.changes.clear();
+        self.change_index = 0;
+        self.insertion = None;
+        self.visual = None;
+    }
+
+    /// Format this buffer's recorded change locations relative to the current index.
+    pub(super) fn ex_changes(&self, doc: &crate::document::Document) -> String {
+        use std::fmt::Write as _;
+        let mut listing = String::from("change  line  col text\n");
+        for (index, offset) in self.changes.iter().enumerate() {
+            let (line, col) = doc.location((*offset).min(doc.text.len()));
+            let cursor = if index == self.change_index { '>' } else { ' ' };
+            let distance = self.change_index.abs_diff(index);
+            let _ = writeln!(
+                listing,
+                "{cursor}{distance:>5} {:>5} {col:>4} {}",
+                line + 1,
+                doc.line(line).trim()
+            );
+        }
+        if self.change_index == self.changes.len() {
+            listing.push('>');
+        }
+        listing
     }
 
     /// Return the sorted start or `end` of the last Visual selection.
@@ -132,6 +173,23 @@ impl State {
                 anchor.min(cursor)
             }
         })
+    }
+
+    /// Move one endpoint of the saved Visual area to `cursor`.
+    pub(super) fn set_visual_mark(&mut self, end: bool, cursor: usize) {
+        let (mode, anchor, caret) = self.visual.unwrap_or((Mode::Visual, cursor, cursor));
+        let (mut first, mut last) = (anchor.min(caret), anchor.max(caret));
+        if end {
+            last = cursor;
+        } else {
+            first = cursor;
+        }
+        let (anchor, caret) = if anchor <= caret {
+            (first, last)
+        } else {
+            (last, first)
+        };
+        self.visual = Some((mode, anchor, caret));
     }
 
     /// Adjust retained positions around the old byte `range` replaced by `bytes`.
@@ -156,6 +214,8 @@ impl State {
 
 /// An extra input expected after a two-key g command.
 pub(super) enum Argument {
+    /// Await the final equals key of the Help-buffer code block command.
+    HelpCode,
     /// A mark lookup using either the line or exact position, possibly as an operator motion.
     Mark {
         /// Whether to target the first nonblank on the mark's line.
@@ -171,6 +231,11 @@ impl Argument {
     /// Show what the next argument provides after the completed g prefix.
     pub(super) fn hint(&self) -> SequenceHint {
         match self {
+            Self::HelpCode => SequenceHint {
+                prefix: "g=".into(),
+                group: "vim_g.help_group",
+                continuations: vec![("=", "vim_g.help_run", false)],
+            },
             Self::Mark { linewise, operator } => {
                 let mut prefix = String::new();
                 if let Some(operator) = operator {
@@ -184,34 +249,61 @@ impl Argument {
                 SequenceHint {
                     prefix,
                     group: "vim_g.mark_group",
-                    continuations: vec![("a–z", "vim_g.mark_argument", false)],
+                    continuations: vec![(
+                        "a–z A–Z 0–9 [ ] < > ( ) { }",
+                        "vim_g.mark_argument",
+                        false,
+                    )],
                 }
             }
             Self::Replace(_) => SequenceHint {
                 prefix: "gr".to_owned(),
                 group: "vim_g.virtual_group",
-                continuations: vec![("…", "vim_g.replace_argument", false)],
+                continuations: vec![
+                    ("…", "vim_g.replace_argument", false),
+                    ("Ctrl+k", "vim_hint.digraph_first", true),
+                    ("Ctrl+v Ctrl+q", "vim_hint.literal_key", true),
+                ],
             },
         }
     }
 }
 
 impl Vim {
-    /// Apply the `key` after g, preserving the existing gg, gd and g_ dispatch.
+    /// Retain the most recent nonempty `message` emitted by a native editor action for g<.
+    pub fn remember_host_message(&mut self, message: &str) {
+        if !message.is_empty() {
+            self.g.previous_message.clear();
+            self.g.previous_message.push_str(message);
+        }
+    }
+
+    /// Apply the `key` after g, routing display-row motion through `resolve_screen`.
     pub(super) fn g_key(
         &mut self,
         key: &str,
         operator: Option<Operator>,
         count: Option<usize>,
         register: &mut Register,
+        resolve_screen: &mut ScreenMotionResolver<'_>,
     ) -> Option<Action> {
         let n = count.unwrap_or(1);
+        if key == "c"
+            && let Some(operator) = operator
+        {
+            if let Some(range) = self.commented_lines_at_cursor() {
+                self.operate_object(operator, range, Kind::Line, register);
+            }
+            return Some(Action::None);
+        }
         if let Some(op) = g_operator(key) {
             if let Some(operator) = operator {
                 if operator.key == op {
                     self.line_operator(op, n, register);
                 }
-            } else if self.read_only {
+            } else if op == super::script::USER_OPERATOR && self.mode.is_visual() {
+                self.visual_operator(op, register);
+            } else if self.read_only && op != super::script::USER_OPERATOR {
                 return Some(self.reject_edit());
             } else if !self.g_visual_operator(op) {
                 self.pending = Some(Pending::Operator(Operator::new(op, count)));
@@ -219,6 +311,10 @@ impl Vim {
             return Some(Action::None);
         }
         match key {
+            "=" if self.help_buffer && self.mode == Mode::Normal && operator.is_none() => {
+                self.pending = Some(Pending::GArgument(Argument::HelpCode));
+                return Some(Action::None);
+            }
             "'" | "`" => {
                 self.pending = Some(Pending::GArgument(Argument::Mark {
                     linewise: key == "'",
@@ -232,9 +328,10 @@ impl Vim {
             }
             _ => {}
         }
-        if let Some(motion) = self.g_motion(key, count) {
+        if let Some(motion) = self.g_motion(key, count, resolve_screen) {
             if let Some(operator) = operator {
                 self.operate_motion(operator, motion, register);
+                self.screen_column = None;
             } else {
                 self.apply_motion(motion);
             }
@@ -252,6 +349,12 @@ impl Vim {
             return Some(self.reject_edit());
         }
         match key {
+            "Ctrl+a" | "Ctrl+x" if self.mode.is_visual() => {
+                if self.read_only {
+                    return Some(self.reject_edit());
+                }
+                self.adjust_visual_numbers(key == "Ctrl+a", n, true);
+            }
             "*" | "#" => self.search_word_with_boundaries(key == "#", n, false),
             "&" => self.repeat_substitution_all(),
             "+" | "-" => {
@@ -261,13 +364,14 @@ impl Vim {
             }
             ";" | "," => self.change_position(key == ",", n),
             "v" => self.reselect_visual(),
-            "h" | "H" | "Ctrl+h" => {
+            "V" => self.skip_select_restore(),
+            "h" | "H" | "Ctrl+h" | "Backspace" => {
                 if !self.mode.is_visual() {
                     self.anchor = self.doc.cursor;
                 }
                 self.mode = match key {
                     "H" => Mode::VisualLine,
-                    "Ctrl+h" => Mode::VisualBlock,
+                    "Ctrl+h" | "Backspace" => Mode::VisualBlock,
                     _ => Mode::Visual,
                 };
                 self.g.select = !self.read_only;
@@ -296,12 +400,12 @@ impl Vim {
             "r" => self.pending = Some(Pending::GArgument(Argument::Replace(n))),
             "a" | "8" => self.character_info(key == "8"),
             "Ctrl+g" => self.file_statistics(),
+            "s" => return Some(Action::Sleep(n as u64)),
             "<" => self.message.clone_from(&self.g.previous_message),
             "f" => return Some(self.file_at_cursor(count)),
             "F" => {
                 return Some(match self.path_under_cursor(true) {
-                    Some((path, Some(line))) => Action::OpenAt(path, line),
-                    Some((path, None)) => Action::Open(path),
+                    Some((path, line)) => Action::OpenFile(path, line.map(|line| (line - 1, 0))),
                     None => Action::None,
                 });
             }
@@ -327,33 +431,68 @@ impl Vim {
         register: &mut Register,
     ) -> Action {
         match argument {
+            Argument::HelpCode => {
+                if key == "=" {
+                    self.run_help_code(register);
+                }
+            }
             Argument::Mark { linewise, operator } => {
                 let mut chars = key.chars();
                 if let Some(name) = chars.next()
                     && chars.next().is_none()
-                    && let Some(mut motion) = self.mark_motion(name, linewise)
                 {
-                    if let Some(operator) = operator {
-                        self.operate_motion(operator, motion, register);
-                    } else {
-                        motion.jump = false;
-                        self.apply_motion(motion);
-                    }
+                    return self.command_mark(name, linewise, false, operator, register);
                 }
             }
-            Argument::Replace(count) => self.replace_virtual_characters(key, count),
+            Argument::Replace(count) if matches!(key, "Ctrl+k" | "Ctrl+v" | "Ctrl+q") => {
+                self.begin_character_argument(
+                    key,
+                    super::insert_argument::Target::Replace(count, true),
+                );
+            }
+            Argument::Replace(count) => self.replace_virtual_characters(key, count, register),
         }
         Action::None
     }
 
-    /// Resolve a display-aware g motion following its `key` and optional `count`.
-    fn g_motion(&mut self, key: &str, count: Option<usize>) -> Option<Motion> {
+    /// Resolve the motion for `key` and `count`, using `resolve_screen` for measured rows.
+    fn g_motion(
+        &mut self,
+        key: &str,
+        count: Option<usize>,
+        resolve_screen: &mut ScreenMotionResolver<'_>,
+    ) -> Option<Motion> {
         let n = count.unwrap_or(1);
         let cursor = self.doc.cursor;
         let row = self.doc.location(cursor).0;
+        let screen = match key {
+            "j" | "Down" => Some(ScreenMotion::Down),
+            "k" | "Up" => Some(ScreenMotion::Up),
+            "0" | "Home" => Some(ScreenMotion::Start),
+            "^" => Some(ScreenMotion::FirstNonblank),
+            "m" => Some(ScreenMotion::Middle),
+            "$" => Some(ScreenMotion::End),
+            "End" => Some(ScreenMotion::LastNonblank),
+            _ => None,
+        };
+        if let Some(screen) = screen
+            && let Some((end, column)) = resolve_screen(self, screen, n, self.screen_column)
+        {
+            let vertical = matches!(screen, ScreenMotion::Up | ScreenMotion::Down);
+            self.screen_column = vertical.then_some(column);
+            self.desired_column = None;
+            let kind = if matches!(screen, ScreenMotion::End | ScreenMotion::LastNonblank) {
+                Kind::Inclusive
+            } else {
+                Kind::Exclusive
+            };
+            return (!vertical || end != cursor).then_some(Motion::new(end, kind));
+        }
         let end = match key {
-            "j" | "Down" => return self.cursor_motion("j", count),
-            "k" | "Up" => return self.cursor_motion("k", count),
+            "j" | "Down" | "k" | "Up" => {
+                let down = matches!(key, "j" | "Down");
+                return self.cursor_motion(if down { "j" } else { "k" }, count);
+            }
             "e" | "E" => {
                 let big = key == "E";
                 let mut at = cursor;
@@ -544,6 +683,10 @@ impl Vim {
         if g_operator_name(operator).is_none() {
             return false;
         }
+        if operator == COMMENT_OPERATOR {
+            self.toggle_comment_lines(range);
+            return true;
+        }
         if matches!(operator, '\u{6}' | '\u{7}') {
             self.reflow_text(range, operator == '\u{7}');
             return true;
@@ -567,7 +710,7 @@ impl Vim {
             return true;
         }
         let (rows, columns) = self.block_bounds();
-        if matches!(operator, '\u{6}' | '\u{7}') {
+        if matches!(operator, COMMENT_OPERATOR | '\u{6}' | '\u{7}') {
             self.g_operator_range(operator, self.line_span(*rows.start(), *rows.end()));
         } else {
             let start = self.block_range(*rows.start(), &columns).start;
@@ -654,17 +797,8 @@ impl Vim {
         if first >= last {
             return;
         }
-        let start = self.doc.line_range(first).end;
-        let end = self.doc.line_range(last).end;
-        let mut text = String::new();
-        let mut last_join = start;
-        for row in first + 1..=last {
-            last_join = start + text.len();
-            text.push_str(self.doc.line(row));
-        }
-        self.replace(start..end, &text, true);
         self.mode = Mode::Normal;
-        self.set_cursor(last_join);
+        self.join_range(first..last + 1, true);
     }
 
     /// Display Unicode values or the UTF-8 bytes of the grapheme under the caret.
@@ -686,8 +820,12 @@ impl Vim {
         }
     }
 
-    /// Show the cursor's row, column, word, character and byte as file statistics.
+    /// Report text counts for the caret position or the current selection.
     fn file_statistics(&mut self) {
+        if self.mode.is_visual() {
+            self.selection_statistics();
+            return;
+        }
         let at = self.doc.cursor;
         let (row, col) = self.doc.location(at);
         let index = |n: usize| n.to_string();
@@ -713,6 +851,55 @@ impl Vim {
         );
     }
 
+    /// Report selected rows and text per row, with width for rectangular selections.
+    fn selection_statistics(&mut self) {
+        let first = self.doc.location(self.anchor.min(self.doc.cursor)).0;
+        let last = self.doc.location(self.anchor.max(self.doc.cursor)).0;
+        let mut words = 0;
+        let mut characters = 0;
+        let mut bytes = 0;
+        for row in first..=last {
+            let selected = self.selection_on_line(row).expect("selected row");
+            let start = selected.start.max(self.doc.starts[row]);
+            let end = selected.end.min(
+                self.doc
+                    .starts
+                    .get(row + 1)
+                    .copied()
+                    .unwrap_or(self.doc.text.len()),
+            );
+            let text = &self.doc.text[start..end];
+            words += text.split_whitespace().count();
+            characters += text.chars().count();
+            bytes += text.len();
+        }
+        let columns = if self.mode == Mode::VisualBlock {
+            i18n::format(
+                "vim_g.stats_selection_columns",
+                &[("columns", &self.block_bounds().1.len().to_string())],
+            )
+        } else {
+            String::new()
+        };
+        self.message = i18n::format(
+            "vim_g.stats_selection",
+            &[
+                ("columns", &columns),
+                ("line", &(last - first + 1).to_string()),
+                ("lines", &self.line_count().to_string()),
+                ("word", &words.to_string()),
+                (
+                    "words",
+                    &self.doc.text.split_whitespace().count().to_string(),
+                ),
+                ("character", &characters.to_string()),
+                ("characters", &self.doc.text.chars().count().to_string()),
+                ("byte", &bytes.to_string()),
+                ("bytes", &self.doc.text.len().to_string()),
+            ],
+        );
+    }
+
     /// Retain visual boundaries and cursor positions when `stroke` changes the model.
     pub(super) fn track_g_input(
         &mut self,
@@ -723,6 +910,8 @@ impl Vim {
         record_change: bool,
     ) {
         if prior_mode.is_visual() && !self.mode.is_visual() {
+            self.ex_hidden_marks.remove(&'<');
+            self.ex_hidden_marks.remove(&'>');
             self.g.visual = Some((
                 prior_mode,
                 anchor.min(self.doc.text.len()),
@@ -732,6 +921,7 @@ impl Vim {
         self.g.select &= self.mode.is_visual();
         self.g.ex_mode &= self.mode == Mode::Command;
         if record_change && revision != self.doc.revision {
+            self.ex_hidden_marks.remove(&'.');
             let changes = &mut self.g.changes;
             let boundary = |byte: usize| {
                 self.doc
@@ -796,11 +986,27 @@ impl Vim {
     /// Resolve and open the counted file name under the cursor.
     pub(super) fn file_at_cursor(&self, _count: Option<usize>) -> Action {
         self.path_under_cursor(false)
-            .map_or(Action::None, |(path, _)| Action::Open(path))
+            .map_or(Action::None, |(path, _)| Action::OpenFile(path, None))
     }
 
     /// Resolve the current file token and its one-based line when `with_line` is enabled.
     pub fn path_under_cursor(&self, with_line: bool) -> Option<(String, Option<usize>)> {
+        let (raw, line) = self.path_reference_under_cursor(with_line)?;
+        let path = self
+            .doc
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|parent| parent.join(raw));
+        let path = path.filter(|path| path.is_file()).map_or_else(
+            || raw.to_owned(),
+            |path| path.to_string_lossy().into_owned(),
+        );
+        Some((path, line))
+    }
+
+    /// Read the file token without resolving directories and, for `with_line`, its one-based line.
+    pub fn path_reference_under_cursor(&self, with_line: bool) -> Option<(&str, Option<usize>)> {
         let (raw, rest) = self.path_token(false)?;
         let (raw, embedded) = raw.rsplit_once(':').map_or((raw, None), |(path, line)| {
             if let Some(line) = line_number(line) {
@@ -817,17 +1023,7 @@ impl Vim {
                 embedded.or_else(|| line_number(rest.trim_start_matches([' ', '\t', ':', '('])))
             })
             .flatten();
-        let path = self
-            .doc
-            .path
-            .as_deref()
-            .and_then(Path::parent)
-            .map(|parent| parent.join(raw));
-        let path = path.filter(|path| path.is_file()).map_or_else(
-            || raw.to_owned(),
-            |path| path.to_string_lossy().into_owned(),
-        );
-        Some((path, line))
+        Some((raw, line))
     }
 
     /// Resolve a URL or file path for the native system handler.
@@ -960,11 +1156,11 @@ mod tests {
         vim.set_cursor(5);
         assert_eq!(
             vim.text("gf", &mut register),
-            Action::Open("src/main.rs".into())
+            Action::OpenFile("src/main.rs".into(), None)
         );
         assert_eq!(
             vim.text("gF", &mut register),
-            Action::OpenAt("src/main.rs".into(), 20)
+            Action::OpenFile("src/main.rs".into(), Some((19, 0)))
         );
         vim.set_cursor(vim.doc.starts[1]);
         assert_eq!(

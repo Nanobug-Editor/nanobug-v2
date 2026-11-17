@@ -17,6 +17,7 @@ impl Workspace {
         if std::mem::take(&mut self.plugins.skip_draft_close) || !target.closes_project() {
             return false;
         }
+        self.plugins.freeze_project_windows_for_close();
         if let Some(input) = self.plugins.manager.prompt.take_if(
             |input| matches!(&input.kind, Prompt::Credential { value, .. } if !value.is_empty()),
         ) && let Prompt::Credential {
@@ -42,7 +43,7 @@ impl Workspace {
             .projects
             .active_project()
             .map(|project| project.plugin_scope);
-        if self.plugins.session.is_none() || target == CloseTarget::Tab && project.is_none() {
+        if self.plugins.session.is_none() || target.closes_selected_tab() && project.is_none() {
             return false;
         }
         self.plugins.open = true;
@@ -53,7 +54,7 @@ impl Workspace {
         self.plugins.manager.selection = 0;
         self.plugins.close_draft = Some(DraftClose {
             target,
-            project: project.filter(|_| target == CloseTarget::Tab),
+            project: project.filter(|_| target.closes_selected_tab()),
             draining: true,
             waiting: false,
             error: None,

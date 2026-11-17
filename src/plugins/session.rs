@@ -22,6 +22,7 @@ use nanobug_plugin_sdk::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ops::Range,
     path::PathBuf,
     sync::{Arc, Mutex, mpsc},
     time::Duration,
@@ -250,6 +251,12 @@ pub struct CallResult {
 
 /// User and editor events queued on the supervisor.
 pub enum Action {
+    /// Read the named node ranges of an editor-owned document through the shared syntax worker.
+    SyntaxNodes {
+        language: &'static str,
+        document: DocumentSnapshot,
+        reply: async_channel::Sender<Result<Vec<Range<usize>>, String>>,
+    },
     InspectZip(PathBuf),
     /// Remember the directory of the archive selected in the local picker and inspect it.
     InspectChosenZip(PathBuf),
@@ -361,6 +368,21 @@ pub struct Session {
 }
 
 impl Session {
+    /// Ask the shared Tree-sitter worker for the named ranges in `document`'s `language`.
+    pub fn syntax_nodes(
+        &self,
+        language: &'static str,
+        document: DocumentSnapshot,
+    ) -> anyhow::Result<async_channel::Receiver<Result<Vec<Range<usize>>, String>>> {
+        let (reply, result) = async_channel::bounded(1);
+        self.send(Action::SyntaxNodes {
+            language,
+            document,
+            reply,
+        })?;
+        Ok(result)
+    }
+
     /// Start the supervisor after the core window is drawable. The startup thread owns all I/O.
     pub fn start(options: Options) -> (Self, async_channel::Receiver<()>) {
         let (actions, requests) = mpsc::sync_channel(64);

@@ -52,35 +52,45 @@ fn native_markdown_split_scroll_syncs_by_document_content() -> Result<()> {
             app.background_executor()
                 .timer(Duration::from_millis(60))
                 .await;
-            let (first_anchor, second_anchor, line_height, source_bottom) =
-                app.update(|app| {
-                    handle.update(app, |workspace, window, cx| -> Result<_> {
-                        workspace.open(readme, window, cx);
-                        workspace.sync(window, cx);
-                        let editor = &workspace.projects.active().editor;
-                        ensure!(editor.markdown_view_mode() == Some(MarkdownViewMode::Split));
-                        let source_bottom = editor
-                            .vim()
-                            .doc
-                            .display_rows()
-                            .saturating_sub(editor.text_area(workspace.layout.editor).h);
-                        let preview = workspace
-                            .prepare_markdown_preview(window, cx)
-                            .context("split Markdown preview")?;
-                        Ok((
-                            preview
-                                .anchor_top("first-checkpoint")
-                                .context("first rendered heading")?
-                                as f32,
-                            preview
-                                .anchor_top("second-checkpoint")
-                                .context("second rendered heading")?
-                                as f32,
-                            workspace.metrics.lh,
-                            source_bottom,
-                        ))
-                    })
-                })??;
+            let (
+                first_anchor,
+                second_anchor,
+                line_height,
+                first_visual,
+                second_visual,
+                source_bottom,
+            ) = app.update(|app| {
+                handle.update(app, |workspace, window, cx| -> Result<_> {
+                    workspace.open(readme, window, cx);
+                    workspace.sync(window, cx);
+                    let editor = &workspace.projects.active().editor;
+                    ensure!(editor.markdown_view_mode() == Some(MarkdownViewMode::Split));
+                    let source = editor.text_area(workspace.active_editor_area());
+                    let rows = editor.buffer().cached_visual_rows(source.w);
+                    let first_visual = rows.first_row(first_row);
+                    let second_visual = rows.first_row(second_row);
+                    ensure!(
+                        second_visual - first_visual > second_row - first_row,
+                        "fixture should include wrapped source rows between headings"
+                    );
+                    let source_bottom = rows.len().saturating_sub(source.h);
+                    let preview = workspace
+                        .prepare_markdown_preview(window, cx)
+                        .context("split Markdown preview")?;
+                    Ok((
+                        preview
+                            .anchor_top("first-checkpoint")
+                            .context("first rendered heading")? as f32,
+                        preview
+                            .anchor_top("second-checkpoint")
+                            .context("second rendered heading")? as f32,
+                        workspace.metrics.lh,
+                        first_visual,
+                        second_visual,
+                        source_bottom,
+                    ))
+                })
+            })??;
             ensure!(
                 first_anchor < first_row as f32 * line_height * 0.5,
                 "fixture should compress a long blank area"
@@ -96,14 +106,14 @@ fn native_markdown_split_scroll_syncs_by_document_content() -> Result<()> {
                 handle,
                 app,
                 Pane::Source,
-                ScrollDelta::Lines(point(0., -(first_row as f32))),
+                ScrollDelta::Lines(point(0., -(first_visual as f32))),
             )?;
             ensure!(
                 position(handle, app)?.moving,
                 "a source wheel step should animate"
             );
             let first = settled(handle, app).await?;
-            assert_checkpoint(&first, first_row, first_anchor, line_height)?;
+            assert_checkpoint(&first, first_visual, first_anchor, line_height)?;
             if let Some(path) = std::env::var_os("NANOBUG_MARKDOWN_SCROLL_TEST_CAPTURE") {
                 let frame = app.update_window(handle.into(), |_, window, cx| {
                     window.draw(cx).clear(cx);
@@ -118,19 +128,19 @@ fn native_markdown_split_scroll_syncs_by_document_content() -> Result<()> {
                 "a preview wheel step should animate"
             );
             let second = settled(handle, app).await?;
-            assert_checkpoint(&second, second_row, second_anchor, line_height)?;
+            assert_checkpoint(&second, second_visual, second_anchor, line_height)?;
             ensure!(
                 second.caret == first.caret,
                 "preview wheel moved the source caret"
             );
             ensure!(
-                (second.caret_row as f32) < second.source,
+                second.caret_row < second_row,
                 "fixture did not scroll the caret out of view"
             );
 
             wheel_preview_to(handle, app, second.preview, first_anchor)?;
             let reversed = settled(handle, app).await?;
-            assert_checkpoint(&reversed, first_row, first_anchor, line_height)?;
+            assert_checkpoint(&reversed, first_visual, first_anchor, line_height)?;
             ensure!(reversed.caret == first.caret);
 
             wheel_preview_to(handle, app, reversed.preview, second_anchor)?;
@@ -230,13 +240,13 @@ fn native_markdown_split_scroll_syncs_by_document_content() -> Result<()> {
                     && independent.caret == preview_only.caret,
                 "preview-only scrolling changed the hidden source view"
             );
-            assert_preview_lands_smoothly(handle, app, second_row)?;
+            assert_preview_lands_smoothly(handle, app, second_visual)?;
             Ok(())
         },
     )
 }
 
-/// Step the actual split layout to a preview pixel that maps between two source rows.
+/// Step the split layout between source rows, starting from the landmark's visual `row`.
 fn assert_preview_lands_smoothly(
     handle: WindowHandle<Workspace>,
     app: &mut AsyncApp,
@@ -420,7 +430,7 @@ fn wheel_preview_to(
     )
 }
 
-/// Require `view` to show the same landmark `row` and `anchor`, allowing a small alignment margin.
+/// Check `view` for matching visual `row` and preview `anchor` using `row_height` for tolerance.
 fn assert_checkpoint(
     view: &ScrollPosition,
     row: usize,

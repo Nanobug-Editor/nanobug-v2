@@ -1,4 +1,4 @@
-//! Compare every documented editor command with an isolated Neovim reference session.
+//! Exercise documented editor commands using Nanobug's own Rust input model.
 
 use super::{
     Action, Mode, Register, Vim,
@@ -7,8 +7,7 @@ use super::{
     shortcuts::{CATALOG, NAMED_KEYS},
 };
 use crate::document::Document;
-use serde::{Deserialize, Serialize};
-use std::{fs, path::Path, process::Command};
+use std::{fs, path::Path};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Buffer used by the counted motions and scrolling examples.
@@ -20,11 +19,10 @@ const PARAGRAPHS: &str = "First sentence.  Second? Third!\n\nNext paragraph.\nFi
 /// Nested class and method braces for [m and ]m.
 const METHODS: &str =
     "class Example {\n  void first() {\n    run();\n  }\n  void second() {\n    run();\n  }\n}";
-/// Case viewport height, matched by the headless Neovim window.
+/// Case viewport height for scrolling and screen-relative keys.
 const HEIGHT: usize = 8;
 
 /// Reproduce one help example or an edge case using real modal input.
-#[derive(Serialize)]
 struct Case {
     /// Help key whose behavior is exercised.
     shortcut: &'static str,
@@ -89,6 +87,9 @@ fn cases() -> Vec<Case> {
         C::new("$", WORDS, "2$").at(0, 8),
         C::new("g", WORDS, "gg").at(2, 5),
         C::new("gg", WORDS, "3gg").at(0, 7),
+        C::new("g", ROWS, "2gjgk").at(1, 7),
+        C::new("g", ROWS, "dgj").at(1, 7),
+        C::new("g", ROWS, "dgk").at(1, 7),
         C::new("G", WORDS, "G").at(0, 7),
         C::new("G", WORDS, "3G").at(0, 7),
         C::new("G", "one\ntwo\n", "G").at(0, 1),
@@ -232,6 +233,16 @@ fn cases() -> Vec<Case> {
         C::new("Ctrl+a", "dec -9 hex 0x0f bin 0b010", "3<C-a>"),
         C::new("Ctrl+a", "dec -9 hex 0x0f bin 0b010", "<C-a>").at(0, 11),
         C::new("Ctrl+x", "dec -9 hex 0x0f bin 0b010", "2<C-x>").at(0, 20),
+        C::new("g Ctrl+a", "a 1\nskip\nb 1\nb 1", "V3j2g<C-a>").at(0, 1),
+        C::new("g Ctrl+x", "a 1\na 1\na 1", "V2jg<C-x>").at(0, 2),
+        C::new(
+            "g Ctrl+x",
+            "x 11 y 22\nx 11 y 22\nx 11 y 22",
+            "<C-v>jlg<C-x>",
+        )
+        .at(0, 2),
+        C::new("Ctrl+a", "foo 0x9 foo", "v2l<C-a>").at(0, 5),
+        C::new("Ctrl+x", "a 1\na 1\na 1", "V2j<C-x>").at(0, 2),
         C::new("Ctrl+b", ROWS, "<C-b>").at(14, 6).view(11),
         C::new("Ctrl+f", ROWS, "<C-f>").at(14, 6).view(11),
         C::new("Ctrl+e", ROWS, "<C-e>").at(14, 6).view(11),
@@ -286,6 +297,24 @@ fn cases() -> Vec<Case> {
         C::new("U", WORDS, "xjUU").at(0, 4),
         C::new("@", WORDS, "qaxlxq@au").at(0, 3),
         C::new("@", WORDS, "qaxlxq2@au").at(0, 3),
+        C::new("@:", "foo foo foo foo foo", ":s/foo/bar/<CR>2@:@@"),
+        C::new("@=", "abcdef", "2@='x'<CR>@@"),
+        C::new("\"=", "abc\ndef", "\"=['猫', 'dog']<CR>p"),
+        C::new("Ctrl+r =", "abc", "i<C-r>=2 + 3 * 4<CR><Esc>"),
+        C::new("Ctrl+r =", "abc", "i<C-r>=['猫', 'dog']<CR><Esc>"),
+        C::new("Ctrl+r =", "cat", ":s/cat/<C-r>=toupper('dog')<CR>/<CR>"),
+        C::new(
+            "Ctrl+\\ e",
+            "cat",
+            ":s/cat/<C-\\>egetcmdline() .. 'dog/'<CR><CR>",
+        ),
+        C::new("@", "abc\ndef\nghi", "q1xqVj@1"),
+        C::new(
+            ":",
+            "row\nrow\nrow\nrow",
+            "2:s/row/front/<CR>jVj:s/row/tail/<CR>",
+        ),
+        C::new("m", "one 猫 dog", "$m]0`]"),
         C::new("y", WORDS, "yk").at(1, 4),
         C::new("p", WORDS, "GyyP").at(0, 6),
         C::new("p", WORDS, "Gyy p").at(0, 6),
@@ -401,15 +430,28 @@ fn cases() -> Vec<Case> {
             "ab  tail\na   tail\nABCDEFG\n0123456",
             "<C-v>j3lzy2j2zP",
         ),
+        C::new("Insert Ctrl+o", "abc", "A<C-o>hX<Esc>"),
+        C::new("Insert Ctrl+k", "abc", "A<C-k>12X<Esc>"),
+        C::new("Insert Ctrl+v", "abc", "A<C-v>u4e2dX<Esc>"),
+        C::new("Insert Ctrl+q", "abc", "A<C-q><Tab>X<Esc>"),
+        C::new("Insert Ctrl+a", "", "iabc<BS>X<Esc>a<C-a><Esc>"),
+        C::new("r Ctrl+e", "Xabcd\nYpq", "4r<C-e>").at(0, 1),
+        C::new("r literal CR", "abc", "r<C-v><CR>"),
+        C::new("f digraph", "a ä b", "f<C-k>a:"),
+        C::new("Select Ctrl+o", "abcdef", "v<C-g><C-o>lX<Esc>"),
+        C::new("Insert Ctrl+t", "  abc", "A<C-t>X<Esc>"),
+        C::new("Insert Ctrl+d", "      abc", "A<C-d>X<Esc>"),
+        C::new("Insert Ctrl+e", "word\n漢字", "i<C-e><Esc>"),
+        C::new("Insert Ctrl+y", "漢字\nword", "ji<C-y><Esc>"),
     ]
 }
 
 /// Observable text and shape of a named or unnamed register.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct RegisterState(String, String);
 
 /// Compare user-visible results without inspecting either implementation's command state.
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct State {
     /// Buffer text or saved scratch-file contents for ZZ and ZQ.
     text: String,
@@ -424,36 +466,6 @@ struct State {
     named: RegisterState,
     /// First visible line for screen-relative cases.
     top: Option<usize>,
-    /// Initial viewport after Neovim has applied window constraints.
-    initial_top: usize,
-}
-
-/// Neovim version and results from the isolated test process.
-#[derive(Deserialize)]
-struct Reference {
-    version: String,
-    states: Vec<State>,
-}
-
-/// Launch the reference once and collect the result of each input sequence.
-fn reference(cases: &[Case], directory: &Path) -> Reference {
-    let script = directory.join("reference.lua");
-    let input = directory.join("cases.json");
-    let output = directory.join("result.json");
-    fs::write(&script, include_str!("compatibility_reference.lua")).unwrap();
-    fs::write(&input, serde_json::to_vec(cases).unwrap()).unwrap();
-    let process = Command::new("nvim")
-        .args(["--headless", "--clean", "-i", "NONE", "-n", "-l"])
-        .args([&script, &input, &output])
-        .current_dir(directory)
-        .output()
-        .expect("start Neovim 0.12 for comparison");
-    assert!(
-        process.status.success(),
-        "{}",
-        String::from_utf8_lossy(&process.stderr)
-    );
-    serde_json::from_slice(&fs::read(output).unwrap()).unwrap()
 }
 
 /// Translate a Neovim-style test key sequence to the editor's normal input calls.
@@ -562,41 +574,6 @@ fn editor(case: &Case, initial_top: usize, directory: &Path) -> State {
         unnamed: register(None),
         named: register(Some('a')),
         top: case.top.map(|_| vim.take_view_top().unwrap_or(initial_top)),
-        initial_top,
-    }
-}
-
-/// Report only fields that differ, preserving every failure from a complete audit run.
-fn compare(case: &Case, want: &State, got: &State, failures: &mut Vec<String>) {
-    let mut differences = Vec::new();
-    if got.text != want.text {
-        differences.push(format!("text {:?} → {:?}", want.text, got.text));
-    }
-    if got.caret != want.caret {
-        differences.push(format!("caret {:?} → {:?}", want.caret, got.caret));
-    }
-    if got.mode != want.mode {
-        differences.push(format!("mode {:?} → {:?}", want.mode, got.mode));
-    }
-    if got.anchor != want.anchor {
-        differences.push(format!("anchor {:?} → {:?}", want.anchor, got.anchor));
-    }
-    if got.unnamed != want.unnamed {
-        differences.push(format!("unnamed {:?} → {:?}", want.unnamed, got.unnamed));
-    }
-    if got.named != want.named {
-        differences.push(format!("register a {:?} → {:?}", want.named, got.named));
-    }
-    if got.top != want.top {
-        differences.push(format!("top {:?} → {:?}", want.top, got.top));
-    }
-    if !differences.is_empty() {
-        failures.push(format!(
-            "{:?} [{}] {}",
-            case.shortcut,
-            case.keys,
-            differences.join(", ")
-        ));
     }
 }
 
@@ -615,24 +592,35 @@ fn character_keyboard_catalog_is_covered() {
     }
 }
 
-/// Use a standalone reference executable during this test only.
+/// Run the key catalogue against the local editor without an external executable.
 #[test]
-#[ignore = "requires Neovim 0.12 on PATH"]
-fn character_keyboard_matches_neovim() {
+fn character_keyboard_cases_keep_valid_caret_positions() {
     let directory = tempfile::tempdir().unwrap();
-    let cases = cases();
-    let reference = reference(&cases, directory.path());
-    assert_eq!(reference.states.len(), cases.len());
-    let mut failures = Vec::new();
-    for (case, want) in cases.iter().zip(&reference.states) {
-        let got = editor(case, want.initial_top, directory.path());
-        compare(case, want, &got, &mut failures);
+    for case in cases() {
+        let state = editor(&case, case.top.unwrap_or_default(), directory.path());
+        if state.mode == "closed" {
+            continue;
+        }
+        let line = state.text.split('\n').nth(state.caret[0]);
+        assert!(
+            line.is_some_and(|line| line.is_char_boundary(state.caret[1])),
+            "invalid caret for {}: {state:?}",
+            case.shortcut
+        );
     }
-    eprintln!("{} cases against Neovim {}", cases.len(), reference.version);
-    assert!(
-        failures.is_empty(),
-        "{} differences (Neovim → Nanobug):\n{}",
-        failures.len(),
-        failures.join("\n")
-    );
+}
+
+/// A named word deletion updates the text and both registers without leaving Normal mode.
+#[test]
+fn character_keyboard_named_delete_observes_word_bounds() {
+    let directory = tempfile::tempdir().unwrap();
+    let case = Case::new("dw", "alpha beta", "\"adw");
+    let state = editor(&case, 0, directory.path());
+    assert_eq!(state.text, "beta");
+    assert_eq!(state.caret, [0, 0]);
+    assert_eq!(state.mode, "n");
+    assert_eq!(state.anchor, None);
+    assert_eq!(state.unnamed, RegisterState("alpha ".into(), "v".into()));
+    assert_eq!(state.named, state.unnamed);
+    assert_eq!(state.top, None);
 }

@@ -1,6 +1,6 @@
 //! Geometry and rendering shared by the three top-level plugin pages.
 
-use super::{ManagerView, Page, Prompt};
+use super::{ManagerView, ManagerWindow, Page, Prompt};
 use crate::grid::windows::plugin_surface::field;
 use crate::{
     grid::render::{
@@ -150,12 +150,19 @@ impl ListLayout {
     }
 
     /// Return the visible tab slots, measured with the same `spacing` as their labels.
-    pub(in crate::grid) fn tabs(&self, spacing: &TextSpacing) -> [Range<usize>; 3] {
+    pub(in crate::grid) fn tabs(
+        &self,
+        manager: &ManagerWindow,
+        spacing: &TextSpacing,
+    ) -> [Range<usize>; 3] {
         let local = self.list.border_title_columns(None);
         let columns = self.list.x + local.start..self.list.x + local.end;
         let mut left = columns.start;
         let separator = spacing.columns(self.tab_separator());
-        self.tab_labels(spacing).map(|text| {
+        self.tab_labels(manager, spacing).map(|text| {
+            if text.is_empty() {
+                return left..left;
+            }
             let right = (left + spacing.columns(text)).min(columns.end);
             let slot = left..right;
             left = (right + separator).min(columns.end);
@@ -173,10 +180,19 @@ impl ListLayout {
     }
 
     /// Use short tab captions when the localized full set would not fit the title rule.
-    fn tab_labels(&self, spacing: &TextSpacing) -> [&'static str; 3] {
+    fn tab_labels(&self, manager: &ManagerWindow, spacing: &TextSpacing) -> [&'static str; 3] {
         let width = self.list.border_title_columns(None).len();
         let separator = spacing.columns(self.tab_separator());
         let installed = i18n::text(LIST_TABS[0]);
+        let visible = |labels: [&'static str; 3]| {
+            std::array::from_fn(|index| {
+                if manager.list_tab_open(Page::ALL[index]) {
+                    labels[index]
+                } else {
+                    ""
+                }
+            })
+        };
         [
             LIST_TABS.map(i18n::text),
             [
@@ -187,15 +203,13 @@ impl ListLayout {
             [installed, "[2]", "[3]"],
         ]
         .into_iter()
+        .map(visible)
         .find(|labels| {
-            labels
-                .iter()
-                .map(|label| spacing.columns(label))
-                .sum::<usize>()
-                + 2 * separator
-                <= width
+            let displayed = labels.iter().filter(|label| !label.is_empty());
+            let gaps = displayed.clone().count().saturating_sub(1);
+            displayed.map(|label| spacing.columns(label)).sum::<usize>() + gaps * separator <= width
         })
-        .unwrap_or(["[1]", "[2]", "[3]"])
+        .unwrap_or_else(|| visible(["[1]", "[2]", "[3]"]))
     }
 }
 
@@ -257,14 +271,18 @@ impl ManagerView<'_> {
     pub(in crate::grid) fn draw_plugin_list(&self, frame: &mut Frame, layout: &ListLayout) {
         let manager = &self.manager;
         let spacing = self.spacing;
-        let tabs = layout.tabs(spacing);
-        let labels = layout.tab_labels(spacing);
+        let tabs = layout.tabs(manager, spacing);
+        let labels = layout.tab_labels(manager, spacing);
         frame.section_border(layout.list, MUTED, |frame, _| {
+            let mut end = None;
             for (index, (label, slot)) in labels.into_iter().zip(tabs.iter()).enumerate() {
-                if index > 0 {
+                if slot.is_empty() {
+                    continue;
+                }
+                if let Some(previous) = end {
                     frame.label(
                         layout.list.y,
-                        tabs[index - 1].end..slot.start,
+                        previous..slot.start,
                         layout.tab_separator(),
                         MUTED,
                         spacing,
@@ -281,8 +299,9 @@ impl ManagerView<'_> {
                     },
                     spacing,
                 );
+                end = Some(slot.end);
             }
-            tabs[2].end
+            end.unwrap_or(layout.list.x)
         });
 
         let header = layout.list.y + 1;
@@ -410,7 +429,18 @@ impl ManagerView<'_> {
 
         let mut text = String::new();
         let mut remaining = footer.w;
+        let visible_bindings = Page::ALL
+            .into_iter()
+            .zip(["1", "2", "3"])
+            .filter_map(|(page, key)| self.manager.list_tab_open(page).then_some(key))
+            .collect::<Vec<_>>()
+            .join("/");
         for &(action, key) in SHORTCUTS {
+            let key = if action == "plugin_manager.hint_tabs" {
+                &visible_bindings
+            } else {
+                key
+            };
             let hint = shortcut_hint(i18n::text(action), key);
             let separator = if text.is_empty() {
                 ""

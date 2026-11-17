@@ -1,5 +1,6 @@
 //! Data stored beside the editor executable.
 
+pub mod numbered_marks;
 pub mod settings;
 use anyhow::{Context, Result, ensure};
 

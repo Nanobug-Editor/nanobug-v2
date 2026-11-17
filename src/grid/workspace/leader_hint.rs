@@ -3,12 +3,15 @@
 use super::{
     Workspace,
     keyboard::{LeaderAvailability, LeaderPrefix, PendingPrefix},
-    layout::Focus,
+    layout::{FOOTER_ROWS, Focus},
 };
 use crate::{
     grid::{
         render::{Frame, LabelStyle, Metrics, Rect, key_hint_slots},
-        windows::start::{StartLayout, StartPage},
+        windows::{
+            editor::EditorWindow,
+            start::{StartLayout, StartPage},
+        },
     },
     ui::{
         icons::KeyIcon,
@@ -22,7 +25,7 @@ use gpui::{
 };
 use nanobug::{
     i18n,
-    vim::{SPELL_SUGGESTION_KEYS, SequenceHint, VIEW_CONTINUATIONS, Vim},
+    vim::{PendingMappingHint, SPELL_SUGGESTION_KEYS, SequenceHint, VIEW_CONTINUATIONS},
 };
 use std::{borrow::Cow, time::Duration};
 
@@ -31,6 +34,9 @@ const HINT_COLUMNS: usize = 34;
 
 /// Pause after an incomplete key sequence before displaying its continuations.
 const SEQUENCE_HINT_DELAY: Duration = Duration::from_millis(150);
+
+/// Localized group shared by custom key sequences in every Vim mode.
+const MAPPING_GROUP: &str = "vim_mapping.group";
 
 /// The pending prefix that owns a delayed popup.
 #[derive(PartialEq, Eq)]
@@ -59,15 +65,22 @@ enum ActiveHint<'a> {
     Leader(LeaderPrefix, LeaderAvailability),
     /// A command sequence in Explorer or a Vim editor.
     Pane(SequenceHint),
+    /// The effective mappings still reachable from a pending Vim prefix.
+    Mapping(PendingMappingHint),
     /// Spelling corrections in order of their selection keys.
     Spelling(&'a [String]),
 }
 
 impl<'a> ActiveHint<'a> {
-    /// Prefer an active correction list when `vim` is waiting for a candidate key.
-    fn for_vim(vim: &'a Vim) -> Option<Self> {
+    /// Read candidates and continuations using the focused editor's Vim state and mappings.
+    fn for_editor(editor: &'a EditorWindow) -> Option<Self> {
+        let vim = editor.vim();
         vim.spelling_suggestions()
             .map(Self::Spelling)
+            .or_else(|| {
+                vim.pending_mapping_hint(editor.register())
+                    .map(Self::Mapping)
+            })
             .or_else(|| vim.sequence_hint().map(Self::Pane))
     }
 
@@ -76,6 +89,7 @@ impl<'a> ActiveHint<'a> {
         match self {
             Self::Leader(prefix, _) => Some(HintPrefix::Leader(prefix)),
             Self::Pane(hint) => Some(HintPrefix::Pane(hint.prefix, hint.group)),
+            Self::Mapping(hint) => Some(HintPrefix::Pane(hint.prefix, MAPPING_GROUP)),
             Self::Spelling(_) => None,
         }
     }
@@ -85,7 +99,26 @@ impl<'a> ActiveHint<'a> {
         match self {
             Self::Leader(prefix, availability) => prefix.bindings(*availability).count(),
             Self::Pane(hint) => hint.continuations.len(),
+            Self::Mapping(hint) => {
+                hint.continuations.len() + usize::from(hint.timeout_replacement.is_some())
+            }
             Self::Spelling(suggestions) => suggestions.len(),
+        }
+    }
+
+    /// Show the localized group, including the typed prefix for custom mappings.
+    fn title(&self) -> Cow<'static, str> {
+        let group = match self {
+            Self::Leader(prefix, _) => prefix.group_description_key(),
+            Self::Pane(hint) => Some(hint.group),
+            Self::Mapping(hint) => {
+                return Cow::Owned(format!("{}[+{}]", hint.prefix, i18n::text(MAPPING_GROUP)));
+            }
+            Self::Spelling(_) => Some("vim_hint.spelling_group"),
+        };
+        match group {
+            Some(group) => Cow::Owned(format!("+{}", i18n::text(group))),
+            None => Cow::Borrowed(i18n::text("leader.space")),
         }
     }
 
@@ -106,6 +139,16 @@ impl<'a> ActiveHint<'a> {
                 .continuations
                 .iter()
                 .map(|&(label, caption, group)| (label, i18n::text(caption), group))
+                .collect(),
+            Self::Mapping(hint) => hint
+                .continuations
+                .iter()
+                .map(|row| (row.keys.as_str(), row.replacement.as_str(), false))
+                .chain(
+                    hint.timeout_replacement
+                        .as_deref()
+                        .map(|replacement| (i18n::text("vim_mapping.timeout"), replacement, false)),
+                )
                 .collect(),
             Self::Spelling(suggestions) => SPELL_SUGGESTION_KEYS
                 .iter()
@@ -145,20 +188,6 @@ const HINT_CONTROLS: [(HintControl, KeyIcon, &str); 2] = [
     (HintControl::Back, KeyIcon::BACKSPACE, "leader.back"),
 ];
 
-/// Format the group keys in `suffix` with separators after the Space icon.
-fn hint_title_path(suffix: &str) -> String {
-    let mut title = String::new();
-    for key in suffix.chars() {
-        title.push_str(" → ");
-        if key == '\t' {
-            title.push_str(leader_key_label("\t"));
-        } else {
-            title.push(key);
-        }
-    }
-    title
-}
-
 /// Give the leader's internal Tab token a printable label in the menu.
 fn leader_key_label(key: &str) -> &str {
     if key == "\t" { "Tab" } else { key }
@@ -167,18 +196,6 @@ fn leader_key_label(key: &str) -> &str {
 /// Resolve the active locale's captions for the leader footer.
 fn hint_captions() -> [(KeyIcon, &'static str); 2] {
     HINT_CONTROLS.map(|(_, icon, caption)| (icon, i18n::text(caption)))
-}
-
-/// Align `popup` to the `editor`'s right and bottom edges when the editor is visible.
-fn align_hint(popup: Rect, editor: Rect) -> Rect {
-    if editor.w == 0 || editor.h == 0 {
-        return popup;
-    }
-    Rect {
-        x: (editor.x + editor.w).saturating_sub(popup.w),
-        y: (editor.y + editor.h).saturating_sub(popup.h),
-        ..popup
-    }
 }
 
 impl Workspace {
@@ -200,7 +217,28 @@ impl Workspace {
 
     /// Read pending keys from the shell or the pane that currently owns keyboard input.
     fn active_sequence_hint(&self) -> Option<ActiveHint<'_>> {
-        if self.small_modal_open() || self.help.is_open() || self.plugins.owns_input() {
+        if self.help.is_open() || self.plugins.owns_input() {
+            return None;
+        }
+        if let Some(history) = &self.command_window {
+            if let Some(window_hint) = self.command_window_sequence_hint() {
+                return Some(ActiveHint::Pane(window_hint));
+            }
+            let mut hint = ActiveHint::for_editor(&history.editor)?;
+            if let ActiveHint::Pane(pane) = &mut hint
+                && pane.group == "vim_hint.record_group"
+            {
+                // The scratch editor can record macros, but cannot open nested histories.
+                pane.continuations.retain(|(_, caption, _)| {
+                    !matches!(
+                        *caption,
+                        "vim_hint.command_window" | "vim_hint.search_window"
+                    )
+                });
+            }
+            return Some(hint);
+        }
+        if self.small_modal_open() {
             return None;
         }
         if let Some(PendingPrefix::Leader(prefix)) = self.prefix {
@@ -213,15 +251,22 @@ impl Workspace {
         if let Some(PendingPrefix::Window(sequence)) = self.prefix {
             return self.window_sequence_hint(sequence).map(ActiveHint::Pane);
         }
+        if let Some(PendingPrefix::MarkdownNavigation(prefix)) = self.prefix {
+            return super::keyboard::markdown_navigation_hint(prefix).map(ActiveHint::Pane);
+        }
         if let Some(session) = &self.file_picker {
             if session.state.busy {
                 return None;
             }
-            return ActiveHint::for_vim(session.focused_editor()?.vim());
+            return ActiveHint::for_editor(session.focused_editor()?);
         }
         let project = self.projects.active_project()?;
         match project.focus {
-            Focus::Editor => ActiveHint::for_vim(project.editor.vim()),
+            Focus::Editor => self
+                .terminal_mapping_hint()
+                .map(ActiveHint::Mapping)
+                .or_else(|| self.terminal_hint().map(ActiveHint::Pane))
+                .or_else(|| ActiveHint::for_editor(&project.editor)),
             Focus::Manager => {
                 let Some(PendingPrefix::Manager(key)) = self.prefix else {
                     return None;
@@ -314,22 +359,10 @@ impl Workspace {
             ..
         } = layout.area;
         let mut frame = Frame::new(columns, height);
-        frame.border_with_title(true, false, false, |frame, slot, color| match &hint {
-            ActiveHint::Leader(prefix, _) => {
-                let icon = KeyIcon::SPACE;
-                frame.key_icon(slot.start, 0, icon, 0.);
-                let start = slot.start + icon.columns(self.metrics.cw, 0.);
-                let path = hint_title_path(prefix.suffix());
-                frame.label(0, start..slot.end, &path, color, &self.spacing)
-            }
-            ActiveHint::Pane(hint) => {
-                let group = format!("{}[+{}]", hint.prefix, i18n::text(hint.group));
-                frame.label(0, slot, &group, color, &self.spacing)
-            }
-            ActiveHint::Spelling(_) => {
-                let group = format!("z=[+{}]", i18n::text("vim_hint.spelling_group"));
-                frame.label(0, slot, &group, color, &self.spacing)
-            }
+        let title = hint.title();
+        let custom_mapping = matches!(hint, ActiveHint::Mapping(_));
+        frame.border_with_title(true, false, false, |frame, slot, color| {
+            frame.label(0, slot, &title, color, &self.spacing)
         });
         let column_width = columns / rows.len().div_ceil(layout.rows).max(1);
         for (column, bindings) in rows.chunks(layout.rows).enumerate() {
@@ -345,7 +378,9 @@ impl Workspace {
             let end = left + column_width - padding;
             for (index, &(label, description, group)) in bindings.iter().enumerate() {
                 let row = index + 1;
-                let label = if self.spacing.columns(label) > label_width {
+                let label = if custom_mapping {
+                    self.spacing.ellipsize(label, label_width)
+                } else if self.spacing.columns(label) > label_width {
                     Cow::Owned(label.replace(' ', ""))
                 } else {
                     Cow::Borrowed(label)
@@ -396,30 +431,40 @@ impl Workspace {
             .update(cx, |panel, cx| panel.set(frame, cx));
     }
 
-    /// Fit `hint` above the footer and wrap longer pane lists across columns.
+    /// Anchor `hint` at the right above the history window or status bar, wrapping longer lists.
     fn sequence_hint_layout(&self, hint: &ActiveHint<'_>) -> HintLayout {
         let pane_hint = !matches!(hint, ActiveHint::Leader(..));
-        let anchor = if pane_hint
-            && self
-                .file_picker
-                .as_ref()
-                .is_some_and(|session| session.previewing_file())
-        {
-            self.file_picker_layout().preview_editor_area()
-        } else {
-            self.active_editor_area()
-        };
+        let right = self.layout.visible_cols;
+        let bottom = self
+            .layout
+            .visible_rows
+            .min(self.layout.rows.saturating_sub(FOOTER_ROWS));
+        let bottom = self
+            .command_window_area()
+            .map_or(bottom, |history| history.y.min(bottom));
         let mut rows = hint.len().max(1);
         let mut columns = HINT_COLUMNS;
         let mut page_size = rows;
-        if pane_hint {
+        if matches!(hint, ActiveHint::Mapping(_)) {
+            // Give command text one wide column and page vertically when the list grows.
+            rows = rows.min(bottom.saturating_sub(5).max(1));
+            page_size = rows;
+            let (key_width, command_width) = hint.rows().into_iter().fold(
+                (0, 0),
+                |(key_width, command_width), (key, command, _)| {
+                    (
+                        key_width.max(self.spacing.columns(key)),
+                        command_width.max(self.spacing.columns(command)),
+                    )
+                },
+            );
+            columns = columns
+                .max(key_width + command_width + 8)
+                .max(self.spacing.columns(&hint.title()) + 5);
+        } else if pane_hint {
             // Balance the bindings when the viewport cannot fit a single column.
-            let available = self
-                .layout
-                .visible_rows
-                .min(self.layout.rows.saturating_sub(1));
-            let available = available.saturating_sub(5).max(1);
-            let max_columns = (self.layout.visible_cols / 12).max(1);
+            let available = bottom.saturating_sub(5).max(1);
+            let max_columns = (right / 12).max(1);
             let column_count = rows.div_ceil(available).min(max_columns);
             rows = rows.div_ceil(column_count).min(available);
             page_size = rows * column_count;
@@ -430,19 +475,17 @@ impl Workspace {
             } else {
                 HINT_COLUMNS
             };
-            columns = columns.min(self.layout.visible_cols.max(16));
         }
         // Leave a blank row between the bindings and the footer.
-        let mut area = align_hint(self.small_popup_area(columns, rows + 4), anchor);
-        if pane_hint {
-            area.x = area.x.min(self.layout.visible_cols.saturating_sub(area.w));
-            area.y = area
-                .y
-                .min(self.layout.visible_rows.saturating_sub(area.h))
-                .max(1);
-        }
+        let width = columns.min(right.max(16));
+        let height = rows + 4;
         HintLayout {
-            area,
+            area: Rect {
+                x: right.saturating_sub(width),
+                y: bottom.saturating_sub(height).max(1),
+                w: width,
+                h: height,
+            },
             rows,
             page_size,
         }
@@ -464,7 +507,7 @@ impl Workspace {
         true
     }
 
-    /// Position the active hint in workspace coordinates against the lower-right pane edge.
+    /// Return the active hint's bounds at the workspace's lower-right corner.
     pub(super) fn sequence_hint_area(&self) -> Option<Rect> {
         let hint = self.visible_sequence_hint()?;
         Some(self.sequence_hint_layout(&hint).area)
@@ -474,7 +517,10 @@ impl Workspace {
     pub(super) fn dismiss_sequence_hint(&mut self, cx: &mut Context<Self>) {
         self.hint_page = 0;
         self.hint_delay = HintDelay::Idle;
-        if matches!(self.prefix, Some(PendingPrefix::Leader(_))) {
+        if self.command_window.is_some() && self.active_sequence_hint().is_some() {
+            self.cancel_command_window_sequence();
+            cx.notify();
+        } else if matches!(self.prefix, Some(PendingPrefix::Leader(_))) {
             self.dismiss_leader_hint(cx);
         } else if matches!(
             self.prefix,
@@ -495,7 +541,7 @@ impl Workspace {
             cx.notify();
         } else if matches!(
             self.active_sequence_hint(),
-            Some(ActiveHint::Pane(_) | ActiveHint::Spelling(_))
+            Some(ActiveHint::Pane(_) | ActiveHint::Mapping(_) | ActiveHint::Spelling(_))
         ) {
             if let Some(session) = &mut self.file_picker {
                 if let Some(editor) = session.focused_editor_mut() {
@@ -545,9 +591,8 @@ impl Workspace {
                 ));
             }
         } else if self.projects.active_project().is_some() {
-            for pane in std::iter::once(self.layout.tree)
-                .chain(self.editor_rects().into_iter().map(|(_, area)| area))
-            {
+            let panes = self.workspace_pane_areas();
+            for &pane in &panes {
                 cuts.extend(border_gaps(pane.pixels(metrics), popup, metrics, metrics));
             }
             // The footer can start within the bottom border row, below its visible stroke.
@@ -720,40 +765,21 @@ mod tests {
     use crate::grid::render::exposed_regions;
     use gpui::px;
 
-    /// The text after the Space icon starts with a separator only in a group.
+    /// Title text contains only Space or the current localized group name.
     #[test]
-    fn hint_title_lists_each_group_key() {
-        assert_eq!(hint_title_path(""), "");
-        assert_eq!(hint_title_path("p"), " → p");
-        assert_eq!(hint_title_path("gfs"), " → g → f → s");
-    }
-
-    /// The editor anchors the popup's corner even when the popup extends over another pane.
-    #[test]
-    fn hint_uses_editor_border_coordinates() {
-        let editor = Rect {
-            x: 36,
-            y: 1,
-            w: 29,
-            h: 25,
-        };
-        let fallback = Rect {
-            x: 30,
-            y: 14,
-            w: HINT_COLUMNS,
-            h: 11,
-        };
-        let metrics = Metrics {
-            cw: 9.6,
-            lh: 22.,
-            font_size: 16.,
-            origin: point(px(5.), px(9.)),
-        };
-        let hint = align_hint(fallback, editor);
-        let delta = hint.pixels(metrics).bottom_right() - editor.pixels(metrics).bottom_right();
-        assert!(f32::from(delta.x).abs() < 0.001 && f32::from(delta.y).abs() < 0.001);
-        assert!(hint.x < editor.x);
-        assert!(align_hint(fallback, Rect { w: 0, ..editor }) == fallback);
+    fn hint_title_describes_the_current_group() {
+        let leader = ActiveHint::Leader(LeaderPrefix::ROOT, LeaderAvailability::default());
+        assert_eq!(leader.title(), i18n::text("leader.space"));
+        let vim = ActiveHint::Pane(SequenceHint {
+            prefix: "Ctrl+w 2 g".into(),
+            group: "vim_window.tabs",
+            continuations: Vec::new(),
+        });
+        assert_eq!(vim.title(), format!("+{}", i18n::text("vim_window.tabs")));
+        assert_eq!(
+            ActiveHint::Spelling(&[]).title(),
+            format!("+{}", i18n::text("vim_hint.spelling_group"))
+        );
     }
 
     /// The visible rules have equal horizontal and vertical clearance with unequal cell dimensions.

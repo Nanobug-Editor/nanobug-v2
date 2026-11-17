@@ -1,6 +1,8 @@
 //! Workspace adapter for manager input.
 
 use super::*;
+use crate::grid::windows::plugin_manager::ListTabClose;
+use gpui::{Pixels, Point};
 
 impl Workspace {
     pub(in crate::grid::workspace) fn open_plugin_manager(
@@ -10,6 +12,9 @@ impl Workspace {
     ) {
         if self.plugins.session.is_none() {
             return;
+        }
+        if !self.plugins.open {
+            self.plugins.manager.reset_list_tabs();
         }
         self.popup_backdrop.invalidate();
         self.plugins.open = true;
@@ -26,6 +31,79 @@ impl Workspace {
             self.plugins.send(Action::OpenMarketplace);
         }
         self.plugin_refresh(window, cx);
+    }
+
+    /// Close the plugin title at `position`, keeping remaining pages and the existing cancel rules.
+    pub(in crate::grid::workspace) fn middle_close_plugin_title(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.plugins.open {
+            return false;
+        }
+        let area = self.plugin_manager_area();
+        let outer_title = self
+            .plugin_panel()
+            .read(cx)
+            .title_at(area, position, self.metrics);
+        let view = self.plugin_manager_view();
+        let page = if view.uses_plugin_list_layout() {
+            let (x, row) = self.metrics.cell(position);
+            let layout = view.plugin_list_layout(area);
+            if area.contains(x, row) && row - area.y == layout.list.y {
+                layout
+                    .tabs(&self.plugins.manager, &self.spacing)
+                    .iter()
+                    .position(|columns| columns.contains(&(x - area.x)))
+                    .map(|index| Page::ALL[index])
+            } else {
+                outer_title.then_some(self.plugins.manager.page)
+            }
+        } else {
+            None
+        };
+        if page.is_none() && !outer_title {
+            return false;
+        }
+        if self.plugins.file_busy
+            || self.plugins.credential_waiting
+            || self
+                .plugins
+                .close_draft
+                .as_ref()
+                .is_some_and(|close| close.waiting)
+        {
+            return true;
+        }
+        if self.plugins.manager.prompt.is_some() {
+            self.finish_plugin_prompt(true, window, cx);
+            self.plugins.composition.clear();
+            if page.is_none() {
+                self.plugin_refresh(window, cx);
+                return true;
+            }
+        }
+        if self.plugins.manager.help {
+            self.plugins.manager.help = false;
+        } else if self.plugins.view.review.is_some() {
+            self.plugins.send(Action::CancelInstall);
+        } else if self.plugins.manager.confirm_remove.take().is_none() {
+            if let Some(page) = page.filter(|_| !self.plugins.view.installing) {
+                match self.plugins.manager.close_list_tab(page) {
+                    ListTabClose::Window => self.plugin_back(),
+                    ListTabClose::Page(Some(action)) => {
+                        self.plugins.send(action);
+                    }
+                    ListTabClose::Page(None) => {}
+                }
+            } else {
+                self.plugin_back();
+            }
+        }
+        self.plugin_refresh(window, cx);
+        true
     }
 
     /// Browse for a local archive in `window` from this profile's last ZIP directory.
@@ -162,10 +240,7 @@ impl Workspace {
                 if self.plugins.open {
                     self.finish_plugin_prompt(true, window, cx);
                 } else {
-                    self.plugins.surface.focused = false;
-                    self.plugins.surface.key = None;
-                    self.plugins.surface.viewport = None;
-                    self.end_plugin_field_drag();
+                    self.close_plugin_surface();
                 }
                 self.plugins.composition.clear();
             } else if raw == "enter" && self.plugins.composition.is_empty() {
@@ -287,8 +362,12 @@ impl Workspace {
                         self.plugins.manager.selection.saturating_sub(1)
                 }
                 ("down", _) | (_, "j") => {
-                    self.plugins.manager.selection =
-                        (self.plugins.manager.selection + 1).min(count.saturating_sub(1))
+                    self.plugins.manager.selection = self
+                        .plugins
+                        .manager
+                        .selection
+                        .saturating_add(1)
+                        .min(count.saturating_sub(1))
                 }
                 ("home", _) => self.plugins.manager.selection = 0,
                 ("end", _) => self.plugins.manager.selection = count.saturating_sub(1),
@@ -476,7 +555,7 @@ impl Workspace {
         let entries = if let Some(layout) = layout {
             if row == layout.list.y {
                 if let Some(tab) = layout
-                    .tabs(&self.spacing)
+                    .tabs(&self.plugins.manager, &self.spacing)
                     .iter()
                     .position(|slot| slot.contains(&x))
                 {
@@ -531,7 +610,9 @@ impl Workspace {
             return;
         }
         if self.plugins.close_draft.take().is_some() {
+            self.forced_editor_close = None;
             self.plugins.open = false;
+            self.plugins.resume_project_windows_after_close();
             return;
         }
         let manager = &mut self.plugins.manager;
@@ -624,17 +705,9 @@ impl Workspace {
                     return;
                 };
                 self.plugins.open = false;
-                self.plugins.surface.focused = surface.frame.input.is_some()
-                    || surface
-                        .frame
-                        .canvas
-                        .as_ref()
-                        .is_some_and(|canvas| canvas.has_input());
-                self.plugins.surface.draft.clone_from(&surface.draft);
-                self.plugins.surface.field = field::Field::default();
-                self.plugins.surface.key = Some(key);
-                self.plugins.surface.pending_draft = None;
-                self.plugins.surface.viewport = None;
+                self.plugins.pending_project_surface = None;
+                self.plugins.surface.attach(key, surface, true);
+                self.plugins.interaction = Default::default();
             }
             Target::Scope => {
                 if self.plugins.active.is_some() {

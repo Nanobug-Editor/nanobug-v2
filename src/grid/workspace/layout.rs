@@ -1,7 +1,7 @@
 //! Pane focus, cell rectangles, popup placement and close button geometry.
 
 use super::Workspace;
-use crate::grid::render::{Metrics, Rect};
+use crate::grid::render::{Metrics, Rect, solid_stroke_width};
 use gpui::{Bounds, Pixels, Point, Window, point, px};
 use std::ops::Range;
 
@@ -9,30 +9,26 @@ use std::ops::Range;
 const CORNER_HOVER_SLOP: f32 = 3.;
 /// Matching outer insets above the project tabs and below the status bar, in logical pixels.
 pub(super) const OUTER_INSET_Y: f32 = 5.;
-/// Extra separation between the project tabs and the panes, in logical pixels.
-pub(super) const TAB_GAP_Y: f32 = 4.;
+/// Minimum space from either workspace bar to the pane grid, in logical pixels.
+pub(super) const PANE_GAP_Y: f32 = 4.;
 /// The workspace's shared status and command row.
 pub(super) const FOOTER_ROWS: usize = 1;
-/// Minimum clearance from the panes' bottom rule to the visible status badges, in logical pixels.
-const FOOTER_GAP_Y: f32 = 4.;
 /// Space above and below the status badge fills within the row, in logical pixels.
-pub(super) const FOOTER_BADGE_INSET_Y: f32 = 3.;
+pub(super) const FOOTER_BADGE_INSET_Y: f32 = 1.5;
 /// Horizontal padding inside each status badge, in columns.
 pub(super) const FOOTER_CHIP_PAD: usize = 1;
 /// Space between status groups, in columns.
 pub(super) const FOOTER_LABEL_GAP: usize = 2;
 /// Encoding displayed for the active document.
 pub(super) const FOOTER_ENCODING: &str = "UTF-8";
-/// Space between the encoding and the percentage label.
-pub(super) const FOOTER_ENCODING_GAP: &str = "  ";
 /// Decimal columns reserved before the percent sign.
 pub(super) const FOOTER_PROGRESS_DIGITS: usize = 3;
 /// Decimal columns reserved for the line number.
 pub(super) const FOOTER_LINE_DIGITS: usize = 4;
 /// Decimal columns reserved for the column number.
 pub(super) const FOOTER_COLUMN_DIGITS: usize = 3;
-/// Total width of the position badge, including its left tip and padding.
-const FOOTER_POSITION_WIDTH: usize = 12;
+/// Margin on each side of the position label, including the chevron at the left.
+const FOOTER_POSITION_PADDING: usize = 2;
 
 /// Pane that owns input when shortcut help is closed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -64,7 +60,7 @@ fn split_sizes(available: usize, manager: usize, minimum: (usize, usize)) -> (us
 
 /// Position Explorer and the editor inside `area`. `stacked` chooses the split axis,
 /// `editor_first` chooses the order, and the preferred sizes apply to Explorer on each axis.
-fn split_panes(
+pub(super) fn split_panes(
     area: Rect,
     stacked: bool,
     editor_first: bool,
@@ -72,9 +68,13 @@ fn split_panes(
     manager_height: Option<usize>,
 ) -> (Rect, Rect) {
     let (manager, editor) = if stacked {
-        let available = area.h - 1;
-        let (manager, editor) =
-            split_sizes(available, manager_height.unwrap_or(available / 2), (4, 4));
+        let available = area.h;
+        let minimum = (available / 2).min(4);
+        let (manager, editor) = split_sizes(
+            available,
+            manager_height.unwrap_or(available / 2),
+            (minimum, minimum),
+        );
         (Rect { h: manager, ..area }, Rect { h: editor, ..area })
     } else {
         let (manager, editor) = split_sizes(area.w - 1, sidebar, (16, 29));
@@ -86,7 +86,7 @@ fn split_panes(
         (manager, editor)
     };
     if stacked {
-        second.y += first.h + 1;
+        second.y += first.h;
     } else {
         second.x += first.w + 1;
     }
@@ -109,11 +109,6 @@ pub(super) enum ShellWindow {
 }
 
 impl ShellWindow {
-    /// Whether this window has a shortcut catalog beside its close control.
-    pub(super) fn has_help(self) -> bool {
-        matches!(self, Self::Pane(_) | Self::FilePicker)
-    }
-
     /// Check the sole selected window, prioritizing open help over the remembered `pane`.
     pub(super) fn is_selected(self, pane: Focus, help_open: bool) -> bool {
         let selected = if help_open {
@@ -125,7 +120,7 @@ impl ShellWindow {
     }
 }
 
-/// Derived workspace layout, including the footer's pixel alignment.
+/// Derived workspace layout, including the vertical alignment of the panes and footer.
 #[derive(Clone, Copy, Default, PartialEq)]
 pub(super) struct Layout {
     /// Total grid columns.
@@ -136,45 +131,136 @@ pub(super) struct Layout {
     pub(super) visible_cols: usize,
     /// Whole rows that fit below the native client area's grid origin.
     pub(super) visible_rows: usize,
-    /// Signed offset from the grid footer row that aligns the visible badges with the top inset.
-    pub(super) footer_offset: Pixels,
+    /// Window-local y coordinate of grid row zero, with the panes centered below it.
+    grid_origin_y: Pixels,
+    /// Window-local y coordinate of the footer text row.
+    footer_top: Pixels,
     /// Manager viewport, excluding global chrome.
     pub(super) tree: Rect,
     /// Editing viewport, excluding global chrome.
     pub(super) editor: Rect,
 }
 
+impl Layout {
+    /// Full pane allocation between the workspace header and footer.
+    pub(super) fn pane_area(self) -> Rect {
+        Rect {
+            x: 0,
+            y: 1,
+            w: self.cols,
+            h: self.rows.saturating_sub(1 + FOOTER_ROWS),
+        }
+    }
+
+    /// Clip a rectangle to whole cells within the native viewport.
+    pub(super) fn visible_region(self, area: Rect) -> Rect {
+        Rect {
+            w: area.w.min(self.visible_cols.saturating_sub(area.x)),
+            h: area.h.min(self.visible_rows.saturating_sub(area.y)),
+            ..area
+        }
+    }
+}
+
 /// Nonoverlapping text slots in the footer, shared with command caret measurement.
 pub(super) struct FooterSlots {
     /// Mode, operation feedback, or command input.
     pub(super) left: Range<usize>,
-    /// Encoding and line progress, inset within their shared badge.
+    /// Encoding label, inset within its badge.
     pub(super) details: Range<usize>,
     /// Column occupied by the leading tip of the details badge.
     pub(super) details_tip: usize,
-    /// Line and column label, inset within its badge.
+    /// Progress and line:column label, inset within their shared badge.
     pub(super) position: Range<usize>,
     /// Column occupied by the position tip on top of the details badge.
     pub(super) position_tip: usize,
 }
 
-/// Fit rows into `height` using `line_height`, returning the footer's offset from its grid row.
-fn footer_geometry(height: Pixels, line_height: f32) -> (usize, Pixels) {
-    let grid_height = f32::from(height) - OUTER_INSET_Y * 2. + FOOTER_BADGE_INSET_Y;
-    // The rule sits halfway up its final row, and the badges begin below the footer row's top.
-    let border_slack = line_height * 0.5 - TAB_GAP_Y - FOOTER_GAP_Y + FOOTER_BADGE_INSET_Y;
-    let rows = ((grid_height + border_slack) / line_height)
-        .floor()
-        .max(16.) as usize;
-    let offset = (grid_height - rows as f32 * line_height).max(-border_slack) - TAB_GAP_Y;
-    (rows, px(offset))
+/// Fit whole pane rows of `line_height` within the window's `height`.
+/// Return the total row count and the window-local origins of the grid and footer.
+fn vertical_geometry(height: Pixels, line_height: f32) -> (usize, Pixels, Pixels) {
+    let tab_bottom = OUTER_INSET_Y + line_height;
+    let footer_top = f32::from(height) - OUTER_INSET_Y - line_height + FOOTER_BADGE_INSET_Y;
+    let span = footer_top + FOOTER_BADGE_INSET_Y - tab_bottom;
+    // Reserve room for the picker contents even during transient, undersized viewports.
+    let pane_rows = ((span - 2. * PANE_GAP_Y) / line_height).floor().max(6.) as usize;
+    let gap = ((span - pane_rows as f32 * line_height) * 0.5).max(PANE_GAP_Y);
+    let grid_origin_y = tab_bottom + gap - line_height;
+    (
+        1 + pane_rows + FOOTER_ROWS,
+        px(grid_origin_y),
+        px(footer_top),
+    )
+}
+
+/// Distances from a stacked seam to the top and bottom path centerlines.
+/// The title edge gets half a stroke less, and the lower edge gets the same amount more.
+fn stacked_path_insets(metrics: Metrics) -> (Pixels, Pixels) {
+    let column = px(metrics.cw);
+    let half_stroke = solid_stroke_width(metrics.font_size) * 0.5;
+    (column - half_stroke, column + half_stroke)
+}
+
+/// Return signed vertical shifts of `area`'s paths at stacked seams and the exterior bottom.
+pub(super) fn pane_border_offsets(
+    area: Rect,
+    panes: &[Rect],
+    metrics: Metrics,
+) -> (Pixels, Pixels) {
+    if area.w == 0 || area.h == 0 {
+        return (px(0.), px(0.));
+    }
+    // Mirror the upper edge of the centered title icon with the outer edge of the bottom stroke.
+    let title_height = px(metrics.font_size.min(metrics.lh));
+    let outer_bottom = (title_height - solid_stroke_width(metrics.font_size)) * 0.5;
+    let mut offsets = (px(0.), outer_bottom);
+    let (top, bottom) = stacked_path_insets(metrics);
+    let half_row = px(metrics.lh * 0.5);
+    for neighbor in panes.iter().filter(|neighbor| {
+        neighbor.w > 0
+            && neighbor.h > 0
+            && neighbor.x < area.x + area.w
+            && area.x < neighbor.x + neighbor.w
+    }) {
+        if neighbor.y + neighbor.h == area.y {
+            offsets.0 = top - half_row;
+        }
+        if area.y + area.h == neighbor.y {
+            offsets.1 = half_row - bottom;
+        }
+    }
+    offsets
+}
+
+/// Convert a logical stacked divider `seam` to the blank area between its two painted paths.
+pub(super) fn stacked_divider_bounds(seam: Rect, metrics: Metrics) -> Bounds<Pixels> {
+    let bounds = seam.pixels(metrics);
+    let (top, bottom) = stacked_path_insets(metrics);
+    let half_stroke = solid_stroke_width(metrics.font_size) * 0.5;
+    Bounds::from_corners(
+        point(bounds.left(), bounds.top() - bottom + half_stroke),
+        point(bounds.right(), bounds.top() + top - half_stroke),
+    )
 }
 
 impl Workspace {
+    /// The currently visible docked windows used to find shared exterior edges.
+    pub(super) fn workspace_pane_areas(&self) -> Vec<Rect> {
+        std::iter::once(self.layout.tree)
+            .chain(self.editor_rects().into_iter().map(|(_, area)| area))
+            .collect()
+    }
+
     /// Bottom edge of the Windows caption strip, including the gap below the project tabs.
     #[cfg(windows)]
     pub(super) fn native_caption_height(&self) -> Pixels {
-        self.metrics.at(0., 1.).y
+        self.tab_metrics().at(0., 1.).y + px(PANE_GAP_Y)
+    }
+
+    /// Apply `window`'s layout and its shared pane origin for painting and input.
+    pub(super) fn update_layout(&mut self, window: &Window) {
+        self.layout = self.derive_layout(window);
+        self.metrics.origin.y = self.layout.grid_origin_y;
     }
 
     /// Resolve `window` dimensions and the active project's split to the pane rectangles.
@@ -183,68 +269,35 @@ impl Workspace {
         let visible_cols = ((f32::from(size.width) - 2. * f32::from(self.metrics.origin.x))
             / self.metrics.cw)
             .floor() as usize;
-        let visible_rows = ((f32::from(size.height) - f32::from(self.metrics.origin.y))
-            / self.metrics.lh)
-            .floor() as usize;
+        let (rows, grid_origin_y, footer_top) = vertical_geometry(size.height, self.metrics.lh);
+        let visible_rows =
+            (f32::from(size.height - grid_origin_y) / self.metrics.lh).floor() as usize;
         let cols = visible_cols.max(60);
-        let (rows, footer_offset) = footer_geometry(size.height, self.metrics.lh);
-        let Some(project) = self.projects.active_project() else {
-            return Layout {
-                cols,
-                rows,
-                visible_cols,
-                visible_rows,
-                footer_offset,
-                ..Layout::default()
-            };
-        };
-        let pane_height = rows - 1 - FOOTER_ROWS;
-        let area = Rect {
-            x: 0,
-            y: 1,
-            w: cols,
-            h: pane_height,
-        };
-        let (tree, editor) = match (&project.manager, project.hidden_pane) {
-            (None, _) | (_, Some(Focus::Manager)) => (Rect { w: 0, ..area }, area),
-            (_, Some(Focus::Editor)) => (
-                area,
-                Rect {
-                    x: cols,
-                    w: 0,
-                    ..area
-                },
-            ),
-            (Some(_), None) => split_panes(
-                area,
-                project.stacked,
-                project.editor_first,
-                project.sidebar,
-                project.manager_height,
-            ),
-        };
-        Layout {
+        let mut layout = Layout {
             cols,
             rows,
             visible_cols,
             visible_rows,
-            footer_offset,
-            tree,
-            editor,
+            grid_origin_y,
+            footer_top,
+            ..Layout::default()
+        };
+        if let Some(project) = self.projects.active_project() {
+            (layout.tree, layout.editor) =
+                project.pane_regions_for_tabpage(project.active_page(), layout);
         }
+        layout
     }
 
     /// Reserve fixed-width status badges and their tips, leaving the left side for input.
     pub(super) fn footer_slots(&self) -> FooterSlots {
-        let position_width = FOOTER_LINE_DIGITS + 1 + FOOTER_COLUMN_DIGITS;
-        let position_padding = (FOOTER_POSITION_WIDTH - position_width) / 2;
-        let details_width =
-            FOOTER_ENCODING.len() + FOOTER_ENCODING_GAP.len() + FOOTER_PROGRESS_DIGITS + 1;
-        let position_end = self.layout.cols.saturating_sub(position_padding);
+        // Reserve one column each for the percent sign, separating space, and colon.
+        let position_width = FOOTER_PROGRESS_DIGITS + FOOTER_LINE_DIGITS + FOOTER_COLUMN_DIGITS + 3;
+        let position_end = self.layout.cols.saturating_sub(FOOTER_POSITION_PADDING);
         let position_start = position_end.saturating_sub(position_width);
-        let position_tip = self.layout.cols.saturating_sub(FOOTER_POSITION_WIDTH);
+        let position_tip = position_start.saturating_sub(FOOTER_POSITION_PADDING);
         let details_end = position_tip.saturating_sub(FOOTER_CHIP_PAD);
-        let details_start = details_end.saturating_sub(details_width);
+        let details_start = details_end.saturating_sub(FOOTER_ENCODING.len());
         let details_tip = details_start.saturating_sub(FOOTER_CHIP_PAD + 1);
         let left_end = details_tip
             .saturating_sub(FOOTER_LABEL_GAP)
@@ -273,27 +326,17 @@ impl Workspace {
         }
     }
 
-    /// Place the footer's grid at its pixel-aligned offset from the last pane row.
+    /// Anchor the footer row to the window bottom, independently of the pane grid.
     pub(super) fn footer_bounds(&self) -> Bounds<Pixels> {
         let mut bounds = Rect {
             x: 0,
-            y: self.layout.rows - FOOTER_ROWS,
+            y: 0,
             w: self.layout.cols,
             h: FOOTER_ROWS,
         }
         .pixels(self.metrics);
-        bounds.origin.y += self.layout.footer_offset;
+        bounds.origin.y = self.layout.footer_top;
         bounds
-    }
-
-    /// Return `target`'s grid rectangle, with zero width for a hidden pane.
-    pub(super) fn window_area(&self, target: ShellWindow) -> Rect {
-        match target {
-            ShellWindow::Pane(Focus::Manager) => self.layout.tree,
-            ShellWindow::Pane(Focus::Editor) => self.layout.editor,
-            ShellWindow::FilePicker => self.file_picker_layout().area,
-            ShellWindow::ShortcutHelp => self.help_layout(),
-        }
     }
 }
 

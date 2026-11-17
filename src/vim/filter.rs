@@ -18,6 +18,21 @@ pub fn run_filter(directory: &Path, command: &str, input: &str) -> Result<String
         stdin.write_all(b"\n")?;
     }
     stdin.rewind()?;
+    let output = run_shell(directory, command, Stdio::from(stdin), false)?;
+    ensure!(
+        !output.contains('\0'),
+        crate::i18n::text("document.binary_file")
+    );
+    Ok(output)
+}
+
+/// Run an explicit Ex shell command without sending the buffer to stdin.
+pub fn run_ex_shell(directory: &Path, command: &str) -> Result<String> {
+    run_shell(directory, command, Stdio::null(), true)
+}
+
+/// Run a shell command at `directory`, retaining stderr when `display` is requested.
+fn run_shell(directory: &Path, command: &str, stdin: Stdio, display: bool) -> Result<String> {
     let mut stderr = tempfile::tempfile()?;
     #[cfg(windows)]
     let mut process = {
@@ -37,7 +52,7 @@ pub fn run_filter(directory: &Path, command: &str, input: &str) -> Result<String
     };
     let mut child = process
         .current_dir(directory)
-        .stdin(Stdio::from(stdin))
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr.try_clone()?))
         .spawn()
@@ -58,16 +73,30 @@ pub fn run_filter(directory: &Path, command: &str, input: &str) -> Result<String
         output.len() as u64 <= LIMIT,
         crate::i18n::text("document.file_too_large")
     );
-    if !status.success() {
+    if !status.success() || display {
         stderr.seek(SeekFrom::Start(0))?;
         let mut detail = Vec::new();
-        stderr.take(4096).read_to_end(&mut detail)?;
-        anyhow::bail!("{status} {}", String::from_utf8_lossy(&detail).trim());
+        stderr
+            .take(if display { LIMIT } else { 4096 })
+            .read_to_end(&mut detail)?;
+        if !status.success() {
+            anyhow::bail!(
+                "{status}\n{}{}",
+                String::from_utf8_lossy(&output),
+                String::from_utf8_lossy(&detail)
+            );
+        }
+        if !detail.is_empty() {
+            if !output.is_empty() && !output.ends_with(b"\n") {
+                output.push(b'\n');
+            }
+            output.extend(detail);
+        }
     }
-    let text = String::from_utf8(output).context(crate::i18n::text("document.requires_utf8"))?;
-    ensure!(
-        !text.contains('\0'),
-        crate::i18n::text("document.binary_file")
-    );
+    let text = if display {
+        String::from_utf8_lossy(&output).replace('\0', "^@")
+    } else {
+        String::from_utf8(output).context(crate::i18n::text("document.requires_utf8"))?
+    };
     Ok(text.replace("\r\n", "\n"))
 }

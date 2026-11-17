@@ -31,41 +31,49 @@ fn native_markdown_source_clips_only_whole_graphemes() -> Result<()> {
             app.background_executor()
                 .timer(Duration::from_millis(60))
                 .await;
-            let (columns, crop, highlight_crop, highlight_inset) = app.update(|app| {
-                handle.update(app, |workspace, window, cx| {
-                    workspace.sync(window, cx);
-                    let metrics = workspace.metrics;
-                    let editor = &workspace.projects.active().editor;
-                    let source = editor.text_area(workspace.layout.editor);
-                    let preview = editor
-                        .markdown_preview_area(workspace.layout.editor)
-                        .expect("split preview");
-                    let first = workspace.spacing.cells("中").next().unwrap();
-                    ensure!(source.w >= 3);
-                    ensure!(first.end > crate::ui::text::UNITS_PER_COLUMN);
-                    ensure!(first.end <= 2 * crate::ui::text::UNITS_PER_COLUMN);
-                    ensure!(preview.x == source.x + source.w + 2);
-                    let bounds = source.pixels(metrics);
-                    Ok::<_, anyhow::Error>((
-                        source.w,
-                        Bounds::from_corners(
-                            point(
-                                bounds.right() - px(2. * metrics.cw),
-                                bounds.top() + px(metrics.lh),
+            let (columns, crop, continuation, highlight_crop, highlight_inset) =
+                app.update(|app| {
+                    handle.update(app, |workspace, window, cx| {
+                        workspace.sync(window, cx);
+                        let metrics = workspace.metrics;
+                        let editor = &workspace.projects.active().editor;
+                        let source = editor.text_area(workspace.layout.editor);
+                        let preview = editor
+                            .markdown_preview_area(workspace.layout.editor)
+                            .expect("split preview");
+                        let first = workspace.spacing.cells("中").next().unwrap();
+                        ensure!(source.w >= 3);
+                        ensure!(first.end > crate::ui::text::UNITS_PER_COLUMN);
+                        ensure!(first.end <= 2 * crate::ui::text::UNITS_PER_COLUMN);
+                        ensure!(preview.x == source.x + source.w + 2);
+                        let bounds = source.pixels(metrics);
+                        Ok::<_, anyhow::Error>((
+                            source.w,
+                            Bounds::from_corners(
+                                point(
+                                    bounds.right() - px(2. * metrics.cw),
+                                    bounds.top() + px(metrics.lh),
+                                ),
+                                point(
+                                    metrics.at((preview.x - 1) as f32, 0.).x,
+                                    bounds.top() + px(2. * metrics.lh),
+                                ),
                             ),
-                            point(
-                                metrics.at((preview.x - 1) as f32, 0.).x,
-                                bounds.top() + px(2. * metrics.lh),
+                            Bounds::from_corners(
+                                point(bounds.left(), bounds.top() + px(2. * metrics.lh)),
+                                point(
+                                    bounds.left() + px(2. * metrics.cw),
+                                    bounds.top() + px(3. * metrics.lh),
+                                ),
                             ),
-                        ),
-                        Bounds::from_corners(
-                            metrics.at(workspace.layout.editor.x as f32 + 0.5, source.y as f32),
-                            metrics.at((preview.x - 1) as f32, (source.y + 2) as f32),
-                        ),
-                        metrics.cw * window.scale_factor() * 0.5,
-                    ))
-                })
-            })??;
+                            Bounds::from_corners(
+                                metrics.at(workspace.layout.editor.x as f32 + 0.5, source.y as f32),
+                                metrics.at((preview.x - 1) as f32, (source.y + 2) as f32),
+                            ),
+                            metrics.cw * window.scale_factor() * 0.5,
+                        ))
+                    })
+                })??;
             let mut capture = |name: &str, count: usize, text: &str| {
                 let path = fixture.join(name);
                 fs::write(&path, format!("\n{}{text}\n", " ".repeat(count)))?;
@@ -86,6 +94,12 @@ fn native_markdown_source_clips_only_whole_graphemes() -> Result<()> {
             ensure!(
                 overflow == blank,
                 "source glyphs reached the divider padding"
+            );
+            let next_row = source_crop(handle, app, fixture.join("clipped.md"), continuation)?;
+            let blank_row = source_crop(handle, app, fixture.join("blank.md"), continuation)?;
+            ensure!(
+                next_row != blank_row,
+                "Han grapheme did not paint on the continuation"
             );
             let blank_line = fixture.join("blank.md");
             let highlighted = source_crop(handle, app, blank_line, highlight_crop)?;

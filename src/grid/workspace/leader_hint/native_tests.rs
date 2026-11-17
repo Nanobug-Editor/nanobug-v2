@@ -1,5 +1,10 @@
 //! Exercise the sequence popup through the native workspace keyboard dispatcher.
 
+mod buffer_windows;
+mod ctrl_focus;
+mod ctrl_resize;
+mod history;
+mod mappings;
 mod markdown;
 
 use super::super::{Workspace, layout::Focus, native_test};

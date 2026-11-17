@@ -68,7 +68,12 @@ impl ManagerWindow {
             y: tree_rect.y - context.area.y,
             ..tree_rect
         });
-        context.border(&mut tree, i18n::text("manager.title"));
+        tree.border(
+            i18n::text("manager.title"),
+            context.selected,
+            false,
+            context.spacing,
+        );
         let root_icon_column = Self::indent_column(0) + 1;
         let root_name_column = root_icon_column + 2;
         tree.icon(

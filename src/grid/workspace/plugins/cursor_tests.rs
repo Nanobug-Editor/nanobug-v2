@@ -4,8 +4,8 @@ use super::{Input, ListLayout, Prompt, Workspace};
 use crate::grid::workspace::native_test;
 use anyhow::{Context as _, Result, ensure};
 use gpui::{
-    App, AppContext, AsyncApp, Bounds, Context, KeyDownEvent, Keystroke, MouseDownEvent, Pixels,
-    Point, RenderImage, Window, WindowHandle, point, px, size,
+    App, AppContext, AsyncApp, Bounds, Context, KeyDownEvent, Keystroke, MouseButton,
+    MouseDownEvent, Pixels, Point, RenderImage, Window, WindowHandle, point, px, size,
 };
 use nanobug::{
     animation::cursor::Effect,
@@ -686,7 +686,7 @@ fn verify_search_buttons(
     }
 
     // Switch tabs with the mouse before checking that slash opens the input on the same footer.
-    let tabs = layout.tabs(&workspace.spacing);
+    let tabs = layout.tabs(&workspace.plugins.manager, &workspace.spacing);
     ensure!(tabs.iter().all(|slot| !slot.is_empty()));
     click_manager(workspace, (tabs[2].start, layout.list.y), 1, window, cx)?;
     ensure!(workspace.plugins.manager.page == super::Page::Zip && !workspace.accepts_native_text());
@@ -950,7 +950,7 @@ fn plugin_list_uses_the_same_rows_for_render_caret_and_clicks() -> Result<()> {
                     ensure!(filter.input.end < filter.buttons[0].start);
                     ensure!(filter.buttons[1].end == list.footer.x + list.footer.w);
                     ensure!(
-                        list.tabs(&workspace.spacing)
+                        list.tabs(&workspace.plugins.manager, &workspace.spacing)
                             .iter()
                             .all(|tab| !tab.is_empty())
                     );
@@ -970,8 +970,50 @@ fn plugin_list_uses_the_same_rows_for_render_caret_and_clicks() -> Result<()> {
         if let Some(evidence) = std::env::var_os("NANOBUG_PLUGIN_LAYOUT_EVIDENCE") {
             capture_plugin_manager(handle, cx, Path::new(&evidence)).await?;
         }
-        Ok(())
+        cx.update(|app| handle.update(app, verify_manager_title_closes))?
     })
+}
+
+/// Use the workspace's middle button route with live caption positions after each close.
+fn verify_manager_title_closes(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Result<()> {
+    use super::Page;
+
+    for (page, next) in [
+        (Page::Zip, Some(Page::Installed)),
+        (Page::Installed, Some(Page::Marketplace)),
+        (Page::Marketplace, None),
+    ] {
+        let area = workspace.plugin_manager_area();
+        let layout = workspace.plugin_manager_view().plugin_list_layout(area);
+        let tabs = layout.tabs(&workspace.plugins.manager, &workspace.spacing);
+        let caption = &tabs[page as usize];
+        ensure!(!caption.is_empty());
+        let position = workspace.metrics.at(
+            (area.x + caption.start) as f32 + 0.5,
+            (area.y + layout.list.y) as f32 + 0.5,
+        );
+        workspace.middle_mouse_down(
+            &MouseDownEvent {
+                button: MouseButton::Middle,
+                position,
+                click_count: 1,
+                ..Default::default()
+            },
+            window,
+            cx,
+        );
+        ensure!(workspace.plugins.open == next.is_some());
+        if let Some(next) = next {
+            ensure!(workspace.plugins.manager.page == next);
+            let tabs = layout.tabs(&workspace.plugins.manager, &workspace.spacing);
+            ensure!(tabs[page as usize].is_empty() && !tabs[next as usize].is_empty());
+        }
+    }
+    Ok(())
 }
 
 /// Provide package rows with different versions, enablement, and one matching catalog update.

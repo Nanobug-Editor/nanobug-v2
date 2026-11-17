@@ -1,11 +1,14 @@
 //! Editing window state: retained buffers, modal input and transient native composition.
 
 mod buffer;
+mod command_window;
 mod commands;
 mod completion;
+mod directory;
 mod header;
 mod hover;
 mod input;
+mod jumplist;
 mod markdown;
 mod pointer;
 mod presentation;
@@ -13,12 +16,16 @@ mod project_session;
 mod session;
 pub(in crate::grid) mod shortcuts;
 mod transactions;
+mod undo_file;
 mod view;
 mod viewport;
+mod wrap;
 pub(in crate::grid) use transactions::{EditReceipt, TextChange, TextTarget};
 
 pub(in crate::grid) use buffer::{Buffer, TEXT_OVERSCAN};
+pub(in crate::grid) use command_window::CommandWindow;
 pub(in crate::grid) use completion::CompletionMenu;
+pub(in crate::grid) use directory::DirectorySlot;
 pub(in crate::grid) use header::HeaderTarget;
 pub(in crate::grid) use hover::{DefinitionHoverContent, DefinitionHoverPopup};
 pub(in crate::grid) use input::EditResult;
@@ -29,7 +36,7 @@ use crate::ui::ime::Composition;
 use gpui::{Pixels, Point};
 use nanobug::{
     document::Document,
-    vim::{Register, Vim},
+    vim::{JumpHistory, Register, Vim},
 };
 
 /// One editor pane owns its buffers, input state and viewports.
@@ -38,8 +45,16 @@ pub(in crate::grid) struct EditorWindow {
     buffers: Vec<Buffer>,
     /// Buffer displayed in this window.
     active: usize,
+    /// Stable ID of the last buffer displayed before the current one.
+    alternate: Option<u64>,
+    /// Previous name retained by :file without adding a visible buffer label.
+    alternate_path: Option<std::path::PathBuf>,
+    /// Effective Ex directory override owned by this editing pane.
+    directory: DirectorySlot,
     /// Text registers and recorded macros shared across the window's buffers.
     register: Register,
+    /// Cursor positions visited in this pane, shared by its retained buffers.
+    jump_history: JumpHistory,
     /// Native preedit text, committed to the document only once.
     composition: Composition,
     /// Selection anchor and original pointer position for drag-jitter rejection.
@@ -59,12 +74,23 @@ impl EditorWindow {
         Self::with_buffer(Buffer::with_vim(Vim::read_only(doc)))
     }
 
+    /// Display `doc` as a read-only Vim Help buffer in its own editor pane.
+    pub(in crate::grid) fn help(doc: Document) -> Self {
+        Self::with_buffer(Buffer::with_vim(Vim::help(doc)))
+    }
+
     /// Display a retained buffer, including its edits, undo state and viewport.
-    pub(in crate::grid) fn with_buffer(buffer: Buffer) -> Self {
+    pub(in crate::grid) fn with_buffer(mut buffer: Buffer) -> Self {
+        let jump_history = JumpHistory::default();
+        buffer.vim.set_jump_history(jump_history.clone());
         Self {
             buffers: vec![buffer],
             active: 0,
+            alternate: None,
+            alternate_path: None,
+            directory: DirectorySlot::default(),
             register: Register::default(),
+            jump_history,
             composition: Composition::default(),
             dragging: None,
             horizontal_wheel: 0.,
@@ -74,6 +100,26 @@ impl EditorWindow {
     /// Return the modal model of the displayed buffer.
     pub(in crate::grid) fn vim(&self) -> &Vim {
         &self.buffers[self.active].vim
+    }
+
+    /// Inspect this window's Ex directory override.
+    pub(in crate::grid) fn directory(&self) -> &DirectorySlot {
+        &self.directory
+    }
+
+    /// Update this window's Ex directory without moving the project or active buffer.
+    pub(in crate::grid) fn directory_mut(&mut self) -> &mut DirectorySlot {
+        &mut self.directory
+    }
+
+    /// Attach `buffer` to this pane's jump history and Session file marks before retention.
+    fn push_buffer(&mut self, mut buffer: Buffer) {
+        buffer.vim.set_jump_history(self.jump_history.clone());
+        self.register.initialize_buffer_options(&mut buffer.vim);
+        if buffer.supports_shared_view() {
+            self.register.bind_file_marks(&buffer.vim.doc);
+        }
+        self.buffers.push(buffer);
     }
 }
 

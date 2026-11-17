@@ -33,8 +33,10 @@ const WORKSPACE_EXAMPLES: &[(&str, &str, &str)] = &[
     ("F6", "keyboard.cycle_cursor", "F6"),
     ("Shift+F6", "keyboard.cycle_cursor_back", "Shift+F6"),
     ("F7", "keyboard.reload_cursor", "F7"),
-    ("Ctrl+Left", "keyboard.area_shortcuts", "Ctrl+←"),
-    ("Ctrl+Right", "keyboard.global_shortcuts", "Ctrl+→"),
+    ("Ctrl+Up", "keyboard.split_grow_height", "Ctrl+↑"),
+    ("Ctrl+Down", "keyboard.split_shrink_height", "Ctrl+↓"),
+    ("Ctrl+Left", "keyboard.split_shrink_width", "Ctrl+←"),
+    ("Ctrl+Right", "keyboard.split_grow_width", "Ctrl+→"),
     ("Alt+h", "keyboard.previous_tab", "Alt+h"),
     ("Alt+k", "keyboard.previous_tab", "Alt+k"),
     ("Alt+j", "keyboard.next_tab", "Alt+j"),
@@ -832,8 +834,22 @@ mod tests {
         assert!(keyboard.press(body, metrics, center("Escape")));
         assert_eq!(keyboard.selection.command, "Escape");
         keyboard.toggle_modifier(Modifier::Ctrl);
-        assert!(keyboard.press(body, metrics, center("Right")));
-        assert_eq!(keyboard.selection.command, "Ctrl+Right");
+        for (raw, name, description, keys) in [
+            ("up", "Up", "keyboard.split_grow_height", "Ctrl+↑"),
+            ("down", "Down", "keyboard.split_shrink_height", "Ctrl+↓"),
+            ("left", "Left", "keyboard.split_shrink_width", "Ctrl+←"),
+            ("right", "Right", "keyboard.split_grow_width", "Ctrl+→"),
+        ] {
+            assert!(matches!(
+                keyboard.key(&key_event(raw)),
+                HelpCommand::Update(_)
+            ));
+            assert_eq!(keyboard.selection.command, format!("Ctrl+{name}"));
+            assert!(keyboard.press(body, metrics, center(name)));
+            let entry = example(&keyboard.selection.command).unwrap();
+            assert_eq!(entry.description, description);
+            assert_eq!(entry.keys, keys);
+        }
         keyboard.toggle_modifier(Modifier::Shift);
         assert!(matches!(
             keyboard.key(&key_event("f6")),

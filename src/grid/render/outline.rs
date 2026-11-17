@@ -40,6 +40,10 @@ pub(super) struct Outline {
     pub top: EdgeGaps,
     /// Frame-local columns skipped along the bottom edge.
     pub bottom: EdgeGaps,
+    /// Signed logical pixels added to the centerline of the top edge.
+    pub top_offset: Pixels,
+    /// Signed logical pixels added to the centerline of the bottom edge.
+    pub bottom_offset: Pixels,
 }
 
 impl Outline {
@@ -53,8 +57,11 @@ impl Outline {
                 })
                 .collect::<SmallVec<[_; 2]>>()
         };
+        let mut bounds = cell_center_bounds(self.area.pixels(metrics), metrics);
+        bounds.origin.y += self.top_offset;
+        bounds.size.height += self.bottom_offset - self.top_offset;
         outline_path(
-            cell_center_bounds(self.area.pixels(metrics), metrics),
+            bounds,
             self.style,
             metrics.font_size,
             &gaps(&self.top),
@@ -67,6 +74,11 @@ impl Outline {
 pub(super) fn cell_center_bounds(grid: Bounds<Pixels>, metrics: Metrics) -> Bounds<Pixels> {
     let inset = point(px(metrics.cw * 0.5), px(metrics.lh * 0.5));
     Bounds::from_corners(grid.origin + inset, grid.bottom_right() - inset)
+}
+
+/// Full logical pixel width of a solid outline at `font_size`.
+pub(in crate::grid) fn solid_stroke_width(font_size: f32) -> Pixels {
+    px(font_size * SOLID_STROKE_EM)
 }
 
 /// Build a `style` stroke along `bounds`, scaling the solid weight with `font_size`.
@@ -126,10 +138,10 @@ pub(in crate::grid) fn outline_path(
     } else {
         spans.last_mut()?.extend(first.into_iter().skip(1));
     }
-    let width = px(match style {
-        OutlineStyle::Solid => font_size * SOLID_STROKE_EM,
-        _ => DASHED_STROKE_WIDTH,
-    });
+    let width = match style {
+        OutlineStyle::Solid => solid_stroke_width(font_size),
+        _ => px(DASHED_STROKE_WIDTH),
+    };
     let mut outline = Path::new(bounds.origin);
     for mut span in spans {
         span.dedup();
@@ -215,6 +227,45 @@ pub(super) fn equal_dashes(length: f32) -> Vec<Pixels> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Move the pane's top and bottom strokes separately and align the title with the top edge.
+    #[test]
+    fn pane_border_offsets_move_each_stroke_and_keep_the_title_aligned() {
+        let metrics = Metrics {
+            cw: 9.,
+            lh: 22.,
+            font_size: 16.,
+            origin: point(px(12.), px(5.)),
+        };
+        let mut frame = super::super::Frame::new(30, 10);
+        frame.outline(
+            Rect {
+                x: 0,
+                y: 0,
+                w: 30,
+                h: 10,
+            },
+            0,
+            OutlineStyle::Solid,
+            Some(2..10),
+        );
+        let original = frame.outlines[0]
+            .path(metrics.origin, metrics)
+            .unwrap()
+            .bounds;
+        let top_shift = px(-3.);
+        let bottom_shift = px(4.);
+        frame.offset_pane_borders(top_shift, bottom_shift);
+        let shifted = frame.outlines[0]
+            .path(metrics.origin, metrics)
+            .unwrap()
+            .bounds;
+        assert_eq!(shifted.origin, original.origin + point(px(0.), top_shift));
+        assert_eq!(shifted.size.width, original.size.width);
+        assert!((shifted.bottom() - original.bottom() - bottom_shift).abs() < px(0.01));
+        assert_eq!(frame.title_offset(0), top_shift);
+        assert_eq!(frame.title_offset(1), px(0.));
+    }
 
     /// Dashed paths fit complete strokes and a full gap around the selected length.
     #[test]

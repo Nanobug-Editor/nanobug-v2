@@ -463,65 +463,30 @@ impl Workspace {
             && key.key == "v"
         {
             if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                self.file_picker_commit(&text, window, cx);
+                self.file_picker_commit(&text, false, window, cx);
             }
             return true;
         }
-        if !editor.composition().is_empty() {
+        if !editor.composition().is_empty()
+            && !(cfg!(windows)
+                && editor.vim().awaits_literal_argument()
+                && key.key == "escape"
+                && !key.modifiers.modified())
+        {
             return false;
         }
         let before = editor.register().yank_revision();
-        let Some(result) = editor.key(key, area, &self.spacing, false) else {
+        let directory = file.path.parent().unwrap_or_else(|| Path::new("."));
+        let Some(result) = editor.key(key, area, &self.spacing, directory, false) else {
             return false;
         };
         if editor.register().yank_revision() != before {
             cx.write_to_clipboard(ClipboardItem::new_string(editor.register().text.clone()));
         }
-        let message = match result.edit.action {
-            Action::Close(_) | Action::QuitAll(_) => {
-                self.leave_file_preview(&key.key, window, cx);
-                return true;
-            }
-            Action::Open(name) => {
-                let path = file
-                    .path
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(name);
-                self.open_picker_path(&path, window, cx);
-                return true;
-            }
-            Action::None => editor.vim().message.clone(),
-            Action::Save(_)
-            | Action::OpenAt(_, _)
-            | Action::OpenExternal(_)
-            | Action::TabNavigate(_, _)
-            | Action::TabNew(_)
-            | Action::TabClose
-            | Action::Split { .. }
-            | Action::SaveClose
-            | Action::BracketBuffer { .. }
-            | Action::BracketDiagnostic { .. }
-            | Action::Filter { .. }
-            | Action::Format(_)
-            | Action::SqlDialect { .. }
-            | Action::CancelFormat
-            | Action::UndoPlugin
-            | Action::PluginComplete
-            | Action::PluginDiagnose
-            | Action::PluginDefinition
-            | Action::PluginHover
-            | Action::PluginOutline
-            | Action::PluginFold
-            | Action::PluginCommand(_)
-            | Action::Appearance(_, _) => i18n::text("editor.read_only_preview").into(),
-        };
-        if message == i18n::text("editor.read_only_preview") {
-            self.show_picker_message(MessageLevel::Warning, message, window, cx);
-        }
-        self.repaint(
+        self.finish_focused_file_action(
+            result.edit.action,
+            &key.key,
             [
-                ScrollInput::Advance,
                 result
                     .view_top
                     .map_or(ScrollInput::Reveal, ScrollInput::PositionWithTail),
@@ -533,6 +498,152 @@ impl Workspace {
             cx,
         );
         true
+    }
+
+    /// Dispatch an `action` from a focused preview, including one returned by asynchronous replay.
+    pub(in crate::grid::workspace) fn finish_focused_file_action(
+        &mut self,
+        action: Action,
+        close_key: &str,
+        [rows, columns]: [ScrollInput; 2],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let warning = match action {
+            Action::Close(_) | Action::QuitAll(_) => {
+                self.leave_file_preview(close_key, window, cx);
+                return;
+            }
+            Action::Open(name) | Action::OpenFile(name, None) => {
+                if let Some(file) = self
+                    .file_picker
+                    .as_ref()
+                    .and_then(|session| session.focused.as_ref())
+                {
+                    let path = file
+                        .path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(name);
+                    self.open_picker_path(&path, window, cx);
+                }
+                return;
+            }
+            Action::None => self
+                .file_picker
+                .as_ref()
+                .and_then(PickerSession::focused_editor)
+                .is_some_and(|editor| {
+                    editor.vim().message == i18n::text("editor.read_only_preview")
+                }),
+            Action::SyntaxSelection => {
+                self.request_syntax_selection(true, window, cx);
+                return;
+            }
+            Action::Sleep(seconds) => {
+                self.sleep_editor(seconds, window, cx);
+                return;
+            }
+            Action::WindowExtras(nanobug::vim::WindowCommand::Sleep {
+                duration,
+                hide_caret,
+            }) => {
+                self.sleep_editor_for(duration, hide_caret, window, cx);
+                return;
+            }
+            Action::CommandWindow(_)
+            | Action::Help(_)
+            | Action::HelpTags { .. }
+            | Action::CheckHealth(_)
+            | Action::QuitWithCode(_)
+            | Action::Restart { .. }
+            | Action::VimMenu { .. }
+            | Action::NumberedMarks { .. }
+            | Action::VimInfo { .. }
+            | Action::TerminalOpen(_)
+            | Action::Save(_)
+            | Action::WriteFile { .. }
+            | Action::SaveAs { .. }
+            | Action::ReadFile { .. }
+            | Action::WriteAll
+            | Action::WriteQuitAll
+            | Action::SaveVimConfig
+            | Action::ListBuffers
+            | Action::SelectBuffer(_)
+            | Action::NavigateBuffer { .. }
+            | Action::DeleteBuffer { .. }
+            | Action::WindowCommand { .. }
+            | Action::OpenFile(_, Some(_))
+            | Action::JumpHistory { .. }
+            | Action::ShowListing(_)
+            | Action::EditableListing(_)
+            | Action::IncludeSplit { .. }
+            | Action::Files(_)
+            | Action::BufferLifecycle(_)
+            | Action::SessionExport(_)
+            | Action::UndoFile { .. }
+            | Action::WindowModified { .. }
+            | Action::MessageModified { .. }
+            | Action::WindowExtras(_)
+            | Action::Shell(_)
+            | Action::RegisterEx(_)
+            | Action::UserEx { .. }
+            | Action::Autocmd { .. }
+            | Action::NoAutocmd(_)
+            | Action::ClipboardEx
+            | Action::DeleteNumberedMarks(_)
+            | Action::FinishSource
+            | Action::ListScripts
+            | Action::EditSourcedScript { .. }
+            | Action::Source { .. }
+            | Action::Runtime { .. }
+            | Action::RunBatch { .. }
+            | Action::UndoBatch
+            | Action::AlternateBuffer(_)
+            | Action::OpenFileMark { .. }
+            | Action::OpenExternal(_)
+            | Action::TabNavigate(_, _)
+            | Action::TabEndpoint(_)
+            | Action::TabMove(_)
+            | Action::ListTabs
+            | Action::TabNew(_)
+            | Action::TabClose
+            | Action::TabOnly
+            | Action::Only
+            | Action::EmptyBuffer
+            | Action::EmptySplit(_)
+            | Action::CloseWindow(_)
+            | Action::Arguments { .. }
+            | Action::PreviewOpen(_)
+            | Action::PreviewClose
+            | Action::Split { .. }
+            | Action::SaveClose
+            | Action::BracketBuffer { .. }
+            | Action::BracketDiagnostic { .. }
+            | Action::Filter { .. }
+            | Action::Format(_)
+            | Action::SqlDialect { .. }
+            | Action::CancelFormat
+            | Action::UndoPlugin
+            | Action::PluginComplete
+            | Action::InsertCandidates { .. }
+            | Action::PluginDiagnose
+            | Action::PluginDefinition
+            | Action::PluginHover
+            | Action::PluginOutline
+            | Action::PluginFold
+            | Action::PluginCommand(_)
+            | Action::Appearance(_, _) => true,
+        };
+        if warning {
+            self.show_picker_message(
+                MessageLevel::Warning,
+                i18n::text("editor.read_only_preview").into(),
+                window,
+                cx,
+            );
+        }
+        self.repaint([ScrollInput::Advance, rows, columns], window, cx);
     }
 
     /// Scroll the read-only editor with the same inputs and caret animation as the main pane.

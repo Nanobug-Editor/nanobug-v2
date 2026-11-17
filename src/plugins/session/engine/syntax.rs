@@ -11,10 +11,51 @@ impl Syntax {
         &mut self,
         id: u64,
         language: String,
-        mut document: nanobug_plugin_sdk::DocumentSnapshot,
+        document: nanobug_plugin_sdk::DocumentSnapshot,
         query: Option<String>,
     ) -> anyhow::Result<serde_json::Value> {
         anyhow::ensure!(language.len() <= 32, "Invalid grammar name");
+        self.request(id, document, |document| match query {
+            Some(query) => Request::QuerySyntax {
+                id,
+                language,
+                query,
+                document,
+            },
+            None => Request::Parse {
+                id,
+                language,
+                document,
+            },
+        })
+    }
+
+    /// Read named node ranges for a native editor operation on `document` in `language`.
+    pub(super) fn node_ranges(
+        &mut self,
+        id: u64,
+        language: &str,
+        document: DocumentSnapshot,
+    ) -> anyhow::Result<Vec<std::ops::Range<usize>>> {
+        let value = self.request(id, document, |document| Request::SyntaxNodes {
+            id,
+            language: language.into(),
+            document,
+        })?;
+        let ranges: Vec<nanobug_plugin_sdk::language::ByteRange> = serde_json::from_value(value)?;
+        Ok(ranges
+            .into_iter()
+            .map(|range| range.start..range.end)
+            .collect())
+    }
+
+    /// Send a syntax request with identifier `id`, constructing it from pathless `document` bytes.
+    fn request(
+        &mut self,
+        id: u64,
+        mut document: DocumentSnapshot,
+        request: impl FnOnce(Box<DocumentSnapshot>) -> Request,
+    ) -> anyhow::Result<serde_json::Value> {
         // Parsing only needs bytes and version identity. Keep paths out of the worker message.
         document.path = None;
         anyhow::ensure!(
@@ -32,21 +73,8 @@ impl Syntax {
         }
         let worker = self.worker.as_ref().expect("syntax worker started");
         let document = Box::new(document);
-        let request = match query {
-            Some(query) => Request::QuerySyntax {
-                id,
-                language,
-                query,
-                document,
-            },
-            None => Request::Parse {
-                id,
-                language,
-                document,
-            },
-        };
         let response = worker
-            .post(request)
+            .post(request(document))
             .and_then(|()| worker.wait(Duration::from_secs(2)));
         match response {
             Ok(Reply::Parsed { id: actual, value }) if actual == id => Ok(value),

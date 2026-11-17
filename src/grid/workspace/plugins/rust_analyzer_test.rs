@@ -1184,7 +1184,21 @@ fn native_rust_analyzer_jumps_again_from_an_external_definition() -> Result<()> 
                     Ok(true)
                 },
             )
-            .await
+            .await?;
+            step(app, window, |workspace, native, cx| {
+                for (key, path, reference, offset) in [
+                    ("ctrl-o", &first, "second_hop", 2),
+                    ("ctrl-o", &source, "first_hop", 2),
+                    ("ctrl-i", &first, "second_hop", 2),
+                    ("tab", &second, "second_hop", 0),
+                ] {
+                    keys(workspace, &[key], native, cx);
+                    let doc = &workspace.projects.active().editor.vim().doc;
+                    ensure!(doc.path.as_ref() == Some(path), "{key}: {:?}", doc.path);
+                    ensure!(doc.cursor == doc.text.find(reference).context(reference)? + offset);
+                }
+                Ok(())
+            })
         },
     )
 }

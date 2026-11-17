@@ -1,6 +1,6 @@
 //! Horizontal positions for workspace text, shared by drawing and input.
 use gpui::{FontId, PlatformTextSystem};
-use nanobug::document::display_width;
+use nanobug::document::display_width_with_tabstop;
 use std::{borrow::Cow, cell::RefCell, collections::HashMap, iter::from_fn, sync::Arc};
 use unicode_script::{Script, UnicodeScript};
 use unicode_segmentation::UnicodeSegmentation;
@@ -52,6 +52,11 @@ impl TextSpacing {
         }
     }
 
+    /// Identify the font and advance scale used to measure cached rows.
+    pub(crate) fn metric_key(&self) -> (FontId, u32) {
+        (self.font, self.scale.to_bits())
+    }
+
     /// Return the actual Chinese advance of `ch`, when the bundled face contains the glyph.
     fn chinese_advance(&self, ch: char) -> Option<usize> {
         *self.advances.borrow_mut().entry(ch).or_insert_with(|| {
@@ -66,18 +71,38 @@ impl TextSpacing {
 
     /// Project the graphemes of `line` into visual intervals without changing logical columns.
     pub fn cells<'a>(&'a self, line: &'a str) -> impl Iterator<Item = TextCell<'a>> {
-        let mut graphemes = line.grapheme_indices(true);
-        let mut column = 0;
+        self.cells_from(line, 0, 0)
+    }
+
+    /// Measure `fragment` from its own left edge while retaining its original `byte_start` and tab `column`.
+    pub(crate) fn cells_from<'a>(
+        &'a self,
+        fragment: &'a str,
+        byte_start: usize,
+        column: usize,
+    ) -> impl Iterator<Item = TextCell<'a>> {
+        self.buffer_cells(fragment, byte_start, column, 4)
+    }
+
+    /// Measure a `fragment` using the owning buffer's tab spacing.
+    pub(crate) fn buffer_cells<'a>(
+        &'a self,
+        fragment: &'a str,
+        byte_start: usize,
+        mut column: usize,
+        tabstop: usize,
+    ) -> impl Iterator<Item = TextCell<'a>> {
+        let mut graphemes = fragment.grapheme_indices(true);
         let mut start = 0;
         from_fn(move || {
             let (byte, text) = graphemes.next()?;
-            let columns = display_width(text, column);
+            let columns = display_width_with_tabstop(text, column, tabstop);
             let advance = chinese_base(text)
                 .and_then(|ch| self.chinese_advance(ch))
                 .unwrap_or(columns * UNITS_PER_COLUMN);
             let end = start + advance;
             let cell = TextCell {
-                byte,
+                byte: byte_start + byte,
                 text,
                 columns,
                 start,
@@ -126,10 +151,10 @@ impl TextSpacing {
             .map_or(0, |cell| cell.end.div_ceil(UNITS_PER_COLUMN))
     }
 
-    /// Return the UTF-8 boundary at `x` visual columns from the start of `line`.
-    pub fn byte_at(&self, line: &str, x: f64) -> usize {
+    /// Return the UTF-8 boundary at `x` visual columns with the given `tabstop` width.
+    pub fn byte_at(&self, line: &str, x: f64, tabstop: usize) -> usize {
         let units = x * UNITS_PER_COLUMN as f64;
-        self.cells(line)
+        self.buffer_cells(line, 0, 0, tabstop)
             .find(|cell| units < cell.end as f64)
             .map_or(line.len(), |cell| cell.byte)
     }
@@ -166,9 +191,9 @@ mod tests {
         assert_eq!(spacing.columns(line), 11);
         for cell in spacing.cells(line) {
             let center = (cell.start + cell.end) as f64 / (2 * UNITS_PER_COLUMN) as f64;
-            assert_eq!(spacing.byte_at(line, center), cell.byte);
+            assert_eq!(spacing.byte_at(line, center, 4), cell.byte);
         }
-        assert_eq!(spacing.byte_at(line, 11.), line.len());
+        assert_eq!(spacing.byte_at(line, 11., 4), line.len());
     }
 
     /// Truncation reserves room for the ellipsis and keeps measured graphemes whole.

@@ -13,9 +13,7 @@ pub(super) const GLOBAL: &[Shortcut] = &[
     (Fixed("<leader>E"), "leader.open_file_picker"),
     (Fixed("<leader>L"), "global_shortcuts.change_language"),
     (Fixed("<leader>pa"), "global_shortcuts.open_start"),
-    (Fixed("<leader>q"), "leader.close_focused"),
-    (Fixed("<leader>x"), "leader.close_tab"),
-    (Fixed("<leader>X"), "leader.close_all_tabs"),
+    (Fixed("<leader>qq"), "leader.quit_app"),
     (Fixed("Alt+h/l  Alt+k/j"), "global_shortcuts.switch_project"),
     (
         Fixed("Ctrl+Alt+h/l/k/j"),

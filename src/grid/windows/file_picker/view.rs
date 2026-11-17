@@ -216,7 +216,6 @@ impl FilePicker {
         path: &Path,
         status: Option<&str>,
         active: bool,
-        controls_hovered: bool,
         spacing: &TextSpacing,
     ) -> Frame {
         let PickerLayout {
@@ -225,7 +224,7 @@ impl FilePicker {
             preview,
             ..
         } = layout;
-        let mut frame = picker_border(area, &display_path(path), active, controls_hovered, spacing);
+        let mut frame = picker_border(area, &display_path(path), active, spacing);
         for (rect, key) in [
             (parent, "picker.parent"),
             (preview, "picker.readonly_preview"),
@@ -289,14 +288,8 @@ impl FilePicker {
         Cow::Owned(format!("{prefix}{query}]"))
     }
 
-    /// Draw picker chrome with shared `spacing`, focus `active` and visible `controls_hovered`.
-    pub fn frame(
-        &self,
-        layout: PickerLayout,
-        active: bool,
-        controls_hovered: bool,
-        spacing: &TextSpacing,
-    ) -> Frame {
+    /// Draw picker chrome with shared `spacing` and the focus color for `active`.
+    pub fn frame(&self, layout: PickerLayout, active: bool, spacing: &TextSpacing) -> Frame {
         let PickerLayout {
             area,
             parent,
@@ -309,7 +302,7 @@ impl FilePicker {
                 .as_deref()
                 .map_or(Cow::Borrowed(i18n::text("picker.drives")), display_path)
         });
-        let mut frame = picker_border(area, &title, active, controls_hovered, spacing);
+        let mut frame = picker_border(area, &title, active, spacing);
         let headings = current.y - 1;
         let current_label = self.current_heading(current.w.saturating_sub(1), spacing);
         for (rect, label) in [
@@ -743,15 +736,9 @@ impl FilePicker {
 }
 
 /// Draw the picker boundary and fitted `title` for either column layout.
-fn picker_border(
-    area: Rect,
-    title: &str,
-    active: bool,
-    controls: bool,
-    spacing: &TextSpacing,
-) -> Frame {
+fn picker_border(area: Rect, title: &str, active: bool, spacing: &TextSpacing) -> Frame {
     let mut frame = Frame::new(area.w, area.h);
-    frame.border_with_title(active, controls, true, |frame, slot, color| {
+    frame.border_with_title(active, false, false, |frame, slot, color| {
         let title = spacing.ellipsize(title, slot.len());
         frame.label(0, slot, &title, color, spacing)
     });

@@ -8,6 +8,55 @@ fn editor(text: &str) -> (Vim, Register) {
     (Vim::new(Document::new(text)), Register::default())
 }
 
+/// Counted finds, repeats and operator motions consume one committed Unicode grapheme.
+#[test]
+fn native_literal_find_preserves_counts_operators_and_normal_keys() {
+    let (mut vim, mut registers) = editor("a中b中c中d");
+    vim.text("2f", &mut registers);
+    assert!(vim.accepts_text());
+    vim.commit_text("中文", &mut registers);
+    assert!(vim.accepts_text());
+    assert_eq!(vim.doc.cursor, 0);
+    vim.commit_text("中", &mut registers);
+    assert!(!vim.accepts_text());
+    assert_eq!(vim.doc.cursor, "a中b".len());
+    vim.key(";", &mut registers);
+    assert_eq!(vim.doc.cursor, "a中b中c".len());
+    vim.key(",", &mut registers);
+    assert_eq!(vim.doc.cursor, "a中b".len());
+    vim.text("0d2t", &mut registers);
+    assert!(vim.accepts_text());
+    vim.commit_text("中", &mut registers);
+    assert_eq!(vim.doc.text, "中c中d");
+    assert!(!vim.accepts_text());
+    vim.key("m", &mut registers);
+    assert!(!vim.accepts_text());
+    vim.key("a", &mut registers);
+    assert!(!vim.awaiting_key());
+}
+
+/// Committed replacement graphemes replay as edits, and Escape cancels a pending argument.
+#[test]
+fn native_literal_replace_replays_the_complete_grapheme() {
+    let (mut vim, mut registers) = editor("abcd");
+    vim.key("r", &mut registers);
+    assert!(vim.accepts_text());
+    vim.commit_text("e\u{301}", &mut registers);
+    vim.text("l.", &mut registers);
+    assert_eq!(vim.doc.text, "e\u{301}e\u{301}cd");
+    vim.text("lgr", &mut registers);
+    assert!(vim.accepts_text());
+    vim.commit_text("中", &mut registers);
+    assert_eq!(vim.doc.text, "e\u{301}e\u{301}中");
+    vim.key("F", &mut registers);
+    assert!(vim.accepts_text());
+    vim.key("Escape", &mut registers);
+    vim.commit_text("中", &mut registers);
+    assert!(!vim.accepts_text());
+    assert!(!vim.awaiting_key());
+    assert_eq!(vim.doc.text, "e\u{301}e\u{301}中");
+}
+
 /// Preview text keeps Vim's selection and search without writes, filters or edits.
 #[test]
 fn read_only_vim_keeps_navigation_search_and_yank() {

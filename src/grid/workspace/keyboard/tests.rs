@@ -22,8 +22,8 @@ fn shell_shortcut(
             markdown: false,
             close_only: false,
             choosing_file: false,
-            grid_window: true,
             tabs: true,
+            ..Default::default()
         },
         prefix,
         &key,
@@ -169,8 +169,8 @@ fn leader_letter_case_requires_shift() {
                 markdown: false,
                 close_only: false,
                 choosing_file: false,
-                grid_window: true,
                 tabs: true,
+                ..Default::default()
             },
             leader,
             &key,
@@ -218,8 +218,8 @@ fn question_mark_requires_the_leader_and_a_help_target() {
                     markdown: false,
                     close_only: false,
                     choosing_file: false,
-                    grid_window: help,
                     tabs: true,
+                    ..Default::default()
                 },
                 leader,
                 &key,
@@ -230,7 +230,7 @@ fn question_mark_requires_the_leader_and_a_help_target() {
     }
 }
 
-/// Both panes route q, x and X to separate close scopes after the leader.
+/// The quit group closes the application from either pane.
 #[test]
 fn leader_close_resolves_grid_and_tab_actions() {
     let leader = Some(PendingPrefix::Leader(LeaderPrefix::ROOT));
@@ -244,16 +244,17 @@ fn leader_close_resolves_grid_and_tab_actions() {
         let command = |prefix, key| shell_shortcut(focus, mode, None, prefix, key);
         assert_eq!(command(None, "x"), None);
         assert_eq!(command(None, "q"), None);
-        assert_eq!(command(leader, "q"), Some(ShellShortcut::CloseFocused));
+        assert_eq!(
+            command(leader, "q"),
+            Some(ShellShortcut::AwaitLeader(LeaderPrefix("q")))
+        );
+        assert_eq!(
+            command(Some(PendingPrefix::Leader(LeaderPrefix("q"))), "q"),
+            Some(ShellShortcut::CloseTabs(CloseTarget::Quit))
+        );
         assert_eq!(command(leader, "a"), None);
-        assert_eq!(
-            command(leader, "x"),
-            Some(ShellShortcut::CloseTabs(CloseTarget::Tab))
-        );
-        assert_eq!(
-            command(leader, "shift-x"),
-            Some(ShellShortcut::CloseTabs(CloseTarget::AllTabs))
-        );
+        assert_eq!(command(leader, "x"), None);
+        assert_eq!(command(leader, "shift-x"), None);
         assert_eq!(command(leader, "ctrl-x"), None);
         assert_eq!(command(None, "escape"), None);
         assert_eq!(command(leader, "escape"), Some(ShellShortcut::CancelLeader));
@@ -265,7 +266,7 @@ fn leader_close_resolves_grid_and_tab_actions() {
     }
 }
 
-/// A grouped popup exposes one close action and cannot close the workspace underneath it.
+/// A modal popup suppresses the application quit group.
 #[test]
 fn popup_leader_only_closes_the_popup() {
     let availability = LeaderAvailability {
@@ -274,8 +275,8 @@ fn popup_leader_only_closes_the_popup() {
         markdown: false,
         close_only: true,
         choosing_file: false,
-        grid_window: true,
         tabs: false,
+        ..Default::default()
     };
     let command = |key| {
         let key = Keystroke::parse(key).unwrap();
@@ -290,19 +291,13 @@ fn popup_leader_only_closes_the_popup() {
             normal_character(&key).as_deref(),
         )
     };
-    assert_eq!(command("q"), Some(ShellShortcut::CloseFocused));
+    assert_eq!(command("q"), None);
     assert_eq!(command("x"), None);
     assert_eq!(command("shift-x"), None);
-    assert_eq!(
-        LeaderPrefix::ROOT
-            .bindings(availability)
-            .map(|(key, _)| key)
-            .collect::<Vec<_>>(),
-        ["q"]
-    );
+    assert!(LeaderPrefix::ROOT.bindings(availability).next().is_none());
 }
 
-/// Start pages offer close-all through the leader, while panes also offer q and x.
+/// Start pages and panes offer the quit group through the leader.
 #[test]
 fn project_and_close_actions_resolve_in_panes_and_on_the_start_page() {
     let root = Some(PendingPrefix::Leader(LeaderPrefix::ROOT));
@@ -321,8 +316,8 @@ fn project_and_close_actions_resolve_in_panes_and_on_the_start_page() {
                     markdown: false,
                     close_only: false,
                     choosing_file: false,
-                    grid_window: focus.is_some(),
                     tabs: true,
+                    ..Default::default()
                 },
                 prefix,
                 &key,
@@ -342,16 +337,10 @@ fn project_and_close_actions_resolve_in_panes_and_on_the_start_page() {
         assert_eq!(command(root, "f"), None);
         assert_eq!(
             command(root, "q"),
-            focus.map(|_| ShellShortcut::CloseFocused)
+            Some(ShellShortcut::AwaitLeader(LeaderPrefix("q")))
         );
-        assert_eq!(
-            command(root, "x"),
-            focus.map(|_| ShellShortcut::CloseTabs(CloseTarget::Tab))
-        );
-        assert_eq!(
-            command(root, "shift-x"),
-            Some(ShellShortcut::CloseTabs(CloseTarget::AllTabs))
-        );
+        assert_eq!(command(root, "x"), None);
+        assert_eq!(command(root, "shift-x"), None);
     }
 }
 
@@ -364,8 +353,8 @@ fn standalone_editor_omits_explorer_bindings() {
         markdown: false,
         close_only: false,
         choosing_file: false,
-        grid_window: true,
         tabs: true,
+        ..Default::default()
     };
     let command = |prefix, key| {
         let key = Keystroke::parse(key).unwrap();
@@ -388,11 +377,11 @@ fn standalone_editor_omits_explorer_bindings() {
         Some(ShellShortcut::OpenFilePicker)
     );
     assert_eq!(command(None, "shift-e"), None);
-    assert_eq!(command(leader, "q"), Some(ShellShortcut::CloseFocused));
     assert_eq!(
-        command(leader, "x"),
-        Some(ShellShortcut::CloseTabs(CloseTarget::Tab))
+        command(leader, "q"),
+        Some(ShellShortcut::AwaitLeader(LeaderPrefix("q")))
     );
+    assert_eq!(command(leader, "x"), None);
     assert!(
         !LeaderPrefix::ROOT
             .bindings(availability)
@@ -415,6 +404,19 @@ fn backspace_returns_to_the_parent_leader_group() {
     assert_eq!(command(None), None);
 }
 
+/// Titles use the current binding's group description, including the Tab group.
+#[test]
+fn leader_group_title_uses_the_binding_description() {
+    for (prefix, description) in [
+        ("", None),
+        ("b", Some("leader.buffer_group")),
+        ("w", Some("leader.window_group")),
+        ("\t", Some("leader.tabpage_group")),
+    ] {
+        assert_eq!(LeaderPrefix(prefix).group_description_key(), description);
+    }
+}
+
 /// The Markdown submenu and dispatch use the same surface-specific binding table.
 #[test]
 fn markdown_view_bindings_require_a_markdown_editor() {
@@ -424,8 +426,8 @@ fn markdown_view_bindings_require_a_markdown_editor() {
         markdown: true,
         close_only: false,
         choosing_file: false,
-        grid_window: true,
         tabs: true,
+        ..Default::default()
     };
     let group = LeaderPrefix("m");
     let root = LeaderPrefix::ROOT;
@@ -573,4 +575,93 @@ fn editor_close_keys_leave_normal_commands_to_vim() {
         let key = Keystroke::parse(binding).unwrap();
         assert_eq!(EditorWindow::matches_close_key(&key), editor, "{binding}");
     }
+}
+
+/// Apply batch Ex edits through native input and keep substitution choices in the editor.
+#[cfg(windows)]
+#[test]
+#[ignore = "opens a native Windows workspace"]
+fn native_batch_edit_and_confirm_substitution() -> anyhow::Result<()> {
+    use crate::grid::workspace::native_test;
+    use anyhow::{Result, ensure};
+    use gpui::EntityInputHandler;
+    use nanobug::plugins::session::Options;
+
+    let temp = tempfile::tempdir()?;
+    let project = temp.path().join("project");
+    let original = "foo one\nkeep foo\nfoo two\n";
+    std::fs::create_dir(&project)?;
+    std::fs::write(project.join("README.md"), original)?;
+    let options = Options::take(&mut vec!["--no-plugins".into()], temp.path())?;
+    native_test::run_async(
+        project,
+        options,
+        |workspace| workspace.projects.active_mut().focus_pane(Focus::Editor),
+        async move |handle, app| {
+            let _keep_temp = temp;
+            handle.update(app, |workspace, window, cx| -> Result<()> {
+                workspace.sync(window, cx);
+                let press = |workspace: &mut Workspace,
+                             key: &'static str,
+                             window: &mut Window,
+                             cx: &mut Context<Workspace>|
+                 -> Result<()> {
+                    workspace.key_down(
+                        &KeyDownEvent {
+                            keystroke: Keystroke::parse(key)?,
+                            is_held: false,
+                            prefer_character_input: false,
+                        },
+                        window,
+                        cx,
+                    );
+                    Ok(())
+                };
+                let ex = |workspace: &mut Workspace,
+                          command: &str,
+                          window: &mut Window,
+                          cx: &mut Context<Workspace>|
+                 -> Result<()> {
+                    press(workspace, ":", window, cx)?;
+                    workspace.replace_text_in_range(None, command, window, cx);
+                    press(workspace, "enter", window, cx)
+                };
+                ex(workspace, "g/^foo/s/foo/bar/", window, cx)?;
+                ensure!(
+                    workspace.projects.active().editor.vim().doc.text
+                        == "bar one\nkeep foo\nbar two\n"
+                );
+                press(workspace, "u", window, cx)?;
+                ensure!(workspace.projects.active().editor.vim().doc.text == original);
+
+                ex(workspace, "nnoremap y x", window, cx)?;
+                ex(workspace, "%s/foo/bar/gc", window, cx)?;
+                ensure!(!workspace.accepts_text_input(window, cx));
+                ensure!(
+                    workspace
+                        .projects
+                        .active()
+                        .editor
+                        .vim()
+                        .substitution_match()
+                        == Some(0..3)
+                );
+                press(workspace, "n", window, cx)?;
+                press(workspace, "y", window, cx)?;
+                press(workspace, "l", window, cx)?;
+                let vim = workspace.projects.active().editor.vim();
+                ensure!(vim.substitution_match().is_none());
+                ensure!(vim.doc.text == "foo one\nkeep bar\nbar two\n");
+                press(workspace, "u", window, cx)?;
+                ensure!(workspace.projects.active().editor.vim().doc.text == original);
+
+                ex(workspace, "%s/foo/bar/gc", window, cx)?;
+                press(workspace, "escape", window, cx)?;
+                let vim = workspace.projects.active().editor.vim();
+                ensure!(vim.substitution_match().is_none());
+                ensure!(vim.doc.text == original);
+                Ok(())
+            })?
+        },
+    )
 }
