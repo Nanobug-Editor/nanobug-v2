@@ -63,7 +63,7 @@ pub(super) enum SplitDocument {
     /// Read-only reference page with local mappings for code examples.
     Help(Document),
     /// Read-only output from a Vim command.
-    ReadOnly(Document),
+    ReadOnly(nanobug::vim::ExMessageOutput),
     /// Editable generated output in a new buffer.
     Editable(Document),
     /// Display the focused editor's active buffer in an independent view.
@@ -684,7 +684,7 @@ impl Project {
         match source {
             SplitDocument::SharedView(view) => Ok(EditorWindow::with_buffer(*view)),
             SplitDocument::Help(doc) => Ok(EditorWindow::help(doc)),
-            SplitDocument::ReadOnly(doc) => Ok(EditorWindow::read_only(doc)),
+            SplitDocument::ReadOnly(output) => Ok(EditorWindow::message_output(output)),
             SplitDocument::Editable(doc) => Ok(EditorWindow::new(doc)),
             SplitDocument::Current => {
                 let buffer = self.editor.buffer();
@@ -1567,6 +1567,7 @@ impl Workspace {
                 self.remove_main_window(window, cx);
             }
         }
+        self.prune_resolved_drafts();
     }
 
     /// Reset transient workspace state and apply the selected tab's cursor settings.
@@ -1672,6 +1673,9 @@ impl Workspace {
     /// Report `message` in the current tab's status area.
     pub(super) fn set_status(&mut self, message: String) {
         self.input_mappings.remember_ex_message(&message);
+        if !message.is_empty() {
+            self.input_mappings.record_ex_output(&message, true);
+        }
         if let Some(project) = self.projects.active_project_mut() {
             project.status = message;
         } else if let Some(page) = self.projects.start_mut() {

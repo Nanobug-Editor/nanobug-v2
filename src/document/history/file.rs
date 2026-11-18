@@ -140,6 +140,7 @@ impl History {
                     snapshot,
                     time: entry.time,
                     saved: entry.saved,
+                    recovery_file: None,
                 },
             );
         }

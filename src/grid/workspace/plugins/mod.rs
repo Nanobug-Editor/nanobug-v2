@@ -7,8 +7,11 @@ mod credential_tests;
 #[cfg(all(test, windows))]
 mod cursor_tests;
 mod edits;
+mod ex_languages;
 mod field;
 mod file_ops;
+#[cfg(all(test, windows))]
+mod filetype_test;
 mod formatting;
 mod hover;
 mod interaction;
@@ -107,6 +110,8 @@ pub(super) struct PluginCoordinator {
     projects: Vec<Project>,
     /// SQL overrides in the last project snapshot sent to the supervisor.
     sql_dialects: BTreeMap<u64, String>,
+    /// File type overrides in the last project snapshot sent to the supervisor.
+    document_filetypes: nanobug::plugins::session::DocumentFiletypes,
     pub(super) open: bool,
     pub(super) composition: Composition,
     credential_draft: Option<CredentialDraft>,
@@ -165,6 +170,7 @@ impl PluginCoordinator {
             active: None,
             projects: Vec::new(),
             sql_dialects: BTreeMap::new(),
+            document_filetypes: Default::default(),
             open: false,
             composition: Composition::default(),
             credential_draft: None,

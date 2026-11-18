@@ -13,7 +13,7 @@ use super::{
     sleep::Source,
 };
 use anyhow::Context as _;
-use gpui::{Context, Window};
+use gpui::{ClipboardItem, Context, Window};
 use nanobug::{
     i18n,
     vim::{Action, Register, Vim},
@@ -69,7 +69,7 @@ impl Workspace {
     }
 
     /// Reveal and focus the pane containing the new cursor position.
-    fn finish_file_jump(&mut self) {
+    pub(super) fn finish_file_jump(&mut self) {
         self.last_cursor_space = None;
         let project = self.projects.active_mut();
         project.focus_pane(Focus::Editor);
@@ -81,8 +81,29 @@ impl Workspace {
 
     /// Execute modal `action` in `window` through `cx`, preserving buffers on I/O errors.
     pub(super) fn action(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        let scope = self.begin_noswapfile_dispatch();
+        self.apply_noswapfile_to_loaded();
+        let removes_drafts = matches!(action, Action::Files(_) | Action::BufferLifecycle(_));
+        self.dispatch_action(action, window, cx);
+        self.apply_noswapfile_to_loaded();
+        if scope {
+            self.noswapfile_buffers = None;
+        }
+        if removes_drafts {
+            self.prune_resolved_drafts();
+        }
+    }
+
+    /// Route an editor action inside the active Ex modifier context.
+    fn dispatch_action(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
         match action {
             Action::None => {}
+            Action::Sign(command) => self.execute_sign(command, window, cx),
+            Action::Recovery(command) => self.ex_recovery(command, window, cx),
+            Action::Filetype(command) => self.run_filetype_command(command),
+            Action::LanguageServer { command, target } => {
+                self.control_ex_language_server(command, target, None, window, cx)
+            }
             Action::CommandWindow(prompt) => self.open_command_window(prompt, window, cx),
             Action::VimMenu { path } => self.popup_vim_menu(path, window, cx),
             Action::Help(topic) => self.open_vim_help(&topic, window, cx),
@@ -159,6 +180,18 @@ impl Workspace {
                 }
             }
             Action::ShowListing(list) => self.ex_output_listing(&list, window, cx),
+            Action::ShowStyledListing(output) => self.ex_styled_output_listing(output, window, cx),
+            Action::RedirectFile { path, mode } => self.ex_redirect_file(&path, mode),
+            Action::RedirectClipboard { append } => {
+                let existing = if append {
+                    cx.read_from_clipboard()
+                        .and_then(|item| item.text())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                self.input_mappings.begin_redirect_clipboard(existing);
+            }
             Action::EditableListing(list) => self.open_editor_split_at(
                 true,
                 false,
@@ -192,6 +225,12 @@ impl Workspace {
             Action::WindowModified { modifiers, command } => {
                 self.execute_window_modified(modifiers, &command, window, cx)
             }
+            Action::ExState { modifiers, action } => {
+                let merged = self.active_ex_window_modifiers.overlay(modifiers);
+                self.with_ex_window_modifiers(merged, |workspace| {
+                    workspace.action(*action, window, cx)
+                });
+            }
             Action::MessageModified { modifier, command } => {
                 self.execute_message_modified(modifier, &command, window, cx)
             }
@@ -210,9 +249,12 @@ impl Workspace {
             Action::WindowExtras(command) => self.window_extras(command, window, cx),
             Action::Shell(command) => self.run_shell_command(command, None, window, cx),
             Action::RegisterEx(text) => self.execute_ex_input(&text, "@", 1, false, window, cx),
-            Action::UserEx { text, source } => {
-                self.execute_user_ex(&text, source.as_deref(), window, cx)
-            }
+            Action::ExPipeline(text) => self.execute_ex_input(&text, ":", 1, false, window, cx),
+            Action::UserEx {
+                text,
+                source,
+                source_line,
+            } => self.execute_user_ex(&text, source.as_deref(), source_line, window, cx),
             Action::Autocmd {
                 event,
                 pattern,
@@ -573,7 +615,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.input_mappings.ex_verbose() >= 4 {
+            self.input_mappings
+                .trace_ex(4, &format!("Calling shell to execute: {command}"));
+        }
         let silence = self.input_mappings.ex_silence();
+        let marks = nanobug::document::current_mark_modifiers();
         let root = self.ex_current_dir().to_owned();
         let project = self.projects.active_mut();
         let scope = project.plugin_scope;
@@ -607,7 +654,9 @@ impl Workspace {
                             Ok(output) if editor.buffers()[index].vim.doc.revision == revision => {
                                 changed_path = editor
                                     .edit_buffer(index, |vim, _| {
-                                        vim.apply_filter(range, &output);
+                                        nanobug::document::with_mark_modifiers(marks, || {
+                                            vim.apply_filter(range, &output);
+                                        });
                                         nanobug::vim::Action::None
                                     })
                                     .changed_path;
@@ -659,6 +708,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.input_mappings.ex_verbose() >= 4 {
+            self.input_mappings
+                .trace_ex(4, &format!("Calling shell to execute: {command}"));
+        }
         let silence = self.input_mappings.ex_silence();
         let root = self.ex_current_dir().to_owned();
         let project = self.projects.active_mut();
@@ -696,13 +749,19 @@ impl Workspace {
                     {
                         workspace.set_status(String::new());
                         workspace.action(Action::ShowListing(output), window, cx);
-                    } else if visible
-                        && let Some(project) = workspace
-                            .projects
-                            .iter_mut()
-                            .find(|project| project.plugin_scope == scope)
-                    {
-                        project.status = output.trim().into();
+                    } else {
+                        let output = output.trim_end_matches(['\r', '\n']);
+                        if !output.is_empty() {
+                            workspace.input_mappings.record_ex_output(output, true);
+                        }
+                        if visible
+                            && let Some(project) = workspace
+                                .projects
+                                .iter_mut()
+                                .find(|project| project.plugin_scope == scope)
+                        {
+                            project.status = output.trim().into();
+                        }
                     }
                     if let Some(resume) = continuation
                         && workspace.ex_shell_view_is_active(scope, pane, opening)
@@ -743,6 +802,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(text) = self.input_mappings.take_redirected_clipboard() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
         if let Some(path) = edit.changed_path {
             for manager in self
                 .projects

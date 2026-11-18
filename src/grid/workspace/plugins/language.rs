@@ -655,6 +655,7 @@ impl Workspace {
         kind: Provider,
         scope: u64,
         path: Option<&Path>,
+        filetype: Option<&str>,
     ) -> Vec<(Key, String, u64)> {
         let mut providers = Vec::new();
         for record in self.plugins.view.installed.iter() {
@@ -663,7 +664,7 @@ impl Workspace {
             }
             let manifest = &record.release.manifest;
             for module in &manifest.modules {
-                if !module.provides.contains(&kind) || !module.accepts_document(path) {
+                if !module.provides.contains(&kind) || !module.accepts_filetype(path, filetype) {
                     continue;
                 }
                 let key = Key {
@@ -715,7 +716,9 @@ impl Workspace {
         }
         let (scope, opening, revision, cursor) =
             (project.plugin_scope, doc.opening, doc.revision, doc.cursor);
-        let mut providers = self.language_providers(kind, scope, doc.path.as_deref());
+        let filetype = project.editor.vim().filetype_override();
+        let mut providers =
+            self.language_providers(kind, scope, doc.path.as_deref(), filetype.as_deref());
         if providers.is_empty() {
             if kind == Provider::Definition {
                 let mut moved = false;

@@ -75,6 +75,9 @@ impl Workspace {
         if current != updated {
             cx.set_global(updated);
         }
+        if current.light != updated.light {
+            updated.update_ex_highlight_palette(&self.input_mappings);
+        }
         if current != updated || layout_changed {
             self.popup_backdrop.invalidate();
             self.invalidate_plugin_appearance();

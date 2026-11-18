@@ -12,8 +12,8 @@
         });
     }
     return {
-        // Allow detecting the result format without changing the list of host data APIs.
-        host: Object.freeze(Object.defineProperty({
+        // Expose optional capabilities without changing the enumerable host data APIs.
+        host: Object.freeze(Object.defineProperties({
             context: Object.freeze(context),
             exists: path => query("exists", { path }),
             readFile: (path, options = {}) => query("read_file", { ...options, path }),
@@ -25,7 +25,11 @@
             // Match a file type without invalidating the rule on same-type renames.
             documentExtension: () => query("document_extension", {}),
             list: path => query("list", { path })
-        }, "supportsLanguageServerStartup", { value: true })),
+        }, {
+            supportsLanguageServerStartup: { value: true },
+            // Read the buffer's explicit type from this opted-in rule's context.
+            documentFiletype: { value: () => context.documentFiletype ?? null }
+        })),
         take() {
             const result = JSON.stringify(queued);
             queued = [];

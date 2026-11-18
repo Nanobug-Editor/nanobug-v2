@@ -1,8 +1,7 @@
 //! Tracked file positions remain current across edits in any buffer view.
 
-use super::Document;
+use super::{Document, MarkEdit};
 use std::{
-    ops::Range,
     path::PathBuf,
     sync::{Arc, Mutex, Weak},
 };
@@ -73,18 +72,12 @@ impl Document {
         DocumentAnchor(entry)
     }
 
-    /// Move anchors after replacing the old byte `range` with `inserted` bytes.
-    pub(super) fn shift_anchors(&self, range: &Range<usize>, inserted: usize) {
+    /// Move file marks after replacing text, retaining anchors on removed filter lines.
+    pub(super) fn shift_anchors(&self, marks: &MarkEdit) {
         self.shared.anchors.update(|position| {
-            let offset = if position.offset >= range.end {
-                position.offset - range.len() + inserted
-            } else if position.offset >= range.start {
-                range.start
-            } else {
-                position.offset
-            };
-            position.offset = self.text.floor_char_boundary(offset.min(self.text.len()));
-            position.location = self.anchor_location(position.offset);
+            let offset = marks.retained_position(self, position.offset);
+            position.offset = offset;
+            position.location = self.anchor_location(offset);
         });
     }
 
@@ -102,25 +95,35 @@ impl Document {
     }
 
     /// Treat a history restore to `text` as a replacement between its unchanged edges.
-    pub(super) fn anchor_replacement(&self, text: &str) -> Option<(Range<usize>, usize)> {
-        if !self.shared.anchors.occupied() || self.text == text {
-            return None;
-        }
-        let prefix = self
-            .text
-            .bytes()
-            .zip(text.bytes())
-            .take_while(|(a, b)| a == b)
-            .count();
-        let prefix = self.text.floor_char_boundary(prefix);
-        let suffix = self.text[prefix..]
-            .bytes()
-            .rev()
-            .zip(text[prefix..].bytes().rev())
-            .take_while(|(a, b)| a == b)
-            .count();
-        let end = self.text.ceil_char_boundary(self.text.len() - suffix);
-        let suffix = self.text.len() - end;
-        Some((prefix..end, text.len() - suffix - prefix))
+    pub(super) fn anchor_replacement(&self, text: &str) -> Option<MarkEdit> {
+        self.shared
+            .anchors
+            .occupied()
+            .then(|| changed_span(&self.text, text))
+            .flatten()
+            .map(|(range, inserted)| MarkEdit::new(self, range, inserted, None))
     }
+}
+
+/// Describe a whole-document update by its changed byte span and replacement length.
+pub(super) fn changed_span(before: &str, after: &str) -> Option<(std::ops::Range<usize>, usize)> {
+    if before == after {
+        return None;
+    }
+    let prefix = before.floor_char_boundary(
+        before
+            .bytes()
+            .zip(after.bytes())
+            .take_while(|(left, right)| left == right)
+            .count(),
+    );
+    let suffix = before[prefix..]
+        .bytes()
+        .rev()
+        .zip(after[prefix..].bytes().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let end = before.ceil_char_boundary(before.len() - suffix);
+    let suffix = before.len() - end;
+    Some((prefix..end, after.len() - suffix - prefix))
 }

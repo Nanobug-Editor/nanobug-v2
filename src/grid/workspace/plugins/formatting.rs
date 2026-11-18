@@ -131,6 +131,7 @@ impl Workspace {
         &self,
         project: u64,
         path: Option<&Path>,
+        filetype: Option<&str>,
         options: &Formatting,
     ) -> Vec<(Key, String)> {
         let mut providers = Vec::new();
@@ -148,7 +149,9 @@ impl Workspace {
             }
             let namespace = manifest.identity().namespace();
             for module in &manifest.modules {
-                if !module.provides.contains(&Provider::Format) || !module.accepts_document(path) {
+                if !module.provides.contains(&Provider::Format)
+                    || !module.accepts_filetype(path, filetype)
+                {
                     continue;
                 }
                 let key = Key {
@@ -238,7 +241,8 @@ impl Workspace {
             self.finish_save(scope, opening, save, None, window, cx);
             return;
         }
-        let mut providers = self.formatters(scope, path, &options);
+        let filetype = self.projects.active().editor.vim().filetype_override();
+        let mut providers = self.formatters(scope, path, filetype.as_deref(), &options);
         if let Some(selected) = &selected {
             providers.retain(|(key, _)| key == selected);
         } else if let Some(previous) = self
@@ -576,6 +580,7 @@ impl Workspace {
             .save_editor_buffer(tab, pane, buffer, save.path)
         {
             Ok(()) => {
+                self.prune_resolved_drafts();
                 let project = self.projects.project_mut(tab);
                 project.status = format_error.map_or_else(
                     || i18n::text("workspace.saved").into(),

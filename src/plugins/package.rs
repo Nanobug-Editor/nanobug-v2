@@ -110,6 +110,9 @@ pub struct Module {
     /// Document features apply to these extensions. An empty set matches any document.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub document_extensions: BTreeSet<String>,
+    /// File type overrides this module can consume through the host's document metadata.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub document_filetypes: BTreeSet<String>,
 }
 
 impl Module {
@@ -123,6 +126,16 @@ impl Module {
                     self.document_extensions
                         .contains(&extension.to_ascii_lowercase())
                 })
+    }
+
+    /// Match an explicit `filetype` for opted-in modules; use `path` for legacy selection.
+    pub fn accepts_filetype(&self, path: Option<&Path>, filetype: Option<&str>) -> bool {
+        match filetype {
+            Some(filetype) if !self.document_filetypes.is_empty() => {
+                self.document_filetypes.contains(filetype)
+            }
+            _ => self.accepts_document(path),
+        }
     }
 }
 
@@ -340,6 +353,23 @@ impl Manifest {
                             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
                 }),
                 "Document extensions must use lowercase ASCII letters or digits"
+            );
+            ensure!(
+                module.document_filetypes.is_empty()
+                    || self.permissions.contains(&Permission::ReadDocument)
+                        && module.document_filetypes.iter().all(|filetype| {
+                            filetype.len() <= 64
+                                && filetype
+                                    .as_bytes()
+                                    .first()
+                                    .is_some_and(u8::is_ascii_alphanumeric)
+                                && filetype.bytes().all(|byte| {
+                                    byte.is_ascii_lowercase()
+                                        || byte.is_ascii_digit()
+                                        || matches!(byte, b'.' | b'_' | b'-')
+                                })
+                        }),
+                "Document file types require document access and lowercase ASCII identifiers"
             );
             ensure!(
                 !module.provides.contains(&Provider::Document)

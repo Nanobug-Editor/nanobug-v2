@@ -214,8 +214,14 @@ impl Workspace {
             self.sync(window, cx);
             return;
         }
+        let filetype = self.projects.active().editor.vim().filetype_override();
         let Some((key, _, generation)) = self
-            .language_providers(Provider::Hover, scope, doc.path.as_deref())
+            .language_providers(
+                Provider::Hover,
+                scope,
+                doc.path.as_deref(),
+                filetype.as_deref(),
+            )
             .into_iter()
             .next()
         else {

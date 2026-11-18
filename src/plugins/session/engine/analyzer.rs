@@ -1,12 +1,16 @@
 //! Bind native language-server sessions to authorized plugin modules and editor revisions.
 
+mod control;
 mod hover;
+pub(super) use control::ServerControls;
 
 use super::{Answer, CallResult, Engine, Key, ResultEvent};
 use crate::plugins::{
     package::Provider,
     query,
-    session::{DocumentDiagnostics, LanguageServerPhase, LanguageServerStatus, State},
+    session::{
+        DocumentDiagnostics, LanguageServerPhase, LanguageServerStatus, State, declared_server,
+    },
     tools::rust_analyzer::{self, Analyzer, Event, ProjectSettings, Request, Server},
 };
 use nanobug_plugin_sdk::{
@@ -35,6 +39,8 @@ pub(super) struct Binding {
     /// Last phase of this process generation.
     phase: LanguageServerPhase,
     documents: Vec<Arc<DocumentSnapshot>>,
+    /// Language identifiers sent for the explicitly typed document overlays.
+    languages: BTreeMap<u64, &'static str>,
     diagnostics: BTreeMap<u64, Arc<DocumentDiagnostics>>,
     calls: BTreeMap<u64, Call>,
     error: Option<String>,
@@ -52,11 +58,13 @@ struct Call {
 impl Engine {
     /// Drop servers that lost authorization and sync newly opened or edited source documents.
     pub(super) fn sync_analyzers(&mut self) {
+        self.server_controls
+            .retain(|project| self.projects.contains_key(&project));
         let keys: Vec<_> = self
             .lifecycle
             .wanted
             .keys()
-            .filter(|key| self.analyzer_allowed(key))
+            .filter(|key| self.analyzer_allowed(key) && self.server_controls.can_attach(key))
             .cloned()
             .collect();
         let mut old = std::mem::take(&mut self.analyzers);
@@ -70,29 +78,60 @@ impl Engine {
             let starts_early = self.rules.start_language_server(&key);
             // A different open SQL buffer may select a different dialect than the active one.
             let overlays = (!server_kind.is_sql()).then_some(&project.open_documents);
+            let mut languages = BTreeMap::new();
             let documents: Vec<_> = project
                 .document
                 .iter()
                 .chain(overlays.into_iter().flatten())
-                .filter(|document| {
-                    document.path.as_ref().is_some_and(|path| {
-                        path.starts_with(&project.root)
-                            && (self.lifecycle.wanted[&key].accepts_document(Some(path))
-                                || server_kind.accepts_project_overlay(path))
-                    })
+                .filter_map(|document| {
+                    let path = document.path.as_ref()?;
+                    if !path.starts_with(&project.root) {
+                        return None;
+                    }
+                    let module = &self.lifecycle.wanted[&key];
+                    let filetype = self.document_filetype(project.id, document.opening);
+                    if !module.accepts_filetype(Some(path), filetype)
+                        && !(filetype.is_none() && server_kind.accepts_project_overlay(path))
+                    {
+                        return None;
+                    }
+                    if let Some(filetype) =
+                        filetype.filter(|_| !module.document_filetypes.is_empty())
+                    {
+                        languages.insert(
+                            document.opening,
+                            server_kind.explicit_language_id(filetype)?,
+                        );
+                    }
+                    Some(Arc::clone(document))
                 })
-                .cloned()
                 .collect();
-            if !starts_early && documents.is_empty() && !old.contains_key(&key) {
+            if !starts_early
+                && documents.is_empty()
+                && !old.contains_key(&key)
+                && !self.server_controls.restart_requested(&key)
+            {
                 continue;
             }
             let automatic_exclusions = self.rules.language_server_exclude_dirs(&key);
-            let retained = old.remove(&key).filter(|binding| {
-                binding.root == project.root
-                    && binding.generation == generation
-                    && binding.kind == server_kind
-                    && binding.automatic_exclusions.as_ref() == automatic_exclusions
-            });
+            let retained = match old.remove(&key) {
+                Some(binding)
+                    if binding.root == project.root
+                        && binding.generation == generation
+                        && binding.kind == server_kind
+                        && binding.automatic_exclusions.as_ref() == automatic_exclusions =>
+                {
+                    Some(binding)
+                }
+                Some(binding) => {
+                    self.server_controls.retire(key.clone(), binding);
+                    if !self.server_controls.can_attach(&key) {
+                        continue;
+                    }
+                    None
+                }
+                None => None,
+            };
             let mut binding = match retained {
                 Some(binding) => binding,
                 None => {
@@ -130,24 +169,39 @@ impl Engine {
                         server,
                         phase,
                         documents: Vec::new(),
+                        languages: BTreeMap::new(),
                         diagnostics: BTreeMap::new(),
                         calls: BTreeMap::new(),
                         error,
                     }
                 }
             };
-            if !same_documents(&binding.documents, &documents) {
+            if !same_documents(&binding.documents, &documents) || binding.languages != languages {
                 if let Some(server) = &binding.server {
-                    server.sync(documents.clone());
+                    server.sync_with_languages(documents.clone(), languages.clone());
                 }
                 binding.diagnostics.retain(|opening, entry| {
-                    documents.iter().any(|doc| {
-                        doc.opening == *opening
-                            && version(doc) == entry.version
-                            && doc.path.as_ref() == Some(&entry.path)
-                    })
+                    binding.languages.get(opening) == languages.get(opening)
+                        && documents.iter().any(|doc| {
+                            doc.opening == *opening
+                                && version(doc) == entry.version
+                                && doc.path.as_ref() == Some(&entry.path)
+                        })
                 });
                 binding.documents = documents;
+                if binding.languages != languages {
+                    binding.calls.retain(|_, call| {
+                        let opening = &call.document.opening;
+                        let current = binding.languages.get(opening) == languages.get(opening);
+                        if !current {
+                            let _ = call
+                                .answer
+                                .try_send(Err("Document file type changed".into()));
+                        }
+                        current
+                    });
+                    binding.languages = languages;
+                }
             }
             binding.calls.retain(|_, call| {
                 if call.answer.is_closed() {
@@ -174,9 +228,11 @@ impl Engine {
             }
             let current_document = project.document.as_ref().and_then(|document| {
                 let path = document.path.as_ref()?;
-                (path.starts_with(&project.root)
-                    && self.lifecycle.wanted[&key].accepts_document(Some(path)))
-                .then_some((document.opening, path))
+                binding
+                    .documents
+                    .iter()
+                    .any(|attached| same_snapshot(attached, document))
+                    .then_some((document.opening, path))
             });
             // A server for the selected document takes priority over a project startup.
             if (starts_early || current_document.is_some())
@@ -195,6 +251,10 @@ impl Engine {
             }
             self.analyzers.insert(key, binding);
         }
+        for (key, binding) in old {
+            self.server_controls.retire(key, binding);
+        }
+        self.server_controls.complete(&self.analyzers);
         self.changed |= self.view.document_diagnostics.len() != visible.len()
             || visible.iter().any(|(key, value)| {
                 self.view
@@ -217,6 +277,12 @@ impl Engine {
     fn analyzer_allowed(&self, key: &Key) -> bool {
         self.analyzer_kind(key).is_some()
             && self.view.modules.get(key) == Some(&State::Ready)
+            && self.analyzer_authority(key)
+    }
+
+    /// Check launch authority independently of file matching and runtime readiness.
+    fn analyzer_authority(&self, key: &Key) -> bool {
+        self.enabled
             && !self.installation.busy(&key.namespace)
             && !self.is_draining(key.instance.project)
             && self.records.get(&key.namespace).is_some_and(|record| {
@@ -236,10 +302,7 @@ impl Engine {
 
     /// Resolve the server declared by the current module, including the legacy Rust flag.
     fn analyzer_kind(&self, key: &Key) -> Option<Server> {
-        let module = self.lifecycle.wanted.get(key)?;
-        module
-            .language_server
-            .or(module.rust_analyzer.then_some(Server::RustAnalyzer))
+        declared_server(self.lifecycle.wanted.get(key)?)
     }
 
     /// Handle declared language queries in the host, leaving unrelated plugin events on WASM.
@@ -270,6 +333,9 @@ impl Engine {
         {
             return false;
         }
+        if !self.server_controls.can_attach(key) {
+            return false;
+        }
         let fail = |error| {
             if provider == Provider::Complete {
                 return false;
@@ -297,7 +363,11 @@ impl Engine {
                 server.name()
             ));
         };
-        let Some(server) = &binding.server else {
+        let Some(server) = binding
+            .server
+            .as_ref()
+            .filter(|_| binding.phase != LanguageServerPhase::Failed)
+        else {
             return fail(
                 binding
                     .error
@@ -439,7 +509,7 @@ impl Engine {
                 }
             }
             Event::Failed(error) => {
-                binding.server.take();
+                // Keep the worker receipt so a restart can wait for its exact teardown.
                 binding.phase = LanguageServerPhase::Failed;
                 binding.diagnostics.clear();
                 for (_, call) in std::mem::take(&mut binding.calls) {

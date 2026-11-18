@@ -1,8 +1,11 @@
 //! Vim defaults, window-local display and buffer-local editing options.
 
-use super::{InputMappings, Register, Vim};
+use super::{ExOrigin, InputMappings, Register, Vim};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, RwLock},
+};
 
 /// A generous native-format bound on numeric indentation settings.
 pub(super) const MAX_COLUMNS: usize = 9999;
@@ -41,6 +44,12 @@ pub struct VimOptions {
     pub viewdir: String,
     /// Ordered roots for explicitly sourcing local Vim runtime scripts.
     pub runtimepath: String,
+    /// Diagnostic detail emitted by Ex commands and the local script interpreter.
+    pub verbose: u32,
+    /// Append Ex messages and diagnostics to this file when set.
+    pub verbosefile: String,
+    /// Run automatic Vim filetype detection for buffers with no assigned type.
+    pub filetype_detection: bool,
     /// Default values for the next buffer created after applying these settings.
     pub(super) buffer: BufferOptions,
     /// Default values for each newly created window.
@@ -86,6 +95,9 @@ impl Default for VimOptions {
             ),
             viewdir: String::new(),
             runtimepath: String::new(),
+            verbose: 0,
+            verbosefile: String::new(),
+            filetype_detection: true,
             buffer: BufferOptions::default(),
             window: WindowOptions::default(),
         }
@@ -110,33 +122,33 @@ impl VimOptions {
         let mut default_options = defaults.clone();
         let mut default_window = defaults.window;
         let mut default_buffer = defaults.buffer.clone();
-        NAMES
-            .iter()
-            .filter_map(|&(name, _)| {
-                let current = set_option(
-                    name,
-                    Setting::Query,
-                    Scope::Global,
-                    false,
-                    &mut current,
-                    &mut current_window,
-                    &mut current_buffer,
-                )
-                .ok()
-                .flatten()?;
-                let default = set_option(
-                    name,
-                    Setting::Query,
-                    Scope::Global,
-                    false,
-                    &mut default_options,
-                    &mut default_window,
-                    &mut default_buffer,
-                )
-                .ok()
-                .flatten()?;
-                (current != default).then(|| format!("set {}", ex_escape_option(&current)))
-            })
+        let lines = NAMES.iter().filter_map(|&(name, _)| {
+            let current = set_option(
+                name,
+                Setting::Query,
+                Scope::Global,
+                false,
+                &mut current,
+                &mut current_window,
+                &mut current_buffer,
+            )
+            .ok()
+            .flatten()?;
+            let default = set_option(
+                name,
+                Setting::Query,
+                Scope::Global,
+                false,
+                &mut default_options,
+                &mut default_window,
+                &mut default_buffer,
+            )
+            .ok()
+            .flatten()?;
+            (current != default).then(|| format!("set {}", ex_escape_option(&current)))
+        });
+        lines
+            .chain((!self.filetype_detection).then(|| "filetype off".into()))
             .collect()
     }
 }
@@ -164,6 +176,14 @@ pub(super) struct BufferOptions {
     /// Protect writes to this buffer's backing file without blocking edits.
     #[serde(skip)]
     readonly: bool,
+    /// Permit a local crash recovery file for this shared buffer.
+    swapfile: bool,
+    /// Filetype supplied explicitly or by :filetype detect for this buffer.
+    #[serde(skip)]
+    filetype: super::ex_languages::BufferFiletype,
+    /// Locations of explicit source assignments, shared with other views of this buffer.
+    #[serde(skip)]
+    origins: BTreeMap<&'static str, ExOrigin>,
 }
 
 impl Default for BufferOptions {
@@ -177,6 +197,9 @@ impl Default for BufferOptions {
             path: None,
             autoread: None,
             readonly: false,
+            swapfile: true,
+            filetype: Default::default(),
+            origins: BTreeMap::new(),
         }
     }
 }
@@ -280,10 +303,14 @@ const NAMES: &[(&str, &str)] = &[
     ("autoread", "ar"),
     ("writeany", "wa"),
     ("readonly", "ro"),
+    ("swapfile", "swf"),
+    ("filetype", "ft"),
     ("cdhome", "cdh"),
     ("cdpath", "cd"),
     ("viewdir", "vdir"),
     ("runtimepath", "rtp"),
+    ("verbose", "vbs"),
+    ("verbosefile", "vfile"),
 ];
 
 /// Option names starting with the current completion `prefix`.
@@ -340,12 +367,10 @@ impl Vim {
 
     /// Record the new tab spacing from :retab in this buffer's local options.
     pub(super) fn set_buffer_tabstop(&mut self, columns: usize) {
-        self.buffer_options
-            .as_ref()
-            .unwrap()
-            .write()
-            .unwrap()
-            .tabstop = columns;
+        let mut buffer = self.buffer_options.as_ref().unwrap().write().unwrap();
+        buffer.tabstop = columns;
+        let origin = self.options.current_ex_origin();
+        remember_origin(&mut buffer.origins, "tabstop", origin.as_ref());
         self.doc.set_tabstop(columns);
     }
 
@@ -378,11 +403,102 @@ impl Vim {
         self.buffer_options().readonly
     }
 
+    /// Return whether the shared buffer can write crash recovery checkpoints.
+    pub fn swapfile_enabled(&self) -> bool {
+        self.buffer_options.as_ref().map_or_else(
+            || self.options.with_options(|options| options.buffer.swapfile),
+            |options| options.read().unwrap().swapfile,
+        )
+    }
+
+    /// Disable recovery for a buffer newly loaded under the :noswapfile modifier.
+    pub fn disable_swapfile(&mut self) {
+        if self.buffer_options.is_none() {
+            self.set_input_options(&self.options.clone());
+        }
+        let mut buffer = self.buffer_options.as_ref().unwrap().write().unwrap();
+        buffer.swapfile = false;
+        let origin = self.options.current_ex_origin();
+        remember_origin(&mut buffer.origins, "swapfile", origin.as_ref());
+    }
+
+    /// Return this shared buffer's authoritative type override for language provider routing.
+    pub fn filetype_override(&self) -> Option<String> {
+        self.buffer_options
+            .as_ref()?
+            .read()
+            .unwrap()
+            .filetype
+            .name
+            .as_deref()
+            .map(str::to_owned)
+    }
+
+    /// Return the assigned type or the Vim-level type inferred from this buffer's true identity.
+    pub(crate) fn filetype(&self) -> String {
+        if let Some(name) = self.filetype_override() {
+            return name;
+        }
+        self.options
+            .with_options(|options| options.filetype_detection)
+            .then(|| super::ex_languages::infer(self.doc.path.as_deref(), &self.doc.text))
+            .flatten()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// Assign `name` unless a previous nonfallback assignment already owns the buffer's type.
+    pub(super) fn assign_detected_filetype(&mut self, name: String, fallback: bool) {
+        self.set_input_options(&self.options.clone());
+        let filetype = {
+            let buffer = self.buffer_options.as_ref().unwrap().read().unwrap();
+            (buffer.filetype.name.is_none() || buffer.filetype.fallback).then_some(
+                super::ex_languages::BufferFiletype {
+                    name: Some(Arc::from(name)),
+                    fallback,
+                },
+            )
+        };
+        if let Some(filetype) = filetype {
+            self.replace_filetype(filetype);
+        }
+    }
+
+    /// Rerun detection, supplying a language route when the real extension cannot select one.
+    pub(super) fn redetect_filetype(&mut self) {
+        let name = self.doc.path.as_deref().and_then(|path| {
+            (path.extension().is_none() || super::ex_languages::infer(Some(path), "").is_none())
+                .then(|| super::ex_languages::infer(Some(path), &self.doc.text))
+                .flatten()
+                .map(Arc::from)
+        });
+        self.replace_filetype(super::ex_languages::BufferFiletype {
+            fallback: name.is_some(),
+            name,
+        });
+    }
+
+    /// Replace filetype state together with the shared language result version.
+    fn replace_filetype(&mut self, filetype: super::ex_languages::BufferFiletype) {
+        let changed = {
+            let mut buffer = self.buffer_options.as_ref().unwrap().write().unwrap();
+            let changed = buffer.filetype.name != filetype.name;
+            buffer.filetype = filetype;
+            let origin = self.options.current_ex_origin();
+            remember_origin(&mut buffer.origins, "filetype", origin.as_ref());
+            changed
+        };
+        if changed {
+            self.doc.invalidate_language_dependents();
+        }
+    }
+
     /// Export the buffer and window options implemented by this editor as :setlocal lines.
     pub fn ex_view_option_lines(&self, register: &Register) -> Vec<String> {
         let mut options = self.options.options();
         let mut window = self.view_options(register);
         let mut buffer = self.buffer_options();
+        let export_filetype = buffer.filetype.name.is_some();
         [
             "number",
             "relativenumber",
@@ -394,10 +510,13 @@ impl Vim {
             "expandtab",
             "autoindent",
             "readonly",
+            "swapfile",
+            "filetype",
             "path",
             "autoread",
         ]
         .into_iter()
+        .filter(|name| *name != "filetype" || export_filetype)
         .filter_map(|name| {
             set_option(
                 name,
@@ -522,6 +641,8 @@ impl Vim {
         };
         self.set_input_options(&register.input_maps);
         let mut global = register.input_maps.options();
+        global.verbose = register.input_maps.ex_verbose();
+        let show_origins = global.verbose > 0;
         let mut window_defaults = global.window;
         global.window = register.window_options();
         let mut buffer = self.buffer_options();
@@ -536,6 +657,7 @@ impl Vim {
                 self.option_error(token);
                 return true;
             };
+            let previous_filetype = buffer.filetype.name.clone();
             match set_option(
                 name,
                 setting,
@@ -545,8 +667,69 @@ impl Vim {
                 &mut window,
                 &mut buffer,
             ) {
-                Ok(Some(value)) => output.push(value),
+                Ok(Some(mut value)) => {
+                    if name == "filetype" && scope != Scope::Global {
+                        value = format!("filetype={}", self.filetype());
+                    }
+                    if show_origins {
+                        let origin = match (scope, name) {
+                            (Scope::Global, _) => register.input_maps.ex_option_origin(name),
+                            (_, "number" | "relativenumber" | "wrap" | "scrollbind") => {
+                                self.view_option_origins.get(name).cloned()
+                            }
+                            (_, "scrolloff") if window.scrolloff.is_some() => {
+                                self.view_option_origins.get(name).cloned()
+                            }
+                            (_, "path") if buffer.path.is_some() => {
+                                buffer.origins.get(name).cloned()
+                            }
+                            (_, "autoread") if buffer.autoread.is_some() => {
+                                buffer.origins.get(name).cloned()
+                            }
+                            (
+                                _,
+                                "tabstop" | "shiftwidth" | "textwidth" | "expandtab" | "autoindent"
+                                | "readonly" | "swapfile" | "filetype",
+                            ) => buffer.origins.get(name).cloned(),
+                            _ => register.input_maps.ex_option_origin(name),
+                        };
+                        if let Some(origin) = &origin {
+                            origin.append_inline(&mut value);
+                        }
+                    }
+                    output.push(value);
+                }
                 Ok(None) => {
+                    let origin = register.input_maps.current_ex_origin();
+                    let is_window_local = matches!(
+                        name,
+                        "number" | "relativenumber" | "wrap" | "scrollbind" | "scrolloff"
+                    );
+                    let is_buffer_local = matches!(
+                        name,
+                        "tabstop"
+                            | "shiftwidth"
+                            | "textwidth"
+                            | "expandtab"
+                            | "autoindent"
+                            | "path"
+                            | "autoread"
+                            | "readonly"
+                            | "swapfile"
+                            | "filetype"
+                    );
+                    if scope != Scope::Global && is_window_local {
+                        remember_origin(&mut self.view_option_origins, name, origin.as_ref());
+                    }
+                    if scope != Scope::Global && is_buffer_local {
+                        remember_origin(&mut buffer.origins, name, origin.as_ref());
+                    }
+                    if scope != Scope::Local && is_buffer_local {
+                        remember_origin(&mut global.buffer.origins, name, origin.as_ref());
+                    }
+                    if scope != Scope::Local || !is_window_local && !is_buffer_local {
+                        register.input_maps.set_ex_option_origin(name, origin);
+                    }
                     match name {
                         "number" => window_defaults.number = global.window.number,
                         "relativenumber" => {
@@ -564,11 +747,14 @@ impl Vim {
                     } else {
                         window_defaults
                     };
-                    register.input_maps.set_options(updated);
+                    register.input_maps.set_ex_options(updated);
                     register.set_window_options(global.window);
                     self.view_options = Some(window);
                     *self.buffer_options.as_ref().unwrap().write().unwrap() = buffer.clone();
                     self.doc.set_tabstop(buffer.tabstop);
+                    if name == "filetype" && previous_filetype != buffer.filetype.name {
+                        self.doc.invalidate_language_dependents();
+                    }
                     if name == "hlsearch" {
                         self.search_highlights_hidden = false;
                     }
@@ -584,7 +770,7 @@ impl Vim {
             let mut default_window = defaults.window;
             let mut default_buffer = defaults.buffer.clone();
             for &(name, _) in NAMES {
-                let value = set_option(
+                let mut value = set_option(
                     name,
                     Setting::Query,
                     scope,
@@ -594,6 +780,9 @@ impl Vim {
                     &mut buffer,
                 )
                 .unwrap();
+                if name == "filetype" && scope != Scope::Global {
+                    value = Some(format!("filetype={}", self.filetype()));
+                }
                 let default = set_option(
                     name,
                     Setting::Query,
@@ -823,18 +1012,23 @@ fn set_option(
             None,
             defaults.timeout,
         ),
-        "timeoutlen" => {
-            let mut duration = global.timeoutlen as usize;
+        "timeoutlen" | "verbose" => {
+            let (value, default) = if name == "verbose" {
+                (&mut global.verbose, defaults.verbose)
+            } else {
+                (&mut global.timeoutlen, defaults.timeoutlen)
+            };
+            let mut current = *value as usize;
             let report = numeric(
                 name,
                 scope,
                 setting,
-                &mut duration,
+                &mut current,
                 None,
-                defaults.timeoutlen as usize,
+                default as usize,
                 0..=u32::MAX as usize,
             )?;
-            global.timeoutlen = duration as u32;
+            *value = current as u32;
             Ok(report)
         }
         "path" => {
@@ -902,6 +1096,39 @@ fn set_option(
             Some(&mut buffer.readonly),
             false,
         ),
+        "swapfile" => boolean(
+            name,
+            scope,
+            setting,
+            &mut global.buffer.swapfile,
+            Some(&mut buffer.swapfile),
+            defaults.buffer.swapfile,
+        ),
+        "filetype" => {
+            if matches!(setting, Setting::Query | Setting::Boolean(true)) {
+                let current = if scope == Scope::Global {
+                    ""
+                } else {
+                    buffer.filetype.name.as_deref().unwrap_or_default()
+                };
+                return Ok(Some(format!("filetype={current}")));
+            }
+            if scope == Scope::Global {
+                return Err(());
+            }
+            let name = match setting {
+                Setting::Assign("") | Setting::Inherit | Setting::Reset => None,
+                Setting::Assign(value) => {
+                    Some(Arc::from(super::ex_languages::normalize(value).ok_or(())?))
+                }
+                _ => return Err(()),
+            };
+            buffer.filetype = super::ex_languages::BufferFiletype {
+                name,
+                fallback: false,
+            };
+            Ok(None)
+        }
         "cdhome" => boolean(
             name,
             scope,
@@ -963,6 +1190,25 @@ fn set_option(
             };
             Ok(None)
         }
+        "verbosefile" => {
+            global.verbosefile = match setting {
+                Setting::Query | Setting::Boolean(true) => {
+                    return Ok(Some(format!("verbosefile={}", global.verbosefile)));
+                }
+                Setting::Assign(value) => value.replace("\\ ", " "),
+                Setting::Append(value) => global.verbosefile.clone() + &value.replace("\\ ", " "),
+                Setting::Prepend(value) => value.replace("\\ ", " ") + &global.verbosefile,
+                Setting::Remove(value) => {
+                    global
+                        .verbosefile
+                        .replacen(&value.replace("\\ ", " "), "", 1)
+                }
+                Setting::Reset => defaults.verbosefile,
+                Setting::Inherit => return Ok(None),
+                _ => return Err(()),
+            };
+            Ok(None)
+        }
         "scrolloff" => {
             if matches!(setting, Setting::Inherit | Setting::Assign("-1")) && scope == Scope::Local
             {
@@ -985,6 +1231,19 @@ fn set_option(
             Ok(report)
         }
         _ => Err(()),
+    }
+}
+
+/// An assignment made directly in the editor clears the previous script location.
+fn remember_origin(
+    origins: &mut BTreeMap<&'static str, ExOrigin>,
+    name: &'static str,
+    origin: Option<&ExOrigin>,
+) {
+    if let Some(origin) = origin {
+        origins.insert(name, origin.clone());
+    } else {
+        origins.remove(name);
     }
 }
 
@@ -1117,6 +1376,30 @@ mod tests {
         second_view.share_buffer_options(&vim);
         assert!(second_view.view_options(&second).number);
         assert_eq!(second_view.doc.tabstop(), 2);
+    }
+
+    /// Swapfile settings are shared by buffer views and use separate defaults for new buffers.
+    #[test]
+    fn swapfile_option_is_shared_by_views_and_keeps_global_defaults_separate() {
+        let mut register = Register::default();
+        let mut file = Vim::new(Document::new("file"));
+        command(&mut file, &mut register, "setlocal swf?");
+        assert_eq!(file.message, "swapfile");
+        let mut second_view = Vim::new(Document::new("file"));
+        second_view.share_buffer_options(&file);
+        file.disable_swapfile();
+        assert!(!file.swapfile_enabled());
+        assert!(!second_view.swapfile_enabled());
+
+        command(&mut file, &mut register, "setlocal swf");
+        command(&mut file, &mut register, "setglobal noswapfile");
+        assert!(second_view.swapfile_enabled());
+        let mut other = Vim::new(Document::new("other"));
+        other.set_input_options(&register.input_maps);
+        assert!(!other.swapfile_enabled());
+        command(&mut file, &mut register, "setlocal swapfile<");
+        assert!(!file.swapfile_enabled());
+        assert!(!second_view.swapfile_enabled());
     }
 
     #[test]

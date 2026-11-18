@@ -8,7 +8,10 @@ use super::{
     Action, Register, ScreenMotionResolver, Vim, expression::Value, options::MAX_COLUMNS, pattern,
     register::Kind,
 };
-use crate::{document::Document, i18n};
+use crate::{
+    document::{Document, MarkModifiers, current_mark_modifiers, with_mark_modifiers},
+    i18n,
+};
 use std::{cmp::Ordering, collections::VecDeque, ops::Range, sync::LazyLock};
 
 /// Horizontal whitespace runs that can be recalculated by :retab.
@@ -77,6 +80,8 @@ pub(super) struct Lines {
     revision: u64,
     command: String,
     printed: Vec<String>,
+    /// Restore the outer command's mark behavior after a confirmation prompt.
+    marks: MarkModifiers,
 }
 
 impl Lines {
@@ -577,6 +582,7 @@ impl Vim {
             printed: Vec::new(),
             initial_revision: self.doc.revision,
             revision: self.doc.revision,
+            marks: current_mark_modifiers(),
         });
         self.continue_ex_lines(register, resolve_screen)
     }
@@ -603,8 +609,11 @@ impl Vim {
                 break;
             };
             self.set_cursor(position);
+            let marks = lines.marks;
             self.ex_lines = Some(lines);
-            let supported = self.ex_on_current_line(&command, register, resolve_screen);
+            let supported = with_mark_modifiers(marks, || {
+                self.ex_on_current_line(&command, register, resolve_screen)
+            });
             let Some(next) = self.ex_lines.take() else {
                 break;
             };
@@ -627,6 +636,15 @@ impl Vim {
         register: &mut Register,
         resolve_screen: &mut ScreenMotionResolver<'_>,
     ) -> bool {
+        if let Some((modifiers, command)) = super::ex_window_modifiers::parse_modifiers(command)
+            && !modifiers.has_native_options()
+            && !command.is_empty()
+        {
+            let mappings = register.input_maps.clone();
+            return modifiers.with_ex_state(&mappings, || {
+                self.ex_on_current_line(command, register, resolve_screen)
+            });
+        }
         match self.ex_batch(command, register, resolve_screen) {
             Some(Action::None) => true,
             None if self.substitute_command(command) => true,
@@ -739,6 +757,9 @@ impl Vim {
             .marks
             .iter()
             .filter_map(|(&name, &at)| {
+                if current_mark_modifiers().lock_marks && !matches!(name, '\'' | '`') {
+                    return None;
+                }
                 let row = self.doc.location(at).0;
                 if !rows.contains(&row) {
                     return None;
@@ -755,7 +776,27 @@ impl Vim {
                 Some((name, position))
             })
             .collect();
+        // A :move permutes original lines, so their signs follow even when the text splice
+        // would otherwise invalidate a replaced line's decorations.
+        let moved_signs: Vec<_> = if moving {
+            self.doc
+                .signs()
+                .into_iter()
+                .filter_map(|sign| {
+                    rows.contains(&sign.row)
+                        .then(|| (offsets[sign.row - rows.start], sign))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.replace(bytes, &text, true);
+        for (start, mut sign) in moved_signs.into_iter().rev() {
+            if let Some(start) = start {
+                sign.row = self.doc.location(start).0;
+                self.doc.place_sign(sign);
+            }
+        }
         if let (Some(lines), Some(marked)) = (&mut self.ex_lines, marked) {
             lines.positions = marked;
         }

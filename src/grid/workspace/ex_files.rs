@@ -132,10 +132,7 @@ impl Workspace {
         }
         let position = doc.location(doc.cursor).0 + 1;
         let message = format!("\"{name}\"{state} line {position} of {}", doc.starts.len());
-        self.projects.active_mut().editor.edit(|vim, _| {
-            vim.publish_ex_message(&message, false);
-            Action::None
-        });
+        self.ex_output_message(&message, false);
     }
 
     /// Handle an edit or write-protected view, including reload without a filename.
@@ -404,6 +401,12 @@ impl Workspace {
         } else {
             1
         };
+        if self.input_mappings.ex_verbose() >= 11 {
+            self.input_mappings.trace_ex(
+                11,
+                &format!("Searching for \"{name}\" in {}", vim.file_search_path()),
+            );
+        }
         let Some(path) = find_file(
             self.ex_current_dir(),
             from,

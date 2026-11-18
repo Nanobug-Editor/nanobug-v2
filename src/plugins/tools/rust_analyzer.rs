@@ -98,13 +98,21 @@ enum QuerySource {
     Indexed(Arc<DocumentSnapshot>),
 }
 
-type Snapshots = Arc<Mutex<Option<Vec<Arc<DocumentSnapshot>>>>>;
+/// Coalesced snapshots and validated language identifiers for opted-in documents.
+struct Documents {
+    snapshots: Vec<Arc<DocumentSnapshot>>,
+    languages: BTreeMap<u64, &'static str>,
+}
+
+type Snapshots = Arc<Mutex<Option<Documents>>>;
 
 /// Nonblocking handle for a project's LSP process.
 pub(in crate::plugins) struct Analyzer {
     snapshots: Snapshots,
     queries: SyncSender<Query>,
     stop: Arc<AtomicBool>,
+    /// Finishes after the server's owned processes have been killed and reaped.
+    worker: thread::JoinHandle<()>,
 }
 
 impl Analyzer {
@@ -124,7 +132,7 @@ impl Analyzer {
         let (queries, incoming) = mpsc::sync_channel(24);
         let latest = snapshots.clone();
         let stopped = stop.clone();
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name(format!("nanobug-{}", server.name()))
             .spawn(move || {
                 let cancelled =
@@ -148,12 +156,52 @@ impl Analyzer {
             snapshots,
             queries,
             stop,
+            worker,
         })
     }
 
+    /// Ask the worker to drop its process endpoints without blocking the supervisor.
+    pub(in crate::plugins) fn request_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        self.worker.thread().unpark();
+    }
+
+    /// Check whether this worker has released and reaped its process endpoints.
+    pub(in crate::plugins) fn has_stopped(&self) -> bool {
+        self.worker.is_finished()
+    }
+
+    /// Represent a test worker whose shutdown can be held until an assertion releases it.
+    #[cfg(test)]
+    pub(in crate::plugins) fn with_test_worker(
+        stop: Arc<AtomicBool>,
+        worker: thread::JoinHandle<()>,
+    ) -> Self {
+        let (queries, _) = mpsc::sync_channel(1);
+        Self {
+            snapshots: Snapshots::default(),
+            queries,
+            stop,
+            worker,
+        }
+    }
+
     /// Replace the set of open snapshots for this project. Superseded edits can be coalesced.
+    #[cfg(test)]
     pub(in crate::plugins) fn sync(&self, documents: Vec<Arc<DocumentSnapshot>>) {
-        *self.snapshots.lock().unwrap() = Some(documents);
+        self.sync_with_languages(documents, BTreeMap::new());
+    }
+
+    /// Publish `documents` with explicit `languages` keyed by their stable opening IDs.
+    pub(in crate::plugins) fn sync_with_languages(
+        &self,
+        documents: Vec<Arc<DocumentSnapshot>>,
+        languages: BTreeMap<u64, &'static str>,
+    ) {
+        *self.snapshots.lock().unwrap() = Some(Documents {
+            snapshots: documents,
+            languages,
+        });
     }
 
     /// Queue a position query for the exact `version` at UTF-8 byte `offset` in `path`.
@@ -213,13 +261,15 @@ impl Analyzer {
 
 impl Drop for Analyzer {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.request_stop();
     }
 }
 
 /// Snapshot and strictly increasing LSP version for an open document URI.
 struct Open {
     snapshot: Arc<DocumentSnapshot>,
+    /// LSP language ID sent when this URI was opened.
+    language: &'static str,
     version: i32,
     /// Next pull request for this document version, if the server supports pull diagnostics.
     diagnose_at: Option<Instant>,
@@ -431,19 +481,19 @@ fn run(
             let changed = snapshots.lock().unwrap().take();
             if let Some(changed) = changed {
                 if let Some(bridge) = &mut vue {
-                    bridge.sync(root, &changed)?;
+                    bridge.sync(root, &changed.snapshots)?;
                 }
                 if server.sqlfluff_dialect().is_some() {
                     sql_changes = Some((now + DIAGNOSTIC_IDLE, changed));
                 } else {
-                    client.sync(root, changed)?;
+                    client.sync_with_languages(root, changed.snapshots, &changed.languages)?;
                 }
             }
             // SQLFluff launches a linter for every open notification. Coalesce rapid edits.
             if sql_changes.as_ref().is_some_and(|(due, _)| now >= *due)
                 && let Some((_, documents)) = sql_changes.take()
             {
-                client.sync(root, documents)?;
+                client.sync_with_languages(root, documents.snapshots, &documents.languages)?;
             }
             // Rust can answer completion and navigation before it can diagnose the loaded project.
             rust_loaded |= client.rust_quiescent || now.duration_since(started) >= INITIALIZE_WAIT;
@@ -480,7 +530,7 @@ fn run(
             }
         }
         deferred = next;
-        thread::sleep(TICK);
+        thread::park_timeout(TICK);
     }
     Ok(())
 }
@@ -611,6 +661,16 @@ impl Client {
 
     /// Close missing URIs and send whole-document updates only for new revisions.
     fn sync(&mut self, root: &Path, documents: Vec<Arc<DocumentSnapshot>>) -> Result<()> {
+        self.sync_with_languages(root, documents, &BTreeMap::new())
+    }
+
+    /// Reopen a URI when its `languages` ID changes and keep its real path.
+    fn sync_with_languages(
+        &mut self,
+        root: &Path,
+        documents: Vec<Arc<DocumentSnapshot>>,
+        languages: &BTreeMap<u64, &'static str>,
+    ) -> Result<()> {
         let sqlfluff = self.server.sqlfluff_dialect().is_some();
         let documents: BTreeMap<_, _> = documents
             .into_iter()
@@ -625,14 +685,17 @@ impl Client {
                 } else {
                     file_uri(path)?
                 };
-                Some((uri, (self.server.language_id(path)?, doc)))
+                let language = languages
+                    .get(&doc.opening)
+                    .copied()
+                    .or_else(|| self.server.language_id(path))?;
+                Some((uri, (language, doc)))
             })
             .collect();
         for (uri, open) in &self.documents {
-            if documents
-                .get(uri)
-                .is_none_or(|(_, doc)| doc.opening != open.snapshot.opening)
-            {
+            if documents.get(uri).is_none_or(|(language, doc)| {
+                *language != open.language || doc.opening != open.snapshot.opening
+            }) {
                 self.notify(
                     "textDocument/didClose",
                     json!({"textDocument": {"uri": uri}}),
@@ -640,9 +703,9 @@ impl Client {
             }
         }
         self.documents.retain(|uri, open| {
-            documents
-                .get(uri)
-                .is_some_and(|(_, doc)| doc.opening == open.snapshot.opening)
+            documents.get(uri).is_some_and(|(language, doc)| {
+                *language == open.language && doc.opening == open.snapshot.opening
+            })
         });
         for (uri, (language, snapshot)) in documents {
             let previous = self.documents.get(&uri);
@@ -680,6 +743,7 @@ impl Client {
                 uri,
                 Open {
                     snapshot,
+                    language,
                     version,
                     diagnose_at: self
                         .pull_diagnostics
@@ -1164,6 +1228,44 @@ fn write_message(writer: &mut impl Write, message: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keep the true URI and reopen it when the host changes its explicit language ID.
+    #[test]
+    fn filetype_override_reopens_the_real_uri() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let root = project.path().canonicalize()?;
+        let path = root.join("snippet");
+        let uri = file_uri(&path).unwrap();
+        let doc = Arc::new(DocumentSnapshot {
+            opening: 1,
+            revision: 1,
+            path: Some(path),
+            text: "const value = 1;".into(),
+        });
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let mut client = Client::new(Server::Typescript, sender, Value::Null, Value::Null);
+        client.sync(&root, vec![doc.clone()])?;
+        assert!(receiver.try_recv().is_err());
+        let sync = |client: &mut Client, filetype| {
+            let id = Server::Typescript.explicit_language_id(filetype).unwrap();
+            client.sync_with_languages(&root, vec![doc.clone()], &BTreeMap::from([(1, id)]))
+        };
+        sync(&mut client, "typescript")?;
+        let opened = receiver.try_recv()?;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        assert_eq!(opened["params"]["textDocument"]["uri"], uri);
+        assert_eq!(opened["params"]["textDocument"]["languageId"], "typescript");
+        sync(&mut client, "javascript")?;
+        assert_eq!(receiver.try_recv()?["method"], "textDocument/didClose");
+        let reopened = receiver.try_recv()?;
+        assert_eq!(reopened["method"], "textDocument/didOpen");
+        assert_eq!(reopened["params"]["textDocument"]["uri"], uri);
+        assert_eq!(
+            reopened["params"]["textDocument"]["languageId"],
+            "javascript"
+        );
+        Ok(())
+    }
 
     /// Hover uses negotiated content formats and ignores a reply to a superseded snapshot.
     #[test]

@@ -20,6 +20,7 @@ impl Workspace {
             return;
         };
         let definitions = self.input_mappings.clone();
+        definitions.set_ex_log_directory(self.ex_current_dir());
         let scope = self
             .projects
             .active_project()

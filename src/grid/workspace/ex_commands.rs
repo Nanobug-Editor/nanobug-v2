@@ -10,7 +10,7 @@ use gpui::{Context, Window};
 use nanobug::{
     document::Document,
     i18n,
-    vim::{Action, ScriptEvent},
+    vim::{Action, ScriptEvent, WindowModifiers, without_ex_keep_jumps},
 };
 use std::{
     collections::HashSet,
@@ -27,6 +27,10 @@ struct ExProgramFrame {
     keymap: Option<String>,
     mode: Option<Action>,
     failure: Option<String>,
+    /// Restore the draft-suppression scope after an asynchronous command resumes this frame.
+    no_swapfile: bool,
+    /// Resume the verbosity requested by an enclosing :verbose source command.
+    verbose: Option<u32>,
 }
 
 /// Work resumed by an asynchronous Ex command in its originating window.
@@ -38,13 +42,14 @@ impl Workspace {
         &mut self,
         text: &str,
         source: Option<&str>,
+        source_line: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(project) = self.projects.active_project() else {
             return;
         };
-        let lines = project.editor.vim().script_lines(text, 1);
+        let lines = project.editor.vim().script_lines(text, source_line);
         let display = source.unwrap_or(":command");
         match nanobug::vim::ScriptProgram::user_command(lines, source.map(str::to_owned)) {
             Ok(program) => self.execute_ex_program(
@@ -55,6 +60,8 @@ impl Workspace {
                     keymap: None,
                     mode: None,
                     failure: None,
+                    no_swapfile: self.active_ex_window_modifiers.no_swapfile,
+                    verbose: self.active_ex_window_modifiers.verbose,
                 },
                 window,
                 cx,
@@ -136,13 +143,16 @@ impl Workspace {
             self.projects
                 .save_editor_buffer(tab, pane, index, destination.clone())
         };
-        self.report_ex_result(result)
-            && self.script_write_event(
-                ScriptEvent::BufWritePost,
-                destination.as_deref(),
-                window,
-                cx,
-            )
+        if !self.report_ex_result(result) {
+            return false;
+        }
+        self.prune_resolved_drafts();
+        self.script_write_event(
+            ScriptEvent::BufWritePost,
+            destination.as_deref(),
+            window,
+            cx,
+        )
     }
 
     /// Write every dirty buffer in the active Session or every open tab when `all` is true.
@@ -226,6 +236,7 @@ impl Workspace {
             }
         }
         let ok = failures.is_empty();
+        self.prune_resolved_drafts();
         self.set_status(failures.join(" | "));
         ok
     }
@@ -540,6 +551,10 @@ impl Workspace {
         if file.is_some() && self.restore_exported_session(&text, &source, window, cx) {
             return;
         }
+        if self.input_mappings.ex_verbose() >= 2 {
+            self.input_mappings
+                .trace_ex(2, &format!("sourcing \"{source}\""));
+        }
         self.execute_ex_input(&text, &source, first, true, window, cx);
     }
 
@@ -579,6 +594,8 @@ impl Workspace {
                     keymap: keymap_offset.map(|_| text.into()),
                     mode: None,
                     failure: None,
+                    no_swapfile: self.active_ex_window_modifiers.no_swapfile,
+                    verbose: self.active_ex_window_modifiers.verbose,
                 },
                 window,
                 cx,
@@ -589,6 +606,29 @@ impl Workspace {
 
     /// Run a source frame and retain it unchanged while a shell command or timer is pending.
     fn execute_ex_program(
+        &mut self,
+        frame: ExProgramFrame,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut modifiers = self.active_ex_window_modifiers.clone();
+        modifiers.no_swapfile |= frame.no_swapfile;
+        modifiers.marks.keep_jumps = false;
+        modifiers.verbose = frame.verbose.or(modifiers.verbose);
+        without_ex_keep_jumps(|| {
+            self.with_ex_window_modifiers(modifiers, |workspace| {
+                let scope = workspace.begin_noswapfile_dispatch();
+                workspace.execute_ex_frame(frame, window, cx);
+                workspace.apply_noswapfile_to_loaded();
+                if scope {
+                    workspace.noswapfile_buffers = None;
+                }
+            });
+        });
+    }
+
+    /// Dispatch the remaining statements of `frame` within its current Ex context.
+    fn execute_ex_frame(
         &mut self,
         mut frame: ExProgramFrame,
         window: &mut Window,
@@ -614,9 +654,12 @@ impl Workspace {
                 .is_some_and(|project| !project.editor.vim().substitute_confirmation_active())
         {
             self.activate_input_mappings();
+            let mappings = self.input_mappings.clone();
             let editor = &mut self.projects.active_mut().editor;
             let mut yielded = Ok(None);
             let mut keymap = false;
+            let mut modifiers = WindowModifiers::default();
+            let mut messages = Vec::new();
             let edit = editor.edit(|vim, register| {
                 match frame.program.next(vim, register, frame.failure.take()) {
                     Err(error) => yielded = Err(error),
@@ -638,6 +681,24 @@ impl Workspace {
                             keymap = true;
                             vim.load_ex_keymap(&text);
                         } else {
+                            if let Some((state, output, command)) =
+                                vim.source_ex_modifiers(&line.text, register)
+                            {
+                                let statement = nanobug::vim::ScriptLine {
+                                    number: line.number,
+                                    text: command.to_owned(),
+                                    literal: line.literal,
+                                };
+                                modifiers = state;
+                                messages = output;
+                                return modifiers.with_ex_state(&mappings, || {
+                                    vim.execute_script_statement(
+                                        &frame.program,
+                                        &statement,
+                                        register,
+                                    )
+                                });
+                            }
                             return vim.execute_script_statement(&frame.program, &line, register);
                         }
                     }
@@ -655,6 +716,7 @@ impl Workspace {
                 }
                 Ok(Some(line)) => line,
             };
+            let _origin = mappings.enter_ex_origin(frame.program.ex_origin(line));
             let editor_error = editor
                 .vim()
                 .ex_failed()
@@ -683,20 +745,38 @@ impl Workspace {
                 self.ex_source_depth -= 1;
                 return;
             }
+            if let Action::LanguageServer { command, target } = edit.action {
+                let resume: ExContinuation = Box::new(move |workspace, window, cx, failure| {
+                    frame.failure = failure;
+                    workspace.execute_ex_program(frame, window, cx);
+                });
+                self.ex_source_depth -= 1;
+                self.control_ex_language_server(command, target, Some(resume), window, cx);
+                return;
+            }
             if matches!(edit.action, Action::Shell(_) | Action::Filter { .. }) {
                 let resume: ExContinuation = Box::new(move |workspace, window, cx, failure| {
                     frame.failure = failure;
                     workspace.execute_ex_program(frame, window, cx);
                 });
-                match edit.action {
-                    Action::Shell(command) => {
-                        self.run_shell_command(command, Some(resume), window, cx)
+                let modifiers = self.active_ex_window_modifiers.overlay(modifiers);
+                self.with_ex_window_modifiers(modifiers, |workspace| {
+                    for message in &messages {
+                        mappings.begin_ex_message_modifier(message.clone());
                     }
-                    Action::Filter { range, command } => {
-                        self.filter_lines(range, command, Some(resume), window, cx)
+                    match edit.action {
+                        Action::Shell(command) => {
+                            workspace.run_shell_command(command, Some(resume), window, cx)
+                        }
+                        Action::Filter { range, command } => {
+                            workspace.filter_lines(range, command, Some(resume), window, cx)
+                        }
+                        _ => unreachable!("matched shell and filter"),
                     }
-                    _ => unreachable!("matched shell and filter"),
-                }
+                    for _ in messages {
+                        mappings.end_ex_message_modifier();
+                    }
+                });
                 self.ex_source_depth -= 1;
                 return;
             }
@@ -723,6 +803,7 @@ impl Workspace {
                 edit.action,
                 Action::Source { .. }
                     | Action::RegisterEx(_)
+                    | Action::ExPipeline(_)
                     | Action::ClipboardEx
                     | Action::UserEx { .. }
                     | Action::Runtime { .. }
@@ -736,7 +817,10 @@ impl Workspace {
                 None
             } else {
                 if !matches!(edit.action, Action::SaveVimConfig) {
-                    self.apply_edit(edit, window, cx);
+                    let modifiers = self.active_ex_window_modifiers.overlay(modifiers);
+                    self.with_ex_window_modifiers(modifiers, |workspace| {
+                        workspace.apply_edit(edit, window, cx);
+                    });
                 }
                 self.projects.active_project().and_then(|project| {
                     if nested && project.editor.vim().ex_failed() {
@@ -1151,6 +1235,91 @@ mod tests {
                             project.editor.vim().doc.text,
                             project.status
                         )
+                    })
+                })?
+            },
+        )
+    }
+
+    /// Keep the alternate file and filter mark, and capture Shell output before ending redirection.
+    #[test]
+    #[ignore = "requires Windows DirectWrite and DirectX"]
+    fn native_ex_state_scopes_buffer_switches_and_redirected_shell() -> Result<()> {
+        use std::time::Duration;
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("project");
+        fs::create_dir(&root)?;
+        fs::write(root.join("README.md"), "original\ntail\n")?;
+        fs::write(root.join("second.txt"), "second\n")?;
+        fs::write(root.join("third.txt"), "third\n")?;
+        fs::write(
+            root.join("state.vim"),
+            concat!(
+                "keepa edit third.txt\n",
+                "keepalt edit #\n",
+                "normal! ggma\n",
+                "redir > output.txt\n",
+                "silent kee 1!echo filtered\n",
+                "silent 2verbose !echo shell-output\n",
+                "echo 'after-shell'\n",
+                "redir END\n",
+            ),
+        )?;
+        let output = root.join("output.txt");
+        let options = Options::take(&mut vec!["--no-plugins".into()], temporary.path())?;
+        native_test::run_async(
+            root,
+            options,
+            |_| {},
+            async move |handle, app| {
+                let _temporary = temporary;
+                app.update(|app| {
+                    handle.update(app, |workspace, window, cx| {
+                        command(workspace, "edit second.txt", window, cx);
+                        command(workspace, "source state.vim", window, cx);
+                    })
+                })?;
+                for _ in 0..80 {
+                    app.background_executor()
+                        .timer(Duration::from_millis(25))
+                        .await;
+                    if fs::read_to_string(&output).is_ok_and(|text| text.contains("after-shell")) {
+                        break;
+                    }
+                }
+                app.update(|app| {
+                    handle.update(app, |workspace, window, cx| -> Result<()> {
+                        let project = workspace.projects.active();
+                        ensure!(
+                            project.editor.vim().doc.text == "filtered\ntail\n",
+                            "{:?}: {}",
+                            project.editor.vim().doc.text,
+                            project.status
+                        );
+                        ensure!(
+                            project
+                                .editor
+                                .alternate_path()
+                                .is_some_and(|path| path.ends_with("README.md"))
+                        );
+                        let captured = fs::read_to_string(output)?;
+                        ensure!(
+                            captured.contains("shell-output\nafter-shell"),
+                            "{captured:?}"
+                        );
+                        command(workspace, "normal! G'a", window, cx);
+                        let vim = workspace.projects.active().editor.vim();
+                        ensure!(vim.doc.location(vim.doc.cursor).0 == 0, "{}", vim.message);
+                        ensure!(workspace.input_mappings.ex_verbose() == 0);
+                        command(
+                            workspace,
+                            "redir => g:out | silent echo 'pipeline' | redir END",
+                            window,
+                            cx,
+                        );
+                        command(workspace, "echo g:out", window, cx);
+                        ensure!(workspace.projects.active().editor.vim().message == "\npipeline");
+                        Ok(())
                     })
                 })?
             },

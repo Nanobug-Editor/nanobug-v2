@@ -275,9 +275,20 @@ impl Workspace {
                 Some((project.plugin_scope, dialect.to_owned()))
             })
             .collect();
+        let filetypes = self
+            .projects
+            .ordered()
+            .flat_map(|project| {
+                project.editor.buffers().iter().filter_map(|buffer| {
+                    let filetype = buffer.vim.filetype_override()?;
+                    Some(((project.plugin_scope, buffer.vim.doc.opening), filetype))
+                })
+            })
+            .collect();
         if self.plugins.active != active
             || self.plugins.projects != projects
             || self.plugins.sql_dialects != dialects
+            || self.plugins.document_filetypes != filetypes
         {
             if self
                 .plugins
@@ -292,14 +303,16 @@ impl Workspace {
             self.plugins.active = active;
             self.plugins.projects = projects;
             self.plugins.sql_dialects = dialects;
+            self.plugins.document_filetypes = filetypes;
             self.plugins
                 .session
                 .as_ref()
                 .expect("plugin session")
-                .projects_with_sql_dialects(
+                .projects_with_languages(
                     active,
                     self.plugins.projects.clone(),
                     self.plugins.sql_dialects.clone(),
+                    self.plugins.document_filetypes.clone(),
                 );
         }
         self.reattach_project_surface();

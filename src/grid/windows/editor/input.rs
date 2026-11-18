@@ -100,12 +100,12 @@ impl Buffer {
         self.refresh_shared_document();
         let before = self.vim.doc.revision;
         let action = input(self);
-        if self.vim.doc.revision != before {
+        let changed =
+            self.vim.doc.revision != before && !self.vim.doc.metadata_revised_since(before);
+        if changed {
             self.vim.acknowledge_ex_options_editor_edit();
         }
-        let changed_path = (self.vim.doc.revision != before)
-            .then(|| self.vim.doc.path.clone())
-            .flatten();
+        let changed_path = changed.then(|| self.vim.doc.path.clone()).flatten();
         EditResult {
             action,
             changed_path,
@@ -114,6 +114,17 @@ impl Buffer {
 }
 
 impl EditorWindow {
+    /// Supply plugin-provided candidates for the active buffer's native Ex prompt.
+    pub(in crate::grid) fn set_language_completion(
+        &mut self,
+        servers: Vec<String>,
+        filetypes: Vec<String>,
+    ) {
+        self.buffers[self.active]
+            .vim
+            .set_language_completion(servers, filetypes);
+    }
+
     /// Execute a menu `path` through this pane's input, using its `area` and `spacing` for wrapped motions.
     pub(in crate::grid) fn activate_vim_menu(
         &mut self,

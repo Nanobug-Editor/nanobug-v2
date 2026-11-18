@@ -29,10 +29,12 @@ impl Vim {
             let listing = register
                 .input_maps
                 .ex_messages(count.parse().ok(), !args.trim().is_empty());
-            return Some(if listing.is_empty() {
+            return Some(if listing.text.is_empty() {
                 Action::None
+            } else if listing.spans.is_empty() {
+                Action::ShowListing(listing.text)
             } else {
-                Action::ShowListing(listing)
+                Action::ShowStyledListing(listing)
             });
         }
         if verb.len() >= 1

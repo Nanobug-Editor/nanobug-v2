@@ -221,6 +221,31 @@ impl Server {
         })
     }
 
+    /// Convert a module's explicit `filetype` to an identifier understood by this server.
+    pub(in crate::plugins) fn explicit_language_id(self, filetype: &str) -> Option<&'static str> {
+        Some(match (self, filetype) {
+            (Self::RustAnalyzer, "rust") => "rust",
+            (Self::Typescript | Self::Vue, "javascript") => "javascript",
+            (Self::Typescript | Self::Vue, "typescript") => "typescript",
+            (Self::Typescript | Self::Vue, "javascriptreact") => "javascriptreact",
+            (Self::Typescript | Self::Vue, "typescriptreact") => "typescriptreact",
+            (Self::Html | Self::Angular, "html") => "html",
+            (Self::Css, "css") => "css",
+            (Self::Python, "python") => "python",
+            (Self::Go, "go") => "go",
+            (Self::Csharp, "cs" | "csharp") => "csharp",
+            (Self::Java, "java") => "java",
+            (Self::Php, "php") => "php",
+            (Self::Kotlin, "kotlin") => "kotlin",
+            (Self::Ruby, "ruby") => "ruby",
+            (Self::Svelte, "svelte") => "svelte",
+            (Self::Astro, "astro") => "astro",
+            (Self::Vue, "vue") => "vue",
+            (server, "sql") if server.is_sql() => "sql",
+            _ => return None,
+        })
+    }
+
     /// Vue resolves imports through a paired TypeScript service, including unsaved JS/TS files.
     pub(in crate::plugins) fn accepts_project_overlay(self, path: &Path) -> bool {
         self == Self::Vue && Self::Typescript.language_id(path).is_some()

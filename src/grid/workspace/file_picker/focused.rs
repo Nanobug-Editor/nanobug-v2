@@ -576,17 +576,26 @@ impl Workspace {
             | Action::OpenFile(_, Some(_))
             | Action::JumpHistory { .. }
             | Action::ShowListing(_)
+            | Action::ShowStyledListing(_)
+            | Action::RedirectFile { .. }
+            | Action::RedirectClipboard { .. }
             | Action::EditableListing(_)
             | Action::IncludeSplit { .. }
             | Action::Files(_)
             | Action::BufferLifecycle(_)
             | Action::SessionExport(_)
+            | Action::Recovery(_)
+            | Action::Sign(_)
+            | Action::Filetype(_)
+            | Action::LanguageServer { .. }
             | Action::UndoFile { .. }
             | Action::WindowModified { .. }
+            | Action::ExState { .. }
             | Action::MessageModified { .. }
             | Action::WindowExtras(_)
             | Action::Shell(_)
             | Action::RegisterEx(_)
+            | Action::ExPipeline(_)
             | Action::UserEx { .. }
             | Action::Autocmd { .. }
             | Action::NoAutocmd(_)

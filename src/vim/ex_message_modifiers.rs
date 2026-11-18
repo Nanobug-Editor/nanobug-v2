@@ -17,6 +17,19 @@ pub enum MessageModifier {
 }
 
 impl MessageModifier {
+    /// Filter styled history using the same matching rule as the plain output stream.
+    pub(super) fn filter_styled_output(
+        &self,
+        output: super::ExMessageOutput,
+    ) -> super::ExMessageOutput {
+        let Self::Filter { pattern, invert } = self else {
+            return output;
+        };
+        let Ok(regex) = pattern::compile(pattern, Some(false)) else {
+            return output;
+        };
+        output.retain_lines(|line| regex.is_match(line) != *invert)
+    }
     /// Select the lines to display. Errors are handled by the caller without filtering.
     pub fn filter_text(&self, text: &str) -> String {
         let Self::Filter { pattern, invert } = self else {
@@ -35,21 +48,7 @@ impl MessageModifier {
 impl Vim {
     /// Parse one message modifier with its unexecuted nested command.
     pub(super) fn ex_message_modifier(&mut self, text: &str) -> Option<Action> {
-        let (word, tail) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
-        let name = word.trim_end_matches('!');
-        let bang = name != word;
-        let is = |full: &str, minimum| name.len() >= minimum && full.starts_with(name);
-        let tail = tail.trim();
-        let result = if is("silent", 3) {
-            Ok((MessageModifier::Silent { ignore_error: bang }, tail))
-        } else if is("unsilent", 3) && !bang {
-            Ok((MessageModifier::Unsilent, tail))
-        } else if is("filter", 4) {
-            filter(tail, bang)
-        } else {
-            return None;
-        };
-        Some(match result {
+        Some(match parse_modifier(text)? {
             Ok((modifier, command)) if !command.is_empty() => Action::MessageModified {
                 modifier,
                 command: command.trim_start_matches(':').trim_start().into(),
@@ -65,6 +64,24 @@ impl Vim {
                 Action::None
             }
         })
+    }
+}
+
+/// Identify a message modifier without changing editor state while examining an Ex pipeline.
+pub(super) fn parse_modifier(text: &str) -> Option<Result<(MessageModifier, &str), String>> {
+    let (word, tail) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+    let name = word.trim_end_matches('!');
+    let bang = name != word;
+    let is = |full: &str, minimum| name.len() >= minimum && full.starts_with(name);
+    let tail = tail.trim_start();
+    if is("silent", 3) {
+        Some(Ok((MessageModifier::Silent { ignore_error: bang }, tail)))
+    } else if is("unsilent", 3) && !bang {
+        Some(Ok((MessageModifier::Unsilent, tail)))
+    } else if is("filter", 4) {
+        Some(filter(tail, bang))
+    } else {
+        None
     }
 }
 

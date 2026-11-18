@@ -1,7 +1,11 @@
 //! Local Ex variables, binding locks, and expression scope resolution.
 
 use super::{ScriptProgram, split_fields};
-use crate::vim::{Register, Vim, expression::Value};
+use crate::vim::{
+    Action, Register, Vim,
+    ex_redirect::{RedirectCommand, Redirection},
+    expression::Value,
+};
 use std::{
     collections::BTreeMap,
     sync::{Arc, RwLock},
@@ -83,6 +87,150 @@ impl WindowVariables {
 }
 
 impl ScriptProgram {
+    /// Complete one redirect before beginning another or stopping capture.
+    pub(in crate::vim) fn finish_redirection(
+        &mut self,
+        vim: &Vim,
+        register: &mut Register,
+    ) -> Result<(), String> {
+        match register.input_maps.take_redirection() {
+            Some(Redirection::Clipboard(text)) => {
+                register.input_maps.finish_redirect_clipboard(text)
+            }
+            Some(Redirection::Variable(name, text)) => {
+                self.assign_redirected(vim, register, &name, Some(&text))?;
+            }
+            Some(Redirection::File(_, Some(error))) => return Err(error),
+            Some(Redirection::File(_, None) | Redirection::Register(_)) | None => {}
+        }
+        Ok(())
+    }
+
+    /// Validate the destination before any subsequent Ex output can be recorded.
+    pub(in crate::vim) fn start_redirection(
+        &mut self,
+        vim: &Vim,
+        register: &mut Register,
+        command: RedirectCommand<'_>,
+    ) -> Result<Action, String> {
+        match command {
+            RedirectCommand::End => {}
+            RedirectCommand::File(path, mode) => {
+                return Ok(Action::RedirectFile {
+                    path: path.into(),
+                    mode,
+                });
+            }
+            RedirectCommand::Register('+' | '*', append) => {
+                return Ok(Action::RedirectClipboard { append });
+            }
+            RedirectCommand::Register(name, append) => {
+                let slot = register.redirect_to_register(name, append);
+                register
+                    .input_maps
+                    .start_redirection(Redirection::Register(slot));
+            }
+            RedirectCommand::Variable(name, append) => {
+                self.assign_redirected(vim, register, name, append.then_some(""))?;
+                let name = if name
+                    .split(['.', '['])
+                    .next()
+                    .is_some_and(|base| base.contains(':'))
+                {
+                    name.to_owned()
+                } else {
+                    format!("{}:{name}", if self.function { "l" } else { "g" })
+                };
+                register
+                    .input_maps
+                    .start_redirection(Redirection::Variable(name, String::new()));
+            }
+        }
+        Ok(Action::None)
+    }
+
+    /// Resolve a variable or indexed item afresh when validating or completing a redirection.
+    fn assign_redirected(
+        &mut self,
+        vim: &Vim,
+        register: &mut Register,
+        name: &str,
+        append: Option<&str>,
+    ) -> Result<(), String> {
+        let base_end = name.find(['.', '[']).unwrap_or(name.len());
+        let (base, mut tail) = name.split_at(base_end);
+        let base = base.trim_end();
+        let mut indices = Vec::new();
+        while !tail.is_empty() {
+            if let Some(field) = tail.strip_prefix('.') {
+                let end = field
+                    .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                    .unwrap_or(field.len());
+                if end == 0 {
+                    return Err(format!("Expected a dictionary key in {name}"));
+                }
+                indices.push(Value::String(field[..end].to_owned()));
+                tail = &field[end..];
+            } else if let Some(index) = tail.strip_prefix('[') {
+                let end = end_of_index(index).ok_or_else(|| format!("Missing ] in {name}"))?;
+                indices.push(self.evaluate(vim, &index[..end], register)?);
+                tail = &index[end + 1..];
+            } else {
+                return Err(format!("Invalid redirection variable: {name}"));
+            }
+            tail = tail.trim_start();
+        }
+        if indices.is_empty() && append.is_none() {
+            return self.assign(vim, register, base, Value::String(String::new()), false);
+        }
+        self.with_store(vim, register, base, |store, key| {
+            let binding = store
+                .get_mut(key)
+                .ok_or_else(|| format!("Undefined variable: {base}"))?;
+            if binding.locked {
+                return Err(format!("Variable is locked: {base}"));
+            }
+            let mut value = &mut binding.value;
+            let length = indices.len();
+            for (offset, index) in indices.into_iter().enumerate() {
+                value = match (value, index) {
+                    (Value::Dictionary(values), index @ (Value::String(_) | Value::Integer(_))) => {
+                        let key = index.display();
+                        if append.is_none() && offset + 1 == length {
+                            values
+                                .entry(key)
+                                .or_insert_with(|| Value::String(String::new()))
+                        } else {
+                            values
+                                .get_mut(&key)
+                                .ok_or_else(|| format!("Unknown dictionary key: {key}"))?
+                        }
+                    }
+                    (Value::List(values), Value::Integer(index)) => {
+                        let index = if index < 0 {
+                            values.len() as i64 + index
+                        } else {
+                            index
+                        };
+                        values
+                            .get_mut(index as usize)
+                            .ok_or_else(|| format!("List index out of range: {index}"))?
+                    }
+                    _ => return Err(format!("Invalid indexed redirection variable: {name}")),
+                };
+            }
+            if let Some(text) = append {
+                let Value::String(value) = value else {
+                    return Err(format!("Expected a String variable: {name}"));
+                };
+                value.push_str(text);
+            } else {
+                *value = Value::String(String::new());
+            }
+            Ok(())
+        })
+    }
+
     /// Evaluate an expression with the locals and source-specific variables of this frame.
     pub(super) fn evaluate(
         &self,
@@ -340,4 +488,31 @@ impl ScriptProgram {
             _ => Err(format!("Invalid variable scope: {name}")),
         }
     }
+}
+
+/// Find the closing bracket of an index, ignoring quoted text and nested indices.
+fn end_of_index(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, ch)) = chars.next() {
+        if let Some(end) = quote {
+            if end == '"' && ch == '\\'
+                || end == '\'' && ch == end && chars.peek().is_some_and(|&(_, next)| next == end)
+            {
+                chars.next();
+            } else if ch == end {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' => depth += 1,
+            ']' if depth == 0 => return Some(at),
+            ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
 }

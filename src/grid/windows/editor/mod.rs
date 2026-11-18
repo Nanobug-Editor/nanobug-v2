@@ -5,6 +5,7 @@ mod command_window;
 mod commands;
 mod completion;
 mod directory;
+mod ex_matches;
 mod header;
 mod hover;
 mod input;
@@ -15,6 +16,7 @@ mod presentation;
 mod project_session;
 mod session;
 pub(in crate::grid) mod shortcuts;
+mod signs;
 mod transactions;
 mod undo_file;
 mod view;
@@ -72,6 +74,11 @@ impl EditorWindow {
     /// Display `doc` with the normal editor's read-only Vim operations.
     pub(in crate::grid) fn read_only(doc: Document) -> Self {
         Self::with_buffer(Buffer::with_vim(Vim::read_only(doc)))
+    }
+
+    /// Display an Ex listing with the styles of its retained messages.
+    pub(in crate::grid) fn message_output(output: nanobug::vim::ExMessageOutput) -> Self {
+        Self::with_buffer(Buffer::message_output(output))
     }
 
     /// Display `doc` as a read-only Vim Help buffer in its own editor pane.

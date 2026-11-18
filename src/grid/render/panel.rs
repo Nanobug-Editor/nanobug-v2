@@ -1,6 +1,8 @@
 //! Retained row shaping, glyph painting, cursor text and backdrop stamping.
 
-use super::{Frame, FrameRow, LabelStyle, Metrics, Rect, ThemeBackground, exposed_regions};
+use super::{
+    CellPaint, Frame, FrameRow, LabelStyle, Metrics, Rect, ThemeBackground, exposed_regions,
+};
 use crate::{
     ui::icons::IconCache,
     ui::{
@@ -10,10 +12,10 @@ use crate::{
     },
 };
 use gpui::{
-    App, Bounds, ContentMask, Context, Font, FontId, GlyphId, IntoElement, PathBuilder, Pixels,
-    PlatformTextSystem, Point, Render, RenderGlyphParams, ShapedGlyph, ShapedLine, Styled,
-    TextAlign, TextRun, UnderlineStyle, Window, WindowTextSystem, canvas, fill, font, point, px,
-    rgb, rgba,
+    App, Bounds, ContentMask, Context, Font, FontId, FontStyle, FontWeight, GlyphId, IntoElement,
+    PathBuilder, Pixels, PlatformTextSystem, Point, Render, RenderGlyphParams, ShapedGlyph,
+    ShapedLine, Styled, TextAlign, TextRun, UnderlineStyle, Window, WindowTextSystem, canvas, fill,
+    font, point, px, rgb, rgba,
 };
 use nanobug::animation::cursor::{Vec2, Wave};
 use std::{cell::RefCell, ops::Range, rc::Rc};
@@ -71,6 +73,49 @@ struct Run {
     color: u32,
     /// Foreground and shadow opacity selected by the label.
     opacity: f32,
+    /// Decorations kept independent of glyph layout for clipped and shifted text runs.
+    decoration: Decoration,
+}
+
+/// The line style requested by a highlight group.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Underline {
+    Single,
+    Double,
+    Dotted,
+    Dashed,
+    Curl,
+}
+
+/// Text effects drawn in the same retained position in normal and clipped paint paths.
+#[derive(Clone, Copy, Default)]
+struct Decoration {
+    underline: Option<Underline>,
+    strike: bool,
+    overline: bool,
+    special: Option<u32>,
+}
+
+impl Decoration {
+    /// Convert the highlight group into one underline and an independent strike.
+    fn from_paint(paint: CellPaint) -> Self {
+        let attributes = paint.attributes;
+        let underline = [
+            (attributes.undercurl, Underline::Curl),
+            (attributes.underdouble, Underline::Double),
+            (attributes.underdotted, Underline::Dotted),
+            (attributes.underdashed, Underline::Dashed),
+            (attributes.underline, Underline::Single),
+        ]
+        .into_iter()
+        .find_map(|(active, style)| active.then_some(style));
+        Self {
+            underline,
+            strike: attributes.strikethrough,
+            overline: attributes.overline,
+            special: paint.special,
+        }
+    }
 }
 
 impl Run {
@@ -117,12 +162,103 @@ impl Run {
             })
         })
     }
+
+    /// Emit underline and strike segments at the same measured positions as the text.
+    fn paint_decorations(
+        &self,
+        origin: Point<Pixels>,
+        height: f32,
+        clip: Option<&Range<Pixels>>,
+        mut fill: impl FnMut(Bounds<Pixels>, u32),
+    ) {
+        let Decoration {
+            underline,
+            strike,
+            overline,
+            special,
+        } = self.decoration;
+        if underline.is_none() && !strike && !overline || self.opacity == 0. {
+            return;
+        }
+        let total = self.clusters.len() as f32;
+        let (first, end) = clip.map_or((0., total), |clip| {
+            let first = (f32::from(clip.start - origin.x) / self.advance - 0.001).ceil();
+            let end = (f32::from(clip.end - origin.x) / self.advance + 0.001).floor();
+            (first.max(0.), end.min(total))
+        });
+        if first >= end {
+            return;
+        }
+        let baseline = self.baseline(height);
+        let mut ink = |start: f32, y: Pixels, width: f32, color: u32| {
+            fill(
+                Bounds {
+                    origin: origin + point(px(start), y),
+                    size: gpui::size(px(width), px(1.)),
+                },
+                (color << 8) | (self.opacity * 255.).round() as u32,
+            );
+        };
+        let start = first * self.advance;
+        let finish = end * self.advance;
+        if strike {
+            ink(
+                start,
+                baseline - self.line.ascent / 3.,
+                finish - start,
+                self.color,
+            );
+        }
+        if overline {
+            ink(
+                start,
+                (baseline - self.line.ascent).max(px(0.)),
+                finish - start,
+                self.color,
+            );
+        }
+        let Some(underline) = underline else {
+            return;
+        };
+        let color = special.unwrap_or(self.color);
+        let y = (baseline + px(1.)).min(px(height - 2.));
+        match underline {
+            Underline::Single => ink(start, y, finish - start, color),
+            Underline::Double => {
+                ink(start, y - px(1.), finish - start, color);
+                ink(start, y + px(1.), finish - start, color);
+            }
+            Underline::Dotted | Underline::Dashed | Underline::Curl => {
+                let (period, width) = match underline {
+                    Underline::Dotted => (3., 1.),
+                    Underline::Dashed => (6., 4.),
+                    _ => (2., 2.),
+                };
+                let mut at = (start / period).floor() * period;
+                while at < finish {
+                    let left = at.max(start);
+                    let right = (at + width).min(finish);
+                    if right > left {
+                        let shift = if underline == Underline::Curl {
+                            (at / period) % 2.
+                        } else {
+                            0.
+                        };
+                        ink(left, y + px(shift), right - left, color);
+                    }
+                    at += period;
+                }
+            }
+        }
+    }
 }
 
 /// All prepared drawing data for a row.
 struct PreparedRow {
     /// Background runs as visual start, width and RGBA color.
     backgrounds: Vec<(Pixels, Pixels, u32)>,
+    /// Backgrounds of measured labels aligned with their possibly offset text.
+    label_backgrounds: Vec<(Pixels, Pixels, u32)>,
     /// Foreground text runs grouped by color and grapheme width.
     runs: Vec<Run>,
     /// Independently positioned text runs painted above the fixed grid.
@@ -299,8 +435,18 @@ impl Panel {
                 raster.fill(area.intersect(&clip), color);
             }
             let y = y + data.frame.title_offset(row);
+            for &(x, width, color) in &prepared.label_backgrounds {
+                let area = data
+                    .frame
+                    .tint_bounds(point(bounds.origin.x + x, y), width, metrics.lh);
+                raster.fill(area.intersect(&clip), color);
+            }
             for run in prepared.runs.iter().chain(&prepared.label_runs) {
-                let baseline = point(bounds.origin.x + run.x, y + run.baseline(metrics.lh));
+                let origin = point(bounds.origin.x + run.x, y);
+                let baseline = origin + point(px(0.), run.baseline(metrics.lh));
+                run.paint_decorations(origin, metrics.lh, source_clip.as_ref(), |area, color| {
+                    raster.fill(area.intersect(&clip), color);
+                });
                 for shaped in &run.line.runs {
                     for glyph in &shaped.glyphs {
                         let cluster = run.cluster(glyph.index);
@@ -451,31 +597,23 @@ impl PanelData {
     /// Get the cached layout of `row`, preparing it with `text_system` on first use.
     fn prepare_row(&mut self, row: usize, text_system: &WindowTextSystem) -> Option<&PreparedRow> {
         let positioned = self.frame.rows.get(row)?;
-        let cells = &positioned.cells;
         let cached = self.cache.get_mut(row)?;
         if cached.is_some() {
             return cached.as_ref();
         }
         let mut prepared = PreparedRow {
             backgrounds: Vec::new(),
+            label_backgrounds: Vec::new(),
             runs: Vec::new(),
             label_runs: Vec::new(),
         };
-        let mut col = 0;
-        while col < cells.len() {
-            let start = col;
-            let color = cells[col].bg;
-            while col < cells.len() && cells[col].bg == color {
-                col += 1;
-            }
-            if color != 0 {
-                let x = self.metrics.spacing_px(positioned.x(start));
-                let end = self.metrics.spacing_px(positioned.x(col));
-                prepared
-                    .backgrounds
-                    .push((x, end - x, self.style.tint(color)));
-            }
-        }
+        Self::row_backgrounds(
+            positioned,
+            0,
+            self.metrics,
+            self.style,
+            &mut prepared.backgrounds,
+        );
         Self::shape_runs(
             positioned,
             0,
@@ -486,6 +624,13 @@ impl PanelData {
             &mut prepared.runs,
         );
         for label in &self.frame.labels[row] {
+            Self::row_backgrounds(
+                &label.text,
+                label.x as isize,
+                self.metrics,
+                self.style,
+                &mut prepared.label_backgrounds,
+            );
             Self::shape_runs(
                 &label.text,
                 label.x as isize,
@@ -498,6 +643,39 @@ impl PanelData {
         }
         *cached = Some(prepared);
         cached.as_ref()
+    }
+
+    /// Merge successive cells of the same background in grid or measured-label coordinates.
+    fn row_backgrounds(
+        row: &FrameRow,
+        origin: isize,
+        metrics: Metrics,
+        style: Style,
+        output: &mut Vec<(Pixels, Pixels, u32)>,
+    ) {
+        let key = |paint: CellPaint| {
+            if paint.attributes.reverse || paint.attributes.standout {
+                (paint.foreground, true)
+            } else {
+                (paint.background, false)
+            }
+        };
+        let cells = &row.cells;
+        let mut col = 0;
+        while col < cells.len() {
+            let start = col;
+            let paint = cells[col].paint;
+            let bg = key(paint);
+            while col < cells.len() && key(cells[col].paint) == bg {
+                col += 1;
+            }
+            let color = paint.colors(style).1;
+            if color != 0 {
+                let x = metrics.spacing_px(origin + row.x(start));
+                let end = metrics.spacing_px(origin + row.x(col));
+                output.push((x, end - x, color));
+            }
+        }
     }
 
     /// Shape `row` at `origin` spacing units using `metrics` and `text_system`, appending to `runs`.
@@ -519,9 +697,19 @@ impl PanelData {
                 continue;
             }
             let start = col;
-            let color = cells[col].fg;
-            let dimmed = cells[col].dimmed;
-            let opacity = if dimmed || label == LabelStyle::Dimmed {
+            let paint = cells[col].paint;
+            let dimmed = paint.dimmed;
+            let same_ink = |other: CellPaint| {
+                paint.foreground == other.foreground
+                    && paint.dimmed == other.dimmed
+                    && paint.attributes == other.attributes
+                    && paint.special == other.special
+                    && (!(paint.attributes.reverse || paint.attributes.standout)
+                        || paint.background == other.background)
+            };
+            let opacity = if paint.attributes.conceal {
+                0.
+            } else if dimmed || paint.attributes.dim || label == LabelStyle::Dimmed {
                 0.5
             } else {
                 1.
@@ -531,8 +719,7 @@ impl PanelData {
             let face = GridFace::for_cell(&cells[col].text);
             let mut text = String::new();
             while col < cells.len()
-                && cells[col].fg == color
-                && cells[col].dimmed == dimmed
+                && same_ink(cells[col].paint)
                 && !cells[col].text.is_empty()
                 && cells[col].text.width().max(1) == width
                 && row.x(col + width) - row.x(col) == units
@@ -541,20 +728,33 @@ impl PanelData {
                 text.push_str(&cells[col].text);
                 col += width;
             }
-            if text.trim().is_empty() {
+            let decoration = Decoration::from_paint(paint);
+            if opacity == 0.
+                || text.trim().is_empty()
+                    && !decoration.strike
+                    && !decoration.overline
+                    && decoration.underline.is_none()
+            {
                 continue;
             }
-            let color = style.foreground(color);
+            let color = paint.colors(style).0;
+            let mut font = match label {
+                LabelStyle::Symbol => font(if cfg!(windows) {
+                    "Segoe UI Symbol"
+                } else {
+                    GRID_RULE_FONT_FAMILY
+                }),
+                _ => face.font(style.font),
+            };
+            if paint.attributes.bold {
+                font.weight = FontWeight::BOLD;
+            }
+            if paint.attributes.italic {
+                font.style = FontStyle::Italic;
+            }
             let run = TextRun {
                 len: text.len(),
-                font: match label {
-                    LabelStyle::Symbol => font(if cfg!(windows) {
-                        "Segoe UI Symbol"
-                    } else {
-                        GRID_RULE_FONT_FAMILY
-                    }),
-                    _ => face.font(style.font),
-                },
+                font,
                 color: rgb(color).opacity(opacity).into(),
                 underline: (label == LabelStyle::Key).then_some(UnderlineStyle {
                     thickness: px(1.),
@@ -591,6 +791,7 @@ impl PanelData {
                 shifts: Vec::new(),
                 color,
                 opacity,
+                decoration,
             };
             if units != (width * UNITS_PER_COLUMN) as isize {
                 // Native shaping can leave small advance differences. Move each whole cluster
@@ -725,8 +926,26 @@ impl PanelData {
                     ));
                 }
                 let y = y + self.frame.title_offset(i);
+                for &(x, width, color) in &row.label_backgrounds {
+                    window.paint_quad(fill(
+                        self.frame.tint_bounds(
+                            point(bounds.origin.x + x, y),
+                            width,
+                            self.metrics.lh,
+                        ),
+                        rgba(color),
+                    ));
+                }
                 for run in row.runs.iter().chain(&row.label_runs) {
                     let origin = point(bounds.origin.x + run.x, y);
+                    run.paint_decorations(
+                        origin,
+                        self.metrics.lh,
+                        source_clip.as_ref(),
+                        |area, color| {
+                            window.paint_quad(fill(area, rgba(color)));
+                        },
+                    );
                     let waves_here = self.waves.iter().any(|wave| {
                         (f32::from(y) + self.metrics.lh * 0.5 - wave.center.y).abs()
                             <= wave.front() + 7.

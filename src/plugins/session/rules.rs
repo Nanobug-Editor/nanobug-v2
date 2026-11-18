@@ -62,6 +62,8 @@ struct Entry {
     rule_paths: ApprovedRulePaths,
     /// Saved project SQL dialect exposed to SQL rules, excluding buffer overrides.
     project_sql_dialect: Option<String>,
+    /// Explicit type observed by an opted-in rule for its current document.
+    document_filetype: Option<String>,
     allowed: Option<bool>,
     /// The last dependency-validated request to start this module's language server.
     start_language_server: bool,
@@ -110,6 +112,8 @@ struct Evaluation {
     input: ContextData,
     /// Project preference retained for this evaluation's immutable JS context.
     project_sql_dialect: Option<String>,
+    /// Explicit filetype retained with the evaluation that observed it.
+    document_filetype: Option<String>,
     deps: Vec<Dependency>,
     sent: bool,
     cancel_sent: bool,
@@ -120,11 +124,17 @@ struct Evaluation {
 }
 
 impl Evaluation {
-    fn new(key: Key, input: ContextData, project_sql_dialect: Option<String>) -> Self {
+    fn new(
+        key: Key,
+        input: ContextData,
+        project_sql_dialect: Option<String>,
+        document_filetype: Option<String>,
+    ) -> Self {
         Self {
             key,
             input,
             project_sql_dialect,
+            document_filetype,
             deps: Vec::new(),
             sent: false,
             cancel_sent: false,
@@ -182,7 +192,14 @@ impl Rules {
     /// Keep installed rules for live scopes. A changed source gets a fresh budget history.
     #[cfg(test)]
     pub(super) fn set(&mut self, key: Key, source: Source, grants: &BTreeSet<Permission>) {
-        self.set_approved(key, source, grants, &ApprovedRulePaths::default(), None);
+        self.set_approved(
+            key,
+            source,
+            grants,
+            &ApprovedRulePaths::default(),
+            None,
+            None,
+        );
     }
 
     /// Retain the rule for `key` and reset its evaluation when its source or context changes.
@@ -193,12 +210,16 @@ impl Rules {
         grants: &BTreeSet<Permission>,
         rule_paths: &ApprovedRulePaths,
         project_sql_dialect: Option<&str>,
+        document_filetype: Option<&str>,
     ) {
+        let document_filetype =
+            document_filetype.filter(|_| grants.contains(&Permission::ReadDocument));
         if self.entries.get(&key).is_some_and(|entry| {
             entry.source.same(&source)
                 && &entry.grants == grants
                 && &entry.rule_paths == rule_paths
                 && entry.project_sql_dialect.as_deref() == project_sql_dialect
+                && entry.document_filetype.as_deref() == document_filetype
         }) {
             return;
         }
@@ -210,6 +231,7 @@ impl Rules {
                 grants: grants.clone(),
                 rule_paths: rule_paths.clone(),
                 project_sql_dialect: project_sql_dialect.map(str::to_owned),
+                document_filetype: document_filetype.map(str::to_owned),
                 allowed: None,
                 start_language_server: false,
                 exclude_dirs: Vec::new(),
@@ -442,6 +464,7 @@ impl Rules {
                         cancelled: Arc::new(AtomicBool::new(false)),
                     },
                     entry.project_sql_dialect.clone(),
+                    entry.document_filetype.clone(),
                 ),
             );
         }
@@ -552,6 +575,9 @@ impl Rules {
                     json!({ "project": job.input.root, "platform": std::env::consts::OS });
                 if let Some(dialect) = &job.project_sql_dialect {
                     context["projectSqlDialect"] = json!(dialect);
+                }
+                if let Some(filetype) = &job.document_filetype {
+                    context["documentFiletype"] = json!(filetype);
                 }
                 if self.worker.as_ref().is_some_and(|worker| {
                     worker
@@ -878,6 +904,7 @@ mod tests {
                         cancelled: Arc::new(AtomicBool::new(false)),
                     },
                     None,
+                    None,
                 ),
             );
         };
@@ -1128,6 +1155,7 @@ mod tests {
             grants: BTreeSet::new(),
             rule_paths: ApprovedRulePaths::default(),
             project_sql_dialect: None,
+            document_filetype: None,
             allowed: Some(true),
             start_language_server: true,
             exclude_dirs: vec!["coverage".into()],
@@ -1145,5 +1173,60 @@ mod tests {
         assert!(entry.exclude_dirs.is_empty());
         assert_eq!(entry.state, State::Failed("Rule paused".into()));
         assert!(entry.dirty.is_none());
+    }
+
+    /// Switching the declared buffer type retires an earlier judgment and applies the read grant.
+    #[test]
+    fn explicit_type_invalidates_the_rule_context_when_visible() -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let mut rules = Rules::new(InstallStore::new(fixture.path().join("profile")));
+        let key = scope(1);
+        let source = Source::Inline("return host.documentFiletype() === 'python';".into());
+        let paths = ApprovedRulePaths::default();
+        let grant = BTreeSet::from([Permission::ReadDocument]);
+        rules.set_approved(
+            key.clone(),
+            source.clone(),
+            &grant,
+            &paths,
+            None,
+            Some("python"),
+        );
+        let entry = rules.entries.get_mut(&key).unwrap();
+        assert_eq!(entry.document_filetype.as_deref(), Some("python"));
+        entry.allowed = Some(true);
+        entry.in_flight = Some(42);
+        rules.set_approved(
+            key.clone(),
+            source.clone(),
+            &grant,
+            &paths,
+            None,
+            Some("python"),
+        );
+        assert_eq!(rules.entries[&key].in_flight, Some(42));
+
+        rules.set_approved(
+            key.clone(),
+            source.clone(),
+            &grant,
+            &paths,
+            None,
+            Some("text"),
+        );
+        let next = &rules.entries[&key];
+        assert_eq!(next.document_filetype.as_deref(), Some("text"));
+        assert!(next.allowed.is_none() && next.in_flight.is_none());
+
+        rules.set_approved(
+            key.clone(),
+            source,
+            &BTreeSet::new(),
+            &paths,
+            None,
+            Some("text"),
+        );
+        assert!(rules.entries[&key].document_filetype.is_none());
+        Ok(())
     }
 }

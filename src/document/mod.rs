@@ -2,7 +2,10 @@
 mod anchor;
 mod folds;
 mod history;
+mod mark_modifiers;
+mod recovery;
 mod shared;
+mod signs;
 
 use crate::i18n;
 pub use anchor::DocumentAnchor;
@@ -10,7 +13,11 @@ use anyhow::{Context, Result, bail};
 use folds::Folds;
 pub(crate) use folds::{FoldChange, FoldEdge, FoldLevel};
 use history::{History, Snapshot};
+pub(crate) use mark_modifiers::MarkEdit;
+pub use mark_modifiers::{MarkModifiers, current_mark_modifiers, with_mark_modifiers};
+pub use recovery::RecoveryDraft;
 use sha2::{Digest, Sha256};
+pub use signs::{SignGroup, SignPlacement};
 use std::{
     borrow::Cow,
     fs,
@@ -44,7 +51,7 @@ pub fn display_width_with_tabstop(text: &str, column: usize, tabstop: usize) -> 
 }
 
 /// Disk contents expected independently by each document that opens a named path.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 enum DiskVersion {
     /// A named buffer for a file that did not exist at open time.
     Missing,
@@ -82,12 +89,16 @@ pub struct DocumentContent {
     pub text: String,
     /// Starting byte of every line, including a final empty line after LF.
     pub starts: Vec<usize>,
-    /// Incremented for every edit or undo, used to invalidate derived text layouts.
+    /// Incremented after edits, undo and metadata changes that invalidate cached results.
     pub revision: u64,
+    /// The consecutive interval of metadata-only revisions, independent of disk history.
+    metadata_revisions: Option<(u64, u64)>,
     /// Previous byte range and replacement length for the most recent single edit.
     last_replacement: Option<(Range<usize>, usize)>,
     /// Last successfully read or written content, for exact dirty detection.
     saved: Arc<String>,
+    /// A revision known to match `saved` without comparing the text again.
+    saved_revision: Option<u64>,
     /// Preserve CRLF when a CRLF file is saved.
     crlf: bool,
     /// Preserve an existing UTF-8 BOM.
@@ -125,8 +136,10 @@ impl Document {
             text: text.into(),
             starts: line_starts(text),
             revision: 0,
+            metadata_revisions: None,
             last_replacement: None,
             saved: Arc::new(text.into()),
+            saved_revision: Some(0),
             crlf: false,
             bom: false,
             disk_version: None,
@@ -194,12 +207,36 @@ impl Document {
 
     /// Whether in-memory content differs from the last successful load/save.
     pub fn modified(&self) -> bool {
-        self.text != *self.saved
+        self.text != *self.saved || self.content.recovery_requires_write()
+    }
+
+    /// Mark cached language results stale in every view while preserving text, undo and save state.
+    pub fn invalidate_language_dependents(&mut self) {
+        self.refresh_shared();
+        let before = self.revision;
+        self.revision += 1;
+        let from = self
+            .metadata_revisions
+            .filter(|(_, end)| *end == before)
+            .map_or(before, |(from, _)| from);
+        self.metadata_revisions = Some((from, self.revision));
+        self.last_replacement = None;
+        if self.saved_revision == Some(before) {
+            self.saved_revision = Some(self.revision);
+        }
+        self.publish_content();
+    }
+
+    /// Check whether only metadata changed from `before` to the current revision.
+    pub fn metadata_revised_since(&self, before: u64) -> bool {
+        self.content.metadata_revised_since(before)
     }
 
     /// Treat editable scratch text as ephemeral without advancing its undo history.
     pub(crate) fn acknowledge_scratch_edit(&mut self) {
         self.saved = Arc::new(self.text.clone());
+        self.saved_revision = Some(self.revision);
+        self.history.set_recovery_file(None);
         self.publish_content();
     }
 
@@ -216,6 +253,8 @@ impl Document {
         let mut doc = Self::new(&self.text);
         doc.copy_file_state(self);
         doc.saved.clone_from(&self.saved);
+        doc.saved_revision = (doc.text == *doc.saved).then_some(doc.revision);
+        doc.history.set_recovery_file(self.history.recovery_file());
         doc.cursor = self.cursor;
         doc.publish_content();
         doc
@@ -236,8 +275,10 @@ impl Document {
     pub fn set_ex_filename(&mut self, path: Option<PathBuf>) {
         self.refresh_shared();
         if self.path != path {
+            (self.crlf, self.bom) = self.content.file_format();
             self.path = path;
             self.disk_version = self.path.as_ref().map(|_| DiskVersion::Missing);
+            self.history.forget_recovery_files();
             self.noticed_disk_version = None;
             self.relocate_anchors();
             self.publish_content();
@@ -250,7 +291,7 @@ impl Document {
         let Some(path) = &self.path else {
             return Ok(None);
         };
-        let Some(expected) = self.disk_version else {
+        let Some(expected) = self.content.expected_disk_version() else {
             return Ok(None);
         };
         let actual = disk_fingerprint(path)?;
@@ -281,7 +322,11 @@ impl Document {
             self.replace(0..self.text.len(), &fresh.text, true);
         }
         self.saved = fresh.saved.clone();
+        self.saved_revision = Some(self.revision);
         self.disk_version = fresh.disk_version;
+        self.history.set_recovery_file(None);
+        self.crlf = fresh.crlf;
+        self.bom = fresh.bom;
         self.noticed_disk_version = None;
         self.cursor = self.offset(row, column);
         self.publish_content();
@@ -292,6 +337,7 @@ impl Document {
     pub fn unload_file_contents(&mut self) {
         let mut unloaded = Self::new("");
         unloaded.set_ex_filename(self.path.clone());
+        self.shared.signs.clear();
         self.replace_file_contents(unloaded);
     }
 
@@ -310,6 +356,7 @@ impl Document {
         let revision = self.revision + 1;
         self.content = fresh.content;
         self.revision = revision;
+        self.saved_revision = Some(revision);
         self.folds = fresh.folds;
         self.cursor = 0;
         self.publish_content();
@@ -452,12 +499,29 @@ impl Document {
 
     /// Replace valid byte `range` with `text`; optionally start a new undo transaction.
     pub fn replace(&mut self, range: Range<usize>, text: &str, checkpoint: bool) {
+        let marks = MarkEdit::new(self, range.clone(), text.len(), None);
+        self.replace_tracking_marks(range, text, checkpoint, &marks);
+    }
+
+    /// Apply a replacement with the same mark geometry used by the originating Vim view.
+    pub(crate) fn replace_tracking_marks(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        checkpoint: bool,
+        marks: &MarkEdit,
+    ) {
         if self.text[range.clone()] == *text {
             return;
         }
         if checkpoint {
             self.checkpoint_content();
         }
+        let signs = if range == (0..self.text.len()) {
+            self.sign_replacement(text)
+        } else {
+            self.sign_edit(range.clone(), text.len())
+        };
         self.history.clear_redo();
         self.shift_folds(&range, text);
         self.text.replace_range(range.clone(), text);
@@ -465,9 +529,8 @@ impl Document {
         self.last_replacement = Some((range, text.len()));
         self.revision += 1;
         self.reindex();
-        if let Some((range, inserted)) = self.last_replacement.as_ref() {
-            self.shift_anchors(range, *inserted);
-        }
+        self.shift_anchors(marks);
+        self.shift_signs(signs);
         self.publish_content();
     }
 
@@ -542,7 +605,9 @@ impl Document {
     /// Replace the retained undo history from `path` after matching the live text.
     pub fn read_undo_file(&mut self, path: &Path) -> Result<()> {
         self.refresh_shared();
+        let recovery = self.history.recovery_file();
         self.history = History::read_file(&self.text, path)?;
+        self.history.set_recovery_file(recovery);
         self.publish_content();
         Ok(())
     }
@@ -555,15 +620,17 @@ impl Document {
         };
         let snapshot = self.history.visit(target, current);
         let replacement = self.anchor_replacement(&snapshot.text);
+        let signs = self.sign_replacement(&snapshot.text);
         self.restore_folds(&snapshot.text);
         self.text = Arc::unwrap_or_clone(snapshot.text);
         self.cursor = snapshot.cursor;
         self.last_replacement = None;
         self.revision += 1;
         self.reindex();
-        if let Some((range, inserted)) = replacement {
-            self.shift_anchors(&range, inserted);
+        if let Some(marks) = replacement {
+            self.shift_anchors(&marks);
         }
+        self.shift_signs(signs);
         self.publish_content();
     }
 
@@ -594,7 +661,7 @@ impl Document {
             .or(self.path.as_deref())
             .context(i18n::text("document.missing_filename"))?;
         let path = write_destination(requested, exclusive)?;
-        let expected = self.disk_version.filter(|_| {
+        let expected = self.content.expected_disk_version().filter(|_| {
             !exclusive
                 && (destination.is_none()
                     || self
@@ -607,11 +674,20 @@ impl Document {
             bail!(i18n::text("document.disk_changed"));
         }
         let written = write_contents(&self.content, &path, expected, exclusive)?;
-        self.path = Some(fs::canonicalize(&path).unwrap_or(path));
+        let new_path = Some(fs::canonicalize(&path).unwrap_or(path));
+        let path_changed = self.path != new_path;
+        self.path = new_path;
         self.relocate_anchors();
         self.saved = Arc::new(self.text.clone());
+        self.saved_revision = Some(self.revision);
         self.history.mark_saved();
         self.disk_version = Some(written);
+        (self.crlf, self.bom) = self.content.file_format();
+        if path_changed {
+            self.history.forget_recovery_files();
+        } else {
+            self.history.set_recovery_file(None);
+        }
         self.noticed_disk_version = None;
         self.publish_content();
         Ok(())
@@ -651,16 +727,8 @@ fn write_contents(
         .open(&temporary)
         .with_context(error_context)?;
     let result = (|| -> Result<DiskVersion> {
-        let bom: &[u8] = if content.bom {
-            &[0xef, 0xbb, 0xbf]
-        } else {
-            &[]
-        };
-        let text = if content.crlf {
-            Cow::Owned(content.text.replace('\n', "\r\n"))
-        } else {
-            Cow::Borrowed(content.text.as_str())
-        };
+        let (crlf, bom) = content.file_format();
+        let (bom, text) = file_encoding(&content.text, crlf, bom);
         file.write_all(bom)?;
         file.write_all(text.as_bytes())?;
         let mut digest = Sha256::new();
@@ -695,6 +763,17 @@ fn write_contents(
         let _ = fs::remove_file(&temporary);
     }
     result.with_context(error_context)
+}
+
+/// Encode internal LF text with the requested line endings and UTF-8 BOM.
+fn file_encoding(text: &str, crlf: bool, bom: bool) -> (&'static [u8], Cow<'_, str>) {
+    let prefix: &[u8] = if bom { &[0xef, 0xbb, 0xbf] } else { &[] };
+    let text = if crlf {
+        Cow::Owned(text.replace('\n', "\r\n"))
+    } else {
+        Cow::Borrowed(text)
+    };
+    (prefix, text)
 }
 
 /// Return the byte offset of every logical line, including a final empty line.

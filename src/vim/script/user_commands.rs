@@ -3,7 +3,7 @@
 use super::{split_fields, split_word};
 use crate::{
     i18n,
-    vim::{Action, Register, Vim},
+    vim::{Action, ExOrigin, Register, Vim},
 };
 use std::{collections::BTreeMap, fmt::Write as _};
 
@@ -18,6 +18,8 @@ pub(super) struct UserCommands {
 struct Definition {
     body: String,
     source: Option<String>,
+    /// Original declaration location for listings and the expanded command body.
+    defined_at: Option<ExOrigin>,
     nargs: Nargs,
     bang: bool,
     bar: bool,
@@ -179,6 +181,7 @@ impl Vim {
         let mut definition = Definition {
             body: String::new(),
             source: register.scripts.source.clone(),
+            defined_at: register.input_maps.current_ex_origin(),
             nargs: Nargs::Zero,
             bang: false,
             bar: false,
@@ -249,7 +252,13 @@ impl Vim {
                 }))
                 .filter(|(name, _)| name.starts_with(prefix))
             {
-                let _ = writeln!(listing, "{name:<20} {}", definition.body);
+                let _ = write!(listing, "{name:<20} {}", definition.body);
+                if register.input_maps.ex_verbose() > 0
+                    && let Some(origin) = &definition.defined_at
+                {
+                    origin.append_to(&mut listing);
+                }
+                listing.push('\n');
             }
             if listing.is_empty() {
                 self.message = i18n::text("vim_g.no_user_commands").into();
@@ -368,12 +377,19 @@ impl Vim {
             text.push_str(" | ");
             text.push_str(extra);
         }
-        let source = if definition.keep_script {
-            register.scripts.source.clone()
+        let (source, origin) = if definition.keep_script {
+            (
+                register.scripts.source.clone(),
+                register.input_maps.current_ex_origin(),
+            )
         } else {
-            definition.source.clone()
+            (definition.source.clone(), definition.defined_at.clone())
         };
-        Ok(Action::UserEx { text, source })
+        Ok(Action::UserEx {
+            text,
+            source,
+            source_line: origin.as_ref().map_or(1, ExOrigin::line),
+        })
     }
 }
 

@@ -285,6 +285,11 @@ fn disrupts_batch(action: &Action) -> bool {
             | Action::ListBuffers
             | Action::ListTabs
             | Action::ShowListing(_)
+            | Action::Sign(
+                nanobug::vim::SignCommand::List { .. }
+                    | nanobug::vim::SignCommand::ListPlaced { .. }
+                    | nanobug::vim::SignCommand::Jump { .. }
+            )
             | Action::EditableListing(_)
             | Action::IncludeSplit { .. }
             | Action::Files(_)
@@ -292,10 +297,12 @@ fn disrupts_batch(action: &Action) -> bool {
             | Action::SessionExport(_)
             | Action::UndoFile { .. }
             | Action::WindowModified { .. }
+            | Action::ExState { .. }
             | Action::MessageModified { .. }
             | Action::WindowExtras(_)
             | Action::Shell(_)
             | Action::RegisterEx(_)
+            | Action::ExPipeline(_)
             | Action::UserEx { .. }
             | Action::Autocmd { .. }
             | Action::NoAutocmd(_)

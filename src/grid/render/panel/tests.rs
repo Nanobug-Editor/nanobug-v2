@@ -223,6 +223,57 @@ fn viewport_dims_only_the_marked_glyph_run() {
     assert_eq!(brace.x, px(27.));
 }
 
+/// Styled labels retain run offsets and paint decorations inside the visible span.
+#[test]
+fn highlighted_labels_keep_byte_styles_and_clipped_decorations() {
+    use nanobug::vim::{HighlightAttributes, HighlightStyle};
+
+    let glyphs = Arc::new(gpui::NoopTextSystem::new());
+    let text_system = WindowTextSystem::new(Arc::new(gpui::TextSystem::new(glyphs.clone())));
+    let metrics = Metrics {
+        cw: 9.,
+        lh: 21.,
+        font_size: GRID_FONT_SIZE,
+        origin: point(px(0.), px(0.)),
+    };
+    let spacing = TextSpacing::new(glyphs, FontId(0), metrics.font_size, metrics.cw);
+    let panel = Panel::new(metrics);
+    let mut frame = Frame::new(12, 1);
+    let highlighted = HighlightStyle {
+        foreground: Some(0x102030),
+        background: Some(0x203040),
+        special: Some(0x304050),
+        attributes: HighlightAttributes {
+            underline: true,
+            strikethrough: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    frame.highlighted_label(0, 2..12, "X Y", TEXT, &spacing, |byte| {
+        (byte > 0).then_some(highlighted)
+    });
+    let mut data = panel.data.borrow_mut();
+    data.set_frame(frame);
+    let row = data.prepare_row(0, &text_system).unwrap();
+    assert_eq!(row.label_backgrounds, [(px(27.), px(18.), 0x203040ff)]);
+    assert_eq!(row.label_runs.len(), 2);
+    let run = &row.label_runs[1];
+    let mut marks = Vec::new();
+    run.paint_decorations(
+        point(run.x, px(0.)),
+        metrics.lh,
+        Some(&(px(36.)..px(45.))),
+        |bounds, color| {
+            marks.push((bounds.left(), bounds.size.width, color));
+        },
+    );
+    assert_eq!(
+        marks,
+        [(px(36.), px(9.), 0x102030ff), (px(36.), px(9.), 0x304050ff)]
+    );
+}
+
 /// Selection recolors names without changing the glyph coordinates used to paint them.
 #[test]
 fn tree_names_keep_glyph_positions_when_selected() {

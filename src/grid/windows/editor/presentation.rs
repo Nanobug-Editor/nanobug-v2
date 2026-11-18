@@ -8,6 +8,7 @@ impl EditorWindow {
         let active_buffer = self.active;
         for (index, buffer) in self.buffers.iter_mut().enumerate() {
             let doc = &buffer.vim.doc;
+            let filetype = buffer.vim.filetype_override();
             let diagnostics = view
                 .document_diagnostics
                 .iter()
@@ -22,10 +23,23 @@ impl EditorWindow {
             let provider = view
                 .document_presentations
                 .iter()
-                .find(|(key, data)| {
+                .filter(|(key, data)| {
                     key.instance.project == scope
                         && data.version == (doc.opening, doc.revision)
                         && view.modules.get(*key) == Some(&State::Ready)
+                })
+                .min_by_key(|(key, _)| {
+                    // An explicit match takes priority over an old package's path match.
+                    !filetype.as_ref().is_some_and(|filetype| {
+                        view.installed.iter().any(|record| {
+                            let manifest = &record.release.manifest;
+                            manifest.identity().namespace() == key.namespace
+                                && manifest.modules.iter().any(|module| {
+                                    module.id == key.instance.module
+                                        && module.document_filetypes.contains(filetype)
+                                })
+                        })
+                    })
                 })
                 .map(|(key, data)| (key.clone(), data.clone()));
             let active = index == active_buffer;
@@ -42,7 +56,10 @@ impl EditorWindow {
                                 record.release.manifest.identity().namespace() == key.namespace
                                     && record.release.manifest.modules.iter().any(|module| {
                                         module.id == key.instance.module
-                                            && module.accepts_document(doc.path.as_deref())
+                                            && module.accepts_filetype(
+                                                doc.path.as_deref(),
+                                                filetype.as_deref(),
+                                            )
                                     })
                             })
                     });

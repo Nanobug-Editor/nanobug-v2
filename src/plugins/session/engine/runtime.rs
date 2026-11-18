@@ -177,6 +177,11 @@ impl Engine {
             let compatible = self.store.compatibility().check(manifest);
             for project in self.projects.values() {
                 let project_dialect = self.sql_dialects.project_preference(project.id);
+                let active_filetype = project.document.as_ref().and_then(|doc| {
+                    self.document_filetypes
+                        .get(&(project.id, doc.opening))
+                        .map(String::as_str)
+                });
                 let path = project
                     .document
                     .as_ref()
@@ -199,7 +204,8 @@ impl Engine {
                     } else if let Err(error) = &compatible {
                         (false, State::Failed(error.to_string()))
                     } else if dialect_module
-                        && ((!module.accepts_document(path) && !project_sql_server)
+                        && ((!module.accepts_filetype(path, active_filetype)
+                            && !project_sql_server)
                             || sql_providers
                                 .get(&project.id)
                                 .is_some_and(|selected| selected.as_ref() != Some(namespace)))
@@ -230,6 +236,11 @@ impl Engine {
                                     project_dialect
                                 } else {
                                     None
+                                },
+                                if module.document_filetypes.is_empty() {
+                                    None
+                                } else {
+                                    active_filetype
                                 },
                             );
                             rules.insert(key.clone());

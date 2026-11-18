@@ -10,6 +10,17 @@ use unicode_segmentation::UnicodeSegmentation;
 pub enum Action {
     /// Change the Session buffer list or the current window's argument list.
     BufferLifecycle(super::BufferCommand),
+    /// Manage a local recovery file without writing the backing document.
+    Recovery(super::RecoveryCommand),
+    /// Query or rerun buffer filetype detection in the workspace.
+    Filetype(super::FiletypeCommand),
+    /// Change or query signs attached to a shared buffer or the workspace definitions.
+    Sign(super::SignCommand),
+    /// Apply a language server operation to the originating Session.
+    LanguageServer {
+        command: super::LspCommand,
+        target: Option<String>,
+    },
     /// Read or write the undo archive for the current buffer.
     UndoFile {
         path: String,
@@ -21,6 +32,13 @@ pub enum Action {
         modifiers: super::WindowModifiers,
         command: String,
     },
+    /// Carry a command's local Vim state into the resulting workspace operation.
+    ExState {
+        modifiers: super::WindowModifiers,
+        action: Box<Action>,
+    },
+    /// Execute a pipeline whose statements share the current editor context.
+    ExPipeline(String),
     /// Scope visibility or filtering to one nested Ex command.
     MessageModified {
         modifier: super::MessageModifier,
@@ -131,6 +149,17 @@ pub enum Action {
     },
     /// Display an Ex listing in a scrollable read-only view.
     ShowListing(String),
+    /// Display retained message history with the emitted styles.
+    ShowStyledListing(super::ExMessageOutput),
+    /// Resolve and open a workspace-relative redirection file.
+    RedirectFile {
+        path: String,
+        mode: super::RedirectMode,
+    },
+    /// Start capturing into the native clipboard, optionally preserving its text.
+    RedirectClipboard {
+        append: bool,
+    },
     /// Open the generated text in its own editable buffer.
     EditableListing(String),
     /// Open a match from the local include tree in a new or preview window.
@@ -152,6 +181,7 @@ pub enum Action {
     UserEx {
         text: String,
         source: Option<String>,
+        source_line: usize,
     },
     /// Run the matching automatic commands in one or all retained buffers.
     Autocmd {
@@ -680,7 +710,9 @@ impl Vim {
     /// Run an Ex `line` programmatically using the same dispatch as the command prompt.
     pub fn execute_ex_line(&mut self, line: &str, register: &mut Register) -> Action {
         let line = line.trim_start().trim_start_matches(':').trim_start();
-        self.message.clear();
+        if super::ex_echo_highlight::argument(line).is_none() {
+            self.clear_ex_message();
+        }
         self.ex_failed = false;
         let mode = self.mode;
         let action = self.execute_ex_command(line, None, None, register, &mut |_, _, _, _| None);
@@ -701,6 +733,7 @@ impl Vim {
 
     /// Publish the status text and failure outcome of a host-run nested Ex command.
     pub fn publish_ex_message(&mut self, text: &str, failed: bool) {
+        self.ex_message_spans.clear();
         self.message = text.into();
         self.ex_failed = failed;
     }
@@ -712,13 +745,14 @@ impl Vim {
 
     /// Preserve command tails that interpret their own command separators in a script.
     pub fn source_statements<'a>(&self, line: &'a str) -> Vec<&'a str> {
+        let (_, _, body) = super::ex_window_modifiers::command_modifiers(line);
         if self
-            .ex_range(line)
+            .ex_range(body)
             .is_some_and(|(_, body)| body.starts_with('!'))
         {
             return vec![line];
         }
-        let command = line.trim_start_matches(|ch: char| !ch.is_ascii_alphabetic());
+        let command = body.trim_start_matches(|ch: char| !ch.is_ascii_alphabetic());
         let name = command
             .split(|ch: char| !(ch.is_ascii_alphabetic() || ch == '!'))
             .next()
@@ -850,7 +884,12 @@ impl Vim {
                 self.mode = Mode::Normal;
                 self.command_pos = 0;
                 let command = std::mem::take(&mut self.command);
-                if !self.repeats_previous_ex(&command, register) || self.prompt != ':' {
+                let remember = if self.prompt == ':' {
+                    !self.repeats_previous_ex(&command, register)
+                } else {
+                    !super::ex_window_modifiers::ex_keeps_patterns()
+                };
+                if remember {
                     register.command_history.remember(self.prompt, &command);
                 }
                 let selection = self.command_selection.take();
@@ -977,6 +1016,41 @@ impl Vim {
         register: &mut Register,
         resolve_screen: &mut ScreenMotionResolver<'_>,
     ) -> Action {
+        register.input_maps.clear_ex_diagnostic();
+        register.input_maps.trace_ex_line(text);
+        let previous = self.message.clone();
+        let sequence = register.input_maps.ex_output_sequence();
+        let action =
+            self.dispatch_ex_command(text, selection, menu_origin, register, resolve_screen);
+        if self.ex_failed && register.input_maps.ex_silence() != Some(true) {
+            register.reset_ex_echo_line();
+        }
+        if matches!(action, Action::None)
+            && !self.message.is_empty()
+            && self.message != previous
+            && (self.ex_failed || register.input_maps.ex_output_sequence() == sequence)
+        {
+            let output = if self.ex_failed {
+                self.message.clone()
+            } else {
+                register.input_maps.filter_ex_output(&self.message)
+            };
+            if !output.is_empty() {
+                register.input_maps.record_ex_output(&output, true);
+            }
+        }
+        action
+    }
+
+    /// Dispatch one Ex command, leaving rendered output to the calling boundary.
+    fn dispatch_ex_command(
+        &mut self,
+        text: &str,
+        selection: Option<Range<usize>>,
+        menu_origin: Option<super::menu::Origin>,
+        register: &mut Register,
+        resolve_screen: &mut ScreenMotionResolver<'_>,
+    ) -> Action {
         if self.configure_options(text, register) || self.configure_input(text, register) {
             return Action::None;
         }
@@ -984,15 +1058,46 @@ impl Vim {
             return action;
         }
         self.script_command(text, register)
+            .or_else(|| self.ex_highlight_command(text, register))
+            .or_else(|| self.ex_echo_highlight(text, register))
+            .or_else(|| self.ex_redirect_command(text, register))
+            .or_else(|| self.ex_sign_command(text))
+            .or_else(|| self.ex_match_command(text, register))
             .or_else(|| self.ex_state_command(text, register))
             .or_else(|| self.ex_catalog_command(text))
+            .or_else(|| self.ex_language_command(text))
+            .or_else(|| self.ex_recovery_command(text))
             .or_else(|| self.ex_history_command(text, register, resolve_screen))
             .or_else(|| self.ex_buffer_lifecycle(text))
             .or_else(|| self.session_export_ex_command(text))
             .or_else(|| self.ex_file_command(text))
             .or_else(|| self.ex_message_modifier(text))
             .or_else(|| self.ex_window_command(text, register))
-            .or_else(|| self.ex_window_modifiers(text))
+            .or_else(|| match self.ex_window_modifiers(text)? {
+                Action::WindowModified { modifiers, command }
+                    if !modifiers.has_native_options() =>
+                {
+                    let mappings = register.input_maps.clone();
+                    let action = modifiers.with_ex_state(&mappings, || {
+                        self.execute_ex_command(
+                            &command,
+                            selection.clone(),
+                            menu_origin,
+                            register,
+                            resolve_screen,
+                        )
+                    });
+                    Some(if action == Action::None {
+                        action
+                    } else {
+                        Action::ExState {
+                            modifiers,
+                            action: Box::new(action),
+                        }
+                    })
+                }
+                action => Some(action),
+            })
             .or_else(|| self.ex_batch(text, register, resolve_screen))
             .unwrap_or_else(|| self.ex(text, selection, register))
     }

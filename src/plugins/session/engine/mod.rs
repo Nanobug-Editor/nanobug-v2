@@ -102,6 +102,8 @@ struct Engine {
     projects: BTreeMap<u64, Project>,
     /// Project preferences and overrides supplied by the editor's active buffers.
     sql_dialects: sql_dialect::Dialects,
+    /// Explicit file types of editor-supplied openings, outside the guest document wire.
+    document_filetypes: super::DocumentFiletypes,
     active: Option<u64>,
     rules: Rules,
     config: config::Configurations,
@@ -134,6 +136,8 @@ struct Engine {
     project_execution: BTreeMap<String, bool>,
     project_flags: BTreeMap<u64, Arc<AtomicBool>>,
     analyzers: BTreeMap<Key, analyzer::Binding>,
+    /// Session-local native server policy and in-flight stop/restart operations.
+    server_controls: analyzer::ServerControls,
     developer_io: Pool,
     changed: bool,
 }
@@ -235,6 +239,7 @@ impl Engine {
             project_execution,
             project_flags: BTreeMap::new(),
             analyzers: BTreeMap::new(),
+            server_controls: analyzer::ServerControls::default(),
             developer_io: Pool::new(1, 1),
             store,
             enabled,
@@ -244,6 +249,7 @@ impl Engine {
             releases: BTreeMap::new(),
             projects: BTreeMap::new(),
             sql_dialects: sql_dialect::Dialects::new(&state),
+            document_filetypes: Default::default(),
             active: None,
             draft: drafts,
             draft_write: Instant::now(),
@@ -361,7 +367,9 @@ impl Engine {
         }
     }
 
-    fn projects(&mut self, (active, projects, dialects): Projects) {
+    fn projects(&mut self, (active, projects, dialects, filetypes): Projects) {
+        let types_changed = self.document_filetypes != filetypes;
+        self.document_filetypes = filetypes;
         self.active = active;
         self.projects = projects
             .into_iter()
@@ -389,9 +397,16 @@ impl Engine {
             self.changed = true;
         }
         self.config.projects(self.projects.values());
-        if self.sql_dialects.update(&self.projects, dialects) {
+        if self.sql_dialects.update(&self.projects, dialects) || types_changed {
             self.reconcile();
         }
+    }
+
+    /// Resolve the explicit file type of `opening` in `project` without consulting the disk.
+    pub(super) fn document_filetype(&self, project: u64, opening: u64) -> Option<&str> {
+        self.document_filetypes
+            .get(&(project, opening))
+            .map(String::as_str)
     }
 
     fn config_affects_write(&self, scope: config::ConfigScope, revision: u64, owner: &Key) -> bool {

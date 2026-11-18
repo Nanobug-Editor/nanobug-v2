@@ -18,6 +18,7 @@ mod ex_catalog;
 mod ex_commands;
 mod ex_files;
 mod ex_messages;
+mod ex_sign;
 mod ex_windows;
 mod explorer;
 mod file_picker;
@@ -39,6 +40,7 @@ mod pointer;
 mod probe;
 mod projects;
 mod recent_projects;
+mod recovery;
 mod session_export;
 mod sleep;
 mod start_page;
@@ -109,6 +111,10 @@ pub(crate) struct Workspace {
     ex_sourced_files: Vec<PathBuf>,
     /// App-wide Ex directory set by :cd, falling back to a Session's own root initially.
     ex_directory: crate::grid::windows::editor::DirectorySlot,
+    /// Background draft checkpoints for loaded, modified text buffers.
+    recovery: recovery::Recovery,
+    /// Buffer numbers already loaded within the current `:noswapfile` dispatch.
+    noswapfile_buffers: Option<std::collections::HashSet<u64>>,
     /// Placement overrides for the currently executing Ex command.
     active_ex_window_modifiers: nanobug::vim::WindowModifiers,
     /// Startup command carried into a replacement process after :restart closes this one.
@@ -235,7 +241,8 @@ impl Workspace {
         } else {
             RecentProjects::new(projects.ordered().map(|project| project.root.clone()))
         };
-        cx.set_global(appearance.style(window.appearance()));
+        let style = appearance.style(window.appearance());
+        cx.set_global(style);
         let (metrics, spacing) = dpi::measure(window, &glyphs, appearance);
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
@@ -267,6 +274,7 @@ impl Workspace {
                 } else {
                     workspace.save_numbered_mark();
                     workspace.save_window_geometry(window, cx);
+                    workspace.recovery.finish();
                     true
                 }
             })
@@ -306,6 +314,8 @@ impl Workspace {
             .active_project()
             .map(|project| project.cursor_config.clone())
             .unwrap_or_default();
+        let input_mappings = nanobug::vim::InputMappings::default();
+        style.update_ex_highlight_palette(&input_mappings);
         let mut workspace = Self {
             focus_handle,
             projects,
@@ -316,7 +326,7 @@ impl Workspace {
             command_window: None,
             vim_menu: None,
             editor_sleep: None,
-            input_mappings: nanobug::vim::InputMappings::default(),
+            input_mappings,
             vim_settings_path: (!isolate_data)
                 .then(|| nanobug::app_data::settings::path().ok())
                 .flatten(),
@@ -324,6 +334,11 @@ impl Workspace {
             script_events: Default::default(),
             ex_sourced_files: Vec::new(),
             ex_directory: Default::default(),
+            recovery: recovery::Recovery::new((!isolate_data && !cfg!(test)).then(|| {
+                nanobug::app_data::project_sessions_directory()
+                    .map(|path| path.with_file_name("recovery").join("editor"))
+            })),
+            noswapfile_buffers: None,
             active_ex_window_modifiers: Default::default(),
             restart_ex_command: None,
             main_window_removing: false,
@@ -389,6 +404,7 @@ impl Workspace {
             probe: probe.map(|options| probe::Probe::new(options, metrics, cx)),
         };
         workspace.load_vim_config();
+        workspace.start_recovery(window, cx);
         workspace
     }
 
@@ -422,6 +438,7 @@ impl Workspace {
     /// Persist the placement and remove `window` after an in-app close completes in `cx`.
     fn remove_main_window(&mut self, window: &mut Window, cx: &App) {
         self.main_window_removing = true;
+        self.recovery.finish();
         self.save_numbered_mark();
         self.save_window_geometry(window, cx);
         window.remove_window();

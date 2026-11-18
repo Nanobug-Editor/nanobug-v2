@@ -225,6 +225,7 @@ impl Workspace {
 
     /// Rebuild changed panel cells and retarget the independent animated cursor.
     pub(super) fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_noswapfile_to_loaded();
         self.observe_script_buffer(window, cx);
         if let Some(project) = self.projects.active_project_mut() {
             project.set_input_mappings(&self.input_mappings);

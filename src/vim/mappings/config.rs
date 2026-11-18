@@ -250,6 +250,7 @@ impl SavedMapping {
                     lhs: self.lhs,
                     leader: self.leader,
                 }),
+                defined_at: None,
                 recursive: self.recursive,
                 expression: self.expression,
                 restore_select: self.restore_select,

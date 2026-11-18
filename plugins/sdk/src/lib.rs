@@ -242,6 +242,9 @@ pub enum PluginEvent {
 pub struct Input {
     pub event: PluginEvent,
     pub document: Option<DocumentSnapshot>,
+    /// Explicit filetype for the active buffer when this module supports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_filetype: Option<String>,
     pub settings: BTreeMap<String, Value>,
     pub draft: String,
     #[serde(default)]

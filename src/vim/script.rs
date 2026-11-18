@@ -5,12 +5,12 @@ mod control;
 mod encoding;
 mod user_commands;
 
-use super::{Action, Mode, Register, Vim, expression::Value};
+use super::{Action, ExOrigin, Mode, Register, Vim, expression::Value};
 use crate::i18n;
 pub use autocmd::{ScriptAutocmd, ScriptEvent};
 pub use control::{ScriptLine, ScriptProgram, ScriptTabScope};
 pub use encoding::decode_ex_source;
-use std::{collections::BTreeMap, ops::Range, sync::Arc};
+use std::{collections::BTreeMap, fmt::Write as _, ops::Range, sync::Arc};
 use unicode_segmentation::UnicodeSegmentation;
 pub(super) use user_commands::Completion as UserExCompletion;
 
@@ -63,12 +63,14 @@ pub(super) struct State {
     pub(super) running_help: bool,
     /// Function name called by the next g@ operator.
     operatorfunc: String,
+    /// Source assignment of the next g@ operator.
+    operatorfunc_origin: Option<ExOrigin>,
     /// Definition taking input across consecutive command lines.
     defining: Option<Definition>,
     /// Active script invocations, including nested calls and :normal! commands.
     depth: usize,
-    /// The pending output line produced by consecutive :echon statements.
-    echo_tail: String,
+    /// Recent visible output, to which :echon appends its next fragment.
+    echo_tail: super::ExMessageOutput,
     /// Variables local to the editor pane and scope handle for its current Tabpage.
     variables: control::WindowVariables,
     /// Origin of the script command currently being dispatched, when it came from :source.
@@ -87,6 +89,11 @@ pub(super) struct Shared {
 }
 
 impl Register {
+    /// A later :echon starts a fresh line after a displayed Ex error.
+    pub(super) fn reset_ex_echo_line(&mut self) {
+        self.scripts.echo_tail = super::ExMessageOutput::default();
+    }
+
     /// Borrow an owned handle to a declared function without locking during execution.
     fn script_function(&self, name: &str) -> Option<Arc<Function>> {
         self.input_maps
@@ -120,8 +127,10 @@ impl Register {
 /// A callable Vim function with positional parameters and Ex statements.
 struct Function {
     arguments: Vec<String>,
-    statements: Vec<String>,
+    statements: Vec<ScriptLine>,
     source: Option<String>,
+    /// Location of the declaration, independent of its invocation site.
+    defined_at: Option<ExOrigin>,
 }
 
 /// Pending function input and whether its existing name can be replaced.
@@ -195,7 +204,8 @@ impl Vim {
                 ) {
                     function = !statements(text).any(is_end_function);
                 } else if !function {
-                    let body = text.trim_start_matches(|ch: char| !ch.is_ascii_alphabetic());
+                    let (_, _, body) = super::ex_window_modifiers::command_modifiers(text);
+                    let body = body.trim_start_matches(|ch: char| !ch.is_ascii_alphabetic());
                     let verb = body
                         .split(|ch: char| !ch.is_ascii_alphabetic())
                         .next()
@@ -227,8 +237,12 @@ impl Vim {
             return Action::None;
         }
         let old = std::mem::replace(&mut register.scripts.source, program.source());
+        let _origin = register
+            .input_maps
+            .enter_ex_origin(program.ex_origin(line.number));
         let action = if defining_function(register) {
-            self.message.clear();
+            register.input_maps.trace_ex_line(&line.text);
+            self.clear_ex_message();
             self.ex_failed = false;
             let mode = self.mode;
             let action = self
@@ -271,6 +285,9 @@ impl Vim {
             if let Some(action) = self.user_ex_command(source, register) {
                 return Some(action);
             }
+            if matches!(command, "function" | "func" | "fu") && !argument.contains('(') {
+                return Some(self.list_script_functions(argument, register));
+            }
             if command.len() >= 4 && "finish".starts_with(command) && argument.is_empty() {
                 return Some(Action::FinishSource);
             }
@@ -295,6 +312,40 @@ impl Vim {
         })
     }
 
+    /// Display local function declarations and the body of a selected function.
+    fn list_script_functions(&mut self, name: &str, register: &Register) -> Action {
+        let verbose = register.input_maps.ex_verbose() > 0;
+        let shared = register.input_maps.shared_scripts();
+        let shared = shared.read().unwrap();
+        let mut output = String::new();
+        for (function_name, function) in &shared.functions {
+            if !name.is_empty() && name != function_name {
+                continue;
+            }
+            let _ = write!(
+                output,
+                "function {function_name}({})",
+                function.arguments.join(", ")
+            );
+            if verbose && let Some(origin) = &function.defined_at {
+                origin.append_to(&mut output);
+            }
+            output.push('\n');
+            if !name.is_empty() {
+                for (index, statement) in function.statements.iter().enumerate() {
+                    let _ = writeln!(output, "{:4}  {}", index + 1, statement.text);
+                }
+                output.push_str("   endfunction\n");
+            }
+        }
+        if !name.is_empty() && output.is_empty() {
+            self.script_error(&format!("Unknown function: {name}"));
+            Action::None
+        } else {
+            Action::ShowListing(output)
+        }
+    }
+
     /// Dispatch only script commands, returning None for the regular Ex dispatcher.
     fn try_script_command(
         &mut self,
@@ -302,6 +353,8 @@ impl Vim {
         register: &mut Register,
     ) -> Option<Result<(), String>> {
         let source = source.trim();
+        let origin = register.input_maps.current_ex_origin();
+        let number = origin.as_ref().map_or(1, ExOrigin::line);
         if let Some(mut pending) = register.scripts.defining.take() {
             if is_end_function(source) {
                 return Some(install(pending, register));
@@ -310,7 +363,11 @@ impl Vim {
                 pending
                     .function
                     .statements
-                    .extend(statements(source).map(str::to_owned));
+                    .extend(statements(source).map(|text| ScriptLine {
+                        number,
+                        text: text.into(),
+                        literal: false,
+                    }));
             }
             register.scripts.defining = Some(pending);
             self.open_prompt(':', 1);
@@ -339,13 +396,18 @@ impl Vim {
                         arguments,
                         statements: Vec::new(),
                         source: register.scripts.source.clone(),
+                        defined_at: origin,
                     },
                 };
                 for line in lines {
                     if is_end_function(line) {
                         return install(pending, register);
                     }
-                    pending.function.statements.push(line.into());
+                    pending.function.statements.push(ScriptLine {
+                        number,
+                        text: line.into(),
+                        literal: false,
+                    });
                 }
                 register.scripts.defining = Some(pending);
                 self.open_prompt(':', 1);
@@ -359,8 +421,14 @@ impl Vim {
         {
             if argument.is_empty() || argument == "?" {
                 self.message = format!("operatorfunc={}", register.scripts.operatorfunc);
+                if register.input_maps.ex_verbose() > 0
+                    && let Some(origin) = &register.scripts.operatorfunc_origin
+                {
+                    origin.append_inline(&mut self.message);
+                }
             } else if let Some(name) = argument.strip_prefix('=') {
                 register.scripts.operatorfunc = name.trim().into();
+                register.scripts.operatorfunc_origin = origin;
             } else {
                 return Some(Err("Invalid operatorfunc option".into()));
             }
@@ -374,6 +442,7 @@ impl Vim {
                 self.evaluate_expression(value.trim(), register)
                     .map(|value| {
                         register.scripts.operatorfunc = value.display();
+                        register.scripts.operatorfunc_origin = origin;
                     }),
             );
         }
@@ -487,7 +556,7 @@ impl Vim {
             ),
         ]);
         if let Err(error) = self.run_lines(
-            function.statements.iter().map(String::as_str),
+            function.statements.iter().cloned(),
             locals,
             function.source.clone(),
             register,
@@ -502,25 +571,33 @@ impl Vim {
         source: &str,
         register: &mut Register,
     ) -> Result<(), String> {
-        let program = ScriptProgram::compile(
-            control::program_lines(source),
-            register.scripts.source.clone(),
-        )
-        .map_err(|(_, error)| error)?;
-        self.run_program(program, register).map(|_| ())
+        let mut statements = control::program_lines(source);
+        if let Some(origin) = register.input_maps.current_ex_origin() {
+            for line in &mut statements {
+                line.number += origin.line().saturating_sub(1);
+            }
+        }
+        let program = ScriptProgram::compile(statements, register.scripts.source.clone())
+            .map_err(|(_, error)| error)?;
+        let run = || self.run_program(program, register).map(|_| ());
+        if matches!(split_word(source).0, "execute" | "exe") {
+            super::ex_window_modifiers::without_ex_keep_jumps(run)
+        } else {
+            run()
+        }
     }
 
     /// Run `lines` with scoped `locals`, bounding recursive invocations through `register`.
-    fn run_lines<'s>(
+    fn run_lines(
         &mut self,
-        lines: impl IntoIterator<Item = &'s str>,
+        lines: impl IntoIterator<Item = ScriptLine>,
         arguments: BTreeMap<String, Value>,
         source: Option<String>,
         register: &mut Register,
     ) -> Result<Option<Value>, String> {
         let program =
             ScriptProgram::function(lines, arguments, source).map_err(|(_, error)| error)?;
-        self.run_program(program, register)
+        super::ex_window_modifiers::without_ex_keep_jumps(|| self.run_program(program, register))
     }
 
     /// Execute a program locally, feeding any command failures back into its active try frame.
@@ -533,6 +610,7 @@ impl Vim {
             return Err("Vim script call depth exceeded".into());
         }
         register.scripts.depth += 1;
+        let old_source = std::mem::replace(&mut register.scripts.source, program.source());
         let result = (|| {
             let mut error = None;
             while let Some(line) = program
@@ -540,6 +618,9 @@ impl Vim {
                 .map_err(|(_, error)| error)?
             {
                 let bindings = program.bindings(register);
+                let _origin = register
+                    .input_maps
+                    .enter_ex_origin(program.ex_origin(line.number));
                 error = self.script_line(&line.text, &bindings, register).err();
             }
             Ok(program.returned())
@@ -550,6 +631,7 @@ impl Vim {
                 deferred_error.get_or_insert(error);
             }
         }
+        register.scripts.source = old_source;
         register.scripts.depth -= 1;
         result.and_then(|value| deferred_error.map_or(Ok(value), Err))
     }
@@ -561,6 +643,14 @@ impl Vim {
         locals: &BTreeMap<String, Value>,
         register: &mut Register,
     ) -> Result<(), String> {
+        if let Some((modifiers, command)) = super::ex_window_modifiers::parse_modifiers(line)
+            && !modifiers.has_native_options()
+            && !command.is_empty()
+        {
+            let mappings = register.input_maps.clone();
+            return modifiers
+                .with_ex_state(&mappings, || self.script_line(command, locals, register));
+        }
         let (command, rest) = split_word(line);
         let evaluate =
             |vim: &Vim, source: &str, register: &Register, locals: &BTreeMap<String, Value>| {
@@ -574,16 +664,25 @@ impl Vim {
             "" => {}
             key if key.starts_with('"') => {}
             "echo" | "echomsg" | "echom" => {
-                register.scripts.echo_tail.clear();
-                self.message = evaluate(self, rest, register, locals)?.display();
+                let value = self.ex_message(rest, register, locals, " ")?;
+                let output = super::ExMessageOutput::with_style(
+                    &value,
+                    register.input_maps.echo_highlight(),
+                );
+                self.record_script_output(register, &value, true);
                 if command != "echo" {
-                    register.input_maps.remember_ex_message(&self.message);
+                    register
+                        .input_maps
+                        .remember_styled_ex_message(output.clone());
                 }
+                self.publish_echo_message(output, register);
             }
             "echon" => {
                 let value = self.ex_message(rest, register, locals, "")?;
-                register.scripts.echo_tail.push_str(&value);
-                self.message.clone_from(&register.scripts.echo_tail);
+                self.record_script_output(register, &value, false);
+                let mut output = register.scripts.echo_tail.clone();
+                output.push(&value, register.input_maps.echo_highlight());
+                self.publish_echo_message(output, register);
             }
             "echoerr" | "echoe" => return Err(self.ex_message(rest, register, locals, " ")?),
             "eval" | "eva" | "ev" => {
@@ -628,14 +727,64 @@ impl Vim {
                 self.script_call(name, args, register)?;
             }
             _ => {
+                let previous = self.displayed_ex_message();
                 let action = self.execute_ex_line(line, register);
                 if self.ex_failed() {
                     return Err(self.message.clone());
                 }
                 match action {
                     Action::None => {}
-                    Action::UserEx { text, source } => {
-                        let lines = self.script_lines(&text, 1);
+                    Action::ShowListing(listing)
+                        if register.input_maps.capturing_ex_output()
+                            || register.input_maps.ex_silence().is_some() =>
+                    {
+                        self.record_script_output(register, &listing, true);
+                        if register.input_maps.ex_silence().is_none() {
+                            self.message = listing;
+                        }
+                    }
+                    Action::ShowStyledListing(listing)
+                        if register.input_maps.capturing_ex_output()
+                            || register.input_maps.ex_silence().is_some() =>
+                    {
+                        self.record_script_output(register, &listing.text, true);
+                        if register.input_maps.ex_silence().is_none() {
+                            self.publish_styled_ex_message(listing);
+                        }
+                    }
+                    Action::MessageModified { modifier, command } => {
+                        let mappings = register.input_maps.clone();
+                        mappings.begin_ex_message_modifier(modifier);
+                        let silence = mappings.ex_silence();
+                        let sequence = mappings.ex_output_sequence();
+                        let result = self.script_line(&command, locals, register);
+                        if let Err(error) = &result
+                            && silence == Some(true)
+                        {
+                            if mappings.ex_output_sequence() == sequence {
+                                mappings.record_ex_output(error, true);
+                            }
+                            mappings.remember_ex_error(error);
+                            self.ex_failed = false;
+                        }
+                        if silence.is_some() {
+                            self.publish_styled_ex_message(previous);
+                        } else {
+                            let output =
+                                mappings.filter_styled_ex_output(self.displayed_ex_message());
+                            self.publish_styled_ex_message(output);
+                        }
+                        mappings.end_ex_message_modifier();
+                        if silence != Some(true) {
+                            result?;
+                        }
+                    }
+                    Action::UserEx {
+                        text,
+                        source,
+                        source_line,
+                    } => {
+                        let lines = self.script_lines(&text, source_line);
                         let program = ScriptProgram::user_command(lines, source)
                             .map_err(|(_, error)| error)?;
                         self.run_program(program, register)?;
@@ -649,6 +798,23 @@ impl Vim {
             }
         }
         Ok(())
+    }
+
+    /// Record each script message, even when a function emits several in one Ex command.
+    fn record_script_output(&self, register: &Register, output: &str, newline: bool) {
+        let filtered = register.input_maps.filter_ex_output(output);
+        if output.is_empty() || !filtered.is_empty() {
+            register.input_maps.record_ex_output(&filtered, newline);
+        }
+    }
+
+    /// Keep the visible line for :echon while silent output continues through :redir.
+    fn publish_echo_message(&mut self, output: super::ExMessageOutput, register: &mut Register) {
+        if register.input_maps.ex_silence().is_none() {
+            register.scripts.echo_tail =
+                register.input_maps.filter_styled_ex_output(output.clone());
+        }
+        self.publish_styled_ex_message(output);
     }
 
     /// Render `source` expressions separated by `separator` for an Ex message.
@@ -682,20 +848,38 @@ impl Vim {
             if function.arguments.len() != arguments.len() {
                 return Err(format!("Incorrect argument count for {name}"));
             }
+            if register.input_maps.ex_verbose() >= 12 {
+                let args = arguments
+                    .iter()
+                    .map(Value::display)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                register
+                    .input_maps
+                    .trace_ex(12, &format!("calling {name}({args})"));
+            }
             let locals = function
                 .arguments
                 .iter()
                 .zip(arguments)
                 .map(|(name, value)| (format!("a:{name}"), value))
                 .collect();
-            return self
-                .run_lines(
-                    function.statements.iter().map(String::as_str),
-                    locals,
-                    function.source.clone(),
-                    register,
-                )
-                .map(|_| ());
+            let result = self.run_lines(
+                function.statements.iter().cloned(),
+                locals,
+                function.source.clone(),
+                register,
+            );
+            if register.input_maps.ex_verbose() >= 12 {
+                let outcome = match &result {
+                    Ok(value) => value.as_ref().map_or_else(|| "0".into(), Value::display),
+                    Err(message) => message.clone(),
+                };
+                register
+                    .input_maps
+                    .trace_ex(12, &format!("{name} returning {outcome}"));
+            }
+            return result.map(|_| ());
         }
         match (name, arguments.as_slice()) {
             ("cursor", [Value::Integer(line), Value::Integer(column)]) => {
@@ -758,8 +942,16 @@ impl Vim {
 
     /// Present script `error` on the editor status line.
     pub(super) fn script_error(&mut self, error: &str) {
+        self.ex_message_spans.clear();
         self.ex_failed = true;
         self.message = i18n::format("vim_g.script_error", &[("error", &error)]);
+    }
+}
+
+impl Register {
+    /// Ex statements inherit the source identity of their containing script.
+    pub(super) fn script_source(&self) -> Option<String> {
+        self.scripts.source.clone()
     }
 }
 
@@ -827,8 +1019,26 @@ fn split_fields(source: &str, delimiter: char) -> Vec<&str> {
     let mut start = 0;
     let mut quoted = None;
     let mut brackets = 0usize;
+    let protected_prefix = |start| {
+        if delimiter == '|' {
+            let command = &source[start..];
+            let sign = super::ex_sign::protected_prefix(command);
+            start
+                + if sign > 0 {
+                    sign
+                } else {
+                    super::ex_match::protected_prefix(command)
+                }
+        } else {
+            0
+        }
+    };
+    let mut protected_end = protected_prefix(start);
     let mut input = source.char_indices().peekable();
     while let Some((at, ch)) = input.next() {
+        if at < protected_end {
+            continue;
+        }
         if let Some(quote) = quoted {
             if ch == '\\' && quote == '"' {
                 input.next();
@@ -845,6 +1055,13 @@ fn split_fields(source: &str, delimiter: char) -> Vec<&str> {
             '\\' => {
                 input.next();
             }
+            '"' if delimiter == '|'
+                && source[start..at].strip_suffix('@').is_some_and(|prefix| {
+                    prefix
+                        .split_whitespace()
+                        .last()
+                        .is_some_and(|word| matches!(word.trim_end_matches('!'), "redi" | "redir"))
+                }) => {}
             '\'' | '"' => quoted = Some(ch),
             '(' | '[' | '{' => brackets += 1,
             ')' | ']' | '}' => brackets = brackets.saturating_sub(1),
@@ -855,6 +1072,7 @@ fn split_fields(source: &str, delimiter: char) -> Vec<&str> {
                 }
                 parts.push(source[start..at].trim());
                 start = at + ch.len_utf8();
+                protected_end = protected_prefix(start);
             }
             _ => {}
         }
@@ -942,7 +1160,7 @@ mod tests {
         let mut vim = Vim::new(Document::new("one\ntwo\n"));
         let mut register = Register::default();
         vim.execute_ex_line("command! -range -bang -nargs=* -register -bar Greet echo <q-args> .. '<bang>' | echo <line1> .. ':' .. <line2> .. ':<reg>'", &mut register);
-        let Action::UserEx { text, source } =
+        let Action::UserEx { text, source, .. } =
             vim.execute_ex_line("1,2Greet! a hello world | echo 3", &mut register)
         else {
             panic!("{}", vim.message)

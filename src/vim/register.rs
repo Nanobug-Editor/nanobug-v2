@@ -1,7 +1,11 @@
 //! Text registers and recorded key sequences shared by an editor's buffers.
 
 use super::{FileMarks, command_prompt::Histories, replay::Stroke};
-use std::collections::BTreeMap;
+use std::{
+    borrow::Cow,
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 /// Paste geometry of a register's contents.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -24,6 +28,9 @@ pub(super) struct Contents {
     pub kind: Kind,
 }
 
+/// A register slot that Ex output can update after the originating window loses focus.
+pub(super) type RedirectedRegister = Arc<Mutex<Contents>>;
+
 /// Unnamed register and named register bank, shared across open buffers.
 #[derive(Default)]
 pub struct Register {
@@ -35,6 +42,8 @@ pub struct Register {
     block: Option<usize>,
     /// Contents of explicitly named registers.
     named: BTreeMap<char, Contents>,
+    /// Shared slots allocated only for registers selected as redirection destinations.
+    redirected: BTreeMap<char, RedirectedRegister>,
     /// Key tokens for registers filled by macro recording.
     macros: BTreeMap<char, Vec<Stroke>>,
     /// Target and keys of the current recording.
@@ -66,9 +75,16 @@ pub struct Register {
     pub(super) input_maps: super::InputMappings,
     /// Display options for the window containing this register bank.
     pub(super) window_options: Option<super::WindowOptions>,
+    /// Match patterns shared by the buffers in this window.
+    pub(super) ex_matches: [Option<super::ExMatch>; 3],
 }
 
 impl Register {
+    /// Return the window's three match slots with the highest priority first.
+    pub fn ex_matches(&self) -> &[Option<super::ExMatch>; 3] {
+        &self.ex_matches
+    }
+
     /// Attach the Session's shared `marks` without changing this window's other registers.
     pub fn set_file_marks(&mut self, marks: FileMarks) {
         self.file_marks = marks;
@@ -85,6 +101,7 @@ impl Register {
         let names = if filter.is_empty() {
             self.named
                 .keys()
+                .chain(self.redirected.keys())
                 .chain(self.macros.keys())
                 .copied()
                 .chain(['"', '.', ':', '='])
@@ -127,6 +144,11 @@ impl Register {
         self.input_maps = mappings;
     }
 
+    /// Read the workspace's input definitions and Ex presentation state from this pane.
+    pub fn input_mappings(&self) -> &super::InputMappings {
+        &self.input_maps
+    }
+
     /// Refresh shared numbered `marks` after loading or saving the editor's portable history.
     pub fn set_numbered_marks(
         &mut self,
@@ -147,6 +169,12 @@ impl Register {
 
     /// Read `name`, defaulting to the unnamed register.
     pub(super) fn read(&self, name: Option<char>) -> Contents {
+        if let Some(slot) = self
+            .redirected
+            .get(&name.unwrap_or('"').to_ascii_lowercase())
+        {
+            return slot.lock().unwrap().clone();
+        }
         if name == Some('=') {
             return self.expression_contents.clone().unwrap_or_default();
         }
@@ -202,8 +230,9 @@ impl Register {
             let target = name.to_ascii_lowercase();
             self.macros.remove(&target);
             if name.is_ascii_uppercase()
-                && let Some(old) = self.named.get_mut(&target)
+                && (self.named.contains_key(&target) || self.redirected.contains_key(&target))
             {
+                let mut old = self.read(Some(target));
                 if value.kind == Kind::Line && !old.text.ends_with('\n') {
                     old.text.push('\n');
                 }
@@ -216,21 +245,42 @@ impl Register {
                 } else {
                     old.kind = value.kind;
                 }
-                value = old.clone();
-            } else {
-                self.named.insert(target, value.clone());
+                value = old;
             }
+            self.store_named(target, value.clone());
         } else if yank {
-            self.named.insert('0', value.clone());
+            self.store_named('0', value.clone());
         } else if value.kind == Kind::Line || value.text.contains('\n') {
             for n in ('1'..='8').rev() {
-                if let Some(previous) = self.named.remove(&n) {
-                    self.named.insert(char::from(n as u8 + 1), previous);
+                let previous = if let Some(slot) = self.redirected.get(&n) {
+                    Some(std::mem::take(&mut *slot.lock().unwrap()))
+                } else {
+                    self.named.remove(&n)
+                };
+                if let Some(previous) = previous {
+                    self.store_named(char::from(n as u8 + 1), previous);
                 }
             }
-            self.named.insert('1', value.clone());
+            self.store_named('1', value.clone());
         } else {
-            self.named.insert('-', value.clone());
+            self.store_named('-', value.clone());
+        }
+        self.store_unnamed(value);
+    }
+
+    /// Store in a named slot, keeping an active capture attached.
+    fn store_named(&mut self, name: char, value: Contents) {
+        if let Some(slot) = self.redirected.get(&name) {
+            *slot.lock().unwrap() = value;
+        } else {
+            self.named.insert(name, value);
+        }
+    }
+
+    /// Track both the latest ordinary transfer and the unnamed capture slot.
+    fn store_unnamed(&mut self, value: Contents) {
+        if let Some(slot) = self.redirected.get(&'"') {
+            *slot.lock().unwrap() = value.clone();
         }
         self.text = value.text;
         self.linewise = value.kind == Kind::Line;
@@ -240,10 +290,41 @@ impl Register {
         };
     }
 
+    /// Start a live capture without changing yank or delete history.
+    pub(super) fn redirect_to_register(&mut self, name: char, append: bool) -> RedirectedRegister {
+        let name = name.to_ascii_lowercase();
+        let contents = if append {
+            self.read(Some(name))
+        } else {
+            Contents::default()
+        };
+        self.macros.remove(&name);
+        self.named.remove(&name);
+        let slot = Arc::new(Mutex::new(contents));
+        self.redirected.insert(name, slot.clone());
+        slot
+    }
+
     /// Iterate words from the unnamed and explicitly named text registers for completion.
-    pub(super) fn completion_texts(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.text.as_str())
-            .chain(self.named.values().map(|value| value.text.as_str()))
+    pub(super) fn completion_texts(&self) -> impl Iterator<Item = Cow<'_, str>> {
+        let unnamed = self
+            .redirected
+            .get(&'"')
+            .map_or(Cow::Borrowed(self.text.as_str()), |slot| {
+                Cow::Owned(slot.lock().unwrap().text.clone())
+            });
+        std::iter::once(unnamed)
+            .chain(
+                self.named
+                    .values()
+                    .map(|value| Cow::Borrowed(value.text.as_str())),
+            )
+            .chain(
+                self.redirected
+                    .iter()
+                    .filter(|(name, _)| **name != '"')
+                    .map(|(_, slot)| Cow::Owned(slot.lock().unwrap().text.clone())),
+            )
     }
 
     /// Commit the recording to its register. Uppercase names append.
@@ -259,18 +340,14 @@ impl Register {
         }
         self.last_recorded = Some(target);
         let text = keys.iter().map(Stroke::register_text).collect();
+        let value = Contents {
+            text,
+            kind: Kind::Character,
+        };
         if target == '"' {
-            self.text = text;
-            self.linewise = false;
-            self.block = None;
+            self.store_unnamed(value);
         } else {
-            self.named.insert(
-                target,
-                Contents {
-                    text,
-                    kind: Kind::Character,
-                },
-            );
+            self.store_named(target, value);
         }
         self.macros.insert(target, keys);
     }

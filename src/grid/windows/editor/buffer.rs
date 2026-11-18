@@ -9,7 +9,7 @@ use nanobug::{
     animation::scroll::GridScroll,
     document::Document,
     plugins::session::{DocumentDiagnostics, DocumentPresentation},
-    vim::Vim,
+    vim::{ExMessageOutput, ExMessageSpan, HighlightStyle, Vim},
 };
 use nanobug_plugin_sdk::{
     Diagnostic,
@@ -140,6 +140,8 @@ pub(in crate::grid) struct Buffer {
     retained_highlights: Option<(u64, Vec<Highlight>)>,
     /// Native Markdown syntax cached independently of optional language providers.
     markdown_highlights: MarkdownHighlights,
+    /// Styles captured with the text of an immutable Ex message listing.
+    message_spans: Vec<ExMessageSpan>,
     /// Latest diagnostic sets received for this buffer from live language providers.
     diagnostics: Vec<Arc<DocumentDiagnostics>>,
     /// SQL dialect override retained only for this open buffer.
@@ -147,6 +149,17 @@ pub(in crate::grid) struct Buffer {
 }
 
 impl Buffer {
+    /// Create an immutable view of an Ex listing, keeping captured message colors.
+    pub(super) fn message_output(output: ExMessageOutput) -> Self {
+        let mut buffer = Self::with_vim(Vim::read_only(Document::new(&output.text)));
+        buffer.message_spans = output.spans;
+        buffer
+    }
+
+    /// Read the retained presentation at this byte in a message listing.
+    pub(super) fn message_highlight(&self, offset: usize) -> Option<HighlightStyle> {
+        ExMessageOutput::style_at(&self.message_spans, offset)
+    }
     /// Create a listed placeholder for a file that has not been loaded yet.
     pub(in crate::grid) fn unloaded(doc: Document) -> Self {
         Self::new(doc)
@@ -233,6 +246,7 @@ impl Buffer {
             presentation: None,
             retained_highlights: None,
             markdown_highlights: MarkdownHighlights::default(),
+            message_spans: Vec::new(),
             diagnostics: Vec::new(),
             sql_dialect: None,
         }

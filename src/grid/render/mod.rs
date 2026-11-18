@@ -30,7 +30,10 @@ use crate::ui::{
     },
 };
 use gpui::{Bounds, Pixels, Point, point, px, size};
-use nanobug::i18n;
+use nanobug::{
+    i18n,
+    vim::{HighlightAttributes, HighlightStyle},
+};
 use outline::{EdgeGaps, Outline};
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
@@ -122,21 +125,87 @@ pub(in crate::grid) fn key_hint_slots<const N: usize>(
 struct Cell {
     /// Grapheme text, with tabs expanded only for display.
     text: String,
-    /// RGB foreground.
-    fg: u32,
-    /// Optional RGBA selection or current-line tint; zero means transparent.
-    bg: u32,
-    /// Draw this grapheme and its shadow at half opacity.
-    dimmed: bool,
+    paint: CellPaint,
 }
 
 impl Default for Cell {
     fn default() -> Self {
         Self {
             text: " ".into(),
-            fg: TEXT,
-            bg: 0,
-            dimmed: false,
+            paint: CellPaint::new(TEXT, 0, false),
+        }
+    }
+}
+
+/// Text, background and decorations assigned to one measured grapheme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::grid) struct CellPaint {
+    /// RGB foreground, which may be a retained palette role.
+    pub foreground: u32,
+    /// RGBA background or retained palette role. Zero leaves the underlying theme visible.
+    pub background: u32,
+    /// Draw the grapheme at half opacity when presenting folded text.
+    dimmed: bool,
+    /// Optional explicit ink for decorations.
+    special: Option<u32>,
+    /// Preserve grid advances while applying text effects at draw time.
+    attributes: HighlightAttributes,
+}
+
+impl CellPaint {
+    /// Construct an ordinary grapheme using an existing palette foreground and tint.
+    pub fn new(foreground: u32, background: u32, dimmed: bool) -> Self {
+        Self {
+            foreground,
+            background,
+            dimmed,
+            special: None,
+            attributes: HighlightAttributes::default(),
+        }
+    }
+
+    /// Override explicitly supplied fields in the current grapheme style.
+    pub fn with_highlight(mut self, style: HighlightStyle) -> Self {
+        if style.attributes.nocombine {
+            self.attributes = HighlightAttributes::default();
+            self.special = None;
+        }
+        self.foreground = style.foreground.unwrap_or(self.foreground);
+        self.background = style.background.map_or(self.background, |rgb| {
+            let alpha = u32::from(100 - style.blend.unwrap_or_default().min(100)) * 255 / 100;
+            (rgb << 8) | alpha
+        });
+        self.special = style.special.or(self.special);
+        let previous = self.attributes;
+        let next = style.attributes;
+        self.attributes = HighlightAttributes {
+            bold: previous.bold || next.bold,
+            italic: previous.italic || next.italic,
+            reverse: previous.reverse || next.reverse,
+            standout: previous.standout || next.standout,
+            underline: previous.underline || next.underline,
+            undercurl: previous.undercurl || next.undercurl,
+            underdouble: previous.underdouble || next.underdouble,
+            underdotted: previous.underdotted || next.underdotted,
+            underdashed: previous.underdashed || next.underdashed,
+            strikethrough: previous.strikethrough || next.strikethrough,
+            overline: previous.overline || next.overline,
+            dim: previous.dim || next.dim,
+            conceal: previous.conceal || next.conceal,
+            nocombine: false,
+        };
+        self
+    }
+
+    /// Resolve foreground and background together so reversal also works for palette roles.
+    fn colors(self, theme: Style) -> (u32, u32) {
+        let fg = theme.foreground(self.foreground);
+        let bg = theme.tint(self.background);
+        if self.attributes.reverse || self.attributes.standout {
+            let background = if bg == 0 { theme.background() } else { bg };
+            (background >> 8, (fg << 8) | 0xff)
+        } else {
+            (fg, bg)
         }
     }
 }
@@ -174,7 +243,7 @@ impl FrameRow {
 
     /// Place `cell` at the next logical `column`, relative to `left`, with foreground and tint.
     /// Return the first unused logical column.
-    fn place(&mut self, column: usize, cell: TextCell<'_>, left: usize, fg: u32, bg: u32) -> usize {
+    fn place(&mut self, column: usize, cell: TextCell<'_>, left: usize, paint: CellPaint) -> usize {
         let x = cell.start as isize - left as isize;
         if self.positions.is_empty() {
             self.positions.push(x);
@@ -189,10 +258,7 @@ impl FrameRow {
             self.cells.resize_with(next, Cell::default);
         }
         let cells = &mut self.cells[column..next];
-        write_grapheme(cells, cell.text, fg);
-        for cell in cells {
-            cell.bg = bg;
-        }
+        write_grapheme(cells, cell.text, |_| paint);
         next
     }
 
@@ -242,13 +308,27 @@ impl Label {
         spacing: &TextSpacing,
         style: LabelStyle,
     ) -> Option<Self> {
+        Self::with_paint(text, width, spacing, style, |_| {
+            CellPaint::new(color, 0, false)
+        })
+    }
+
+    /// Preserve fitted grapheme offsets when different bytes carry different Ex styles.
+    fn with_paint(
+        text: &str,
+        width: usize,
+        spacing: &TextSpacing,
+        style: LabelStyle,
+        mut paint: impl FnMut(usize) -> CellPaint,
+    ) -> Option<Self> {
         let mut row = FrameRow {
             cells: Vec::new(),
             positions: Vec::new(),
         };
         let mut column = 0;
         for cell in spacing.fitting_cells(text, width) {
-            column = row.place(column, cell, 0, color, 0);
+            let appearance = paint(cell.byte);
+            column = row.place(column, cell, 0, appearance);
         }
         row.omit_grid_positions();
         (column > 0).then_some(Self {
@@ -264,14 +344,13 @@ impl Label {
     }
 }
 
-/// Store one `grapheme` in its `cells` with foreground `color`, expanding tabs to blanks.
-fn write_grapheme(cells: &mut [Cell], grapheme: &str, color: u32) {
+/// Store one `grapheme` with its `paint` in `cells`, expanding tabs to blanks.
+fn write_grapheme(cells: &mut [Cell], grapheme: &str, mut paint: impl FnMut(&Cell) -> CellPaint) {
     let mut text = if grapheme == "\t" { " " } else { grapheme };
     for cell in cells {
+        cell.paint = paint(cell);
         cell.text.clear();
         cell.text.push_str(text);
-        cell.fg = color;
-        cell.dimmed = false;
         text = if grapheme == "\t" { " " } else { "" };
     }
 }
@@ -501,6 +580,19 @@ impl Frame {
     /// Write fixed-grid `text` at cell `(x, y)` in `fg`, clipped to `limit` cells.
     /// Return the first column after the written text.
     pub fn text(&mut self, x: usize, y: usize, text: &str, fg: u32, limit: usize) -> usize {
+        self.highlighted_text(x, y, text, fg, limit, None)
+    }
+
+    /// Write fixed-grid text with an optional highlight `style`, preserving existing cell tints.
+    pub(in crate::grid) fn highlighted_text(
+        &mut self,
+        x: usize,
+        y: usize,
+        text: &str,
+        fg: u32,
+        limit: usize,
+        style: Option<HighlightStyle>,
+    ) -> usize {
         let Some(row) = self.rows.get_mut(y).map(|row| &mut row.cells) else {
             return x;
         };
@@ -515,7 +607,10 @@ impl Frame {
             if column + width > end {
                 break;
             }
-            write_grapheme(&mut row[column..column + width], ch, fg);
+            write_grapheme(&mut row[column..column + width], ch, |cell| {
+                let paint = CellPaint::new(fg, cell.paint.background, false);
+                style.map_or(paint, |style| paint.with_highlight(style))
+            });
             column += width;
         }
         column
@@ -545,11 +640,42 @@ impl Frame {
         spacing: &TextSpacing,
         style: LabelStyle,
     ) -> usize {
+        self.place_label(y, slot, text, spacing, style, |_| {
+            CellPaint::new(color, 0, false)
+        })
+    }
+
+    /// Retain one measured label with Ex styles at source byte offsets.
+    pub(in crate::grid) fn highlighted_label(
+        &mut self,
+        y: usize,
+        slot: Range<usize>,
+        text: &str,
+        color: u32,
+        spacing: &TextSpacing,
+        style_at: impl Fn(usize) -> Option<HighlightStyle>,
+    ) -> usize {
+        let base = CellPaint::new(color, 0, false);
+        self.place_label(y, slot, text, spacing, LabelStyle::Text, |byte| {
+            style_at(byte).map_or(base, |style| base.with_highlight(style))
+        })
+    }
+
+    /// Compose and anchor a fitted label without losing its internal glyph spacing.
+    fn place_label(
+        &mut self,
+        y: usize,
+        slot: Range<usize>,
+        text: &str,
+        spacing: &TextSpacing,
+        style: LabelStyle,
+        paint: impl FnMut(usize) -> CellPaint,
+    ) -> usize {
         let Some(row) = self.rows.get(y) else {
             return slot.start;
         };
         let width = slot.end.min(row.cells.len()).saturating_sub(slot.start) * UNITS_PER_COLUMN;
-        let Some(mut label) = Label::new(text, color, width, spacing, style) else {
+        let Some(mut label) = Label::with_paint(text, width, spacing, style, paint) else {
             return slot.start;
         };
         label.x = slot.start * UNITS_PER_COLUMN;
@@ -592,6 +718,21 @@ impl Frame {
         tint: u32,
         mut style: impl FnMut(usize) -> (u32, u32, bool),
     ) {
+        self.styled_viewport_line(y, cells, viewport, tint, |byte| {
+            let (fg, bg, dimmed) = style(byte);
+            CellPaint::new(fg, bg, dimmed)
+        });
+    }
+
+    /// Retain the full painting of measured graphemes intersecting the viewport.
+    pub(in crate::grid) fn styled_viewport_line<'a>(
+        &mut self,
+        y: usize,
+        cells: impl Iterator<Item = TextCell<'a>>,
+        viewport: Range<usize>,
+        tint: u32,
+        mut style: impl FnMut(usize) -> CellPaint,
+    ) {
         let row = &mut self.rows[y];
         let left = viewport.start * UNITS_PER_COLUMN;
         let right = viewport.end * UNITS_PER_COLUMN;
@@ -600,10 +741,8 @@ impl Frame {
             .skip_while(|cell| cell.end <= left)
             .take_while(|cell| cell.start < right)
         {
-            let (fg, bg, dimmed) = style(cell.byte);
-            let start = column;
-            column = row.place(column, cell, left, fg, bg);
-            row.cells[start].dimmed = dimmed;
+            let appearance = style(cell.byte);
+            column = row.place(column, cell, left, appearance);
         }
         let remaining = ((right - left) as isize - row.x(column)).max(0) as usize;
         let needed = column + remaining.div_ceil(UNITS_PER_COLUMN);
@@ -611,7 +750,7 @@ impl Frame {
             row.cells.resize_with(needed, Cell::default);
         }
         for blank in &mut row.cells[column..] {
-            blank.bg = tint;
+            blank.paint.background = tint;
         }
         row.omit_grid_positions();
     }
@@ -620,9 +759,15 @@ impl Frame {
         if let Some(row) = self.rows.get_mut(y).map(|row| &mut row.cells) {
             let end = end.min(row.len());
             for cell in &mut row[start.min(end)..end] {
-                cell.bg = color;
+                cell.paint.background = color;
             }
         }
+    }
+
+    /// Inspect retained display style in grid-level rendering tests.
+    #[cfg(test)]
+    pub(in crate::grid) fn cell_paint_at(&self, row: usize, column: usize) -> CellPaint {
+        self.rows[row].cells[column].paint
     }
 
     /// Inset the frame's row tints by `padding` on both vertical edges without moving its text.
@@ -984,7 +1129,7 @@ mod message_tests {
             assert!(frame.rows.iter().all(|row| {
                 row.cells
                     .iter()
-                    .all(|cell| cell.text == " " && cell.bg == 0)
+                    .all(|cell| cell.text == " " && cell.paint.background == 0)
             }));
             let (icon, title) = level.heading().unwrap();
             assert_eq!(frame.icons.len(), 1);
@@ -1005,13 +1150,19 @@ mod message_tests {
                     .collect::<String>(),
                 title
             );
-            assert!(heading_label.text.cells.iter().all(|cell| cell.fg == text));
+            assert!(
+                heading_label
+                    .text
+                    .cells
+                    .iter()
+                    .all(|cell| cell.paint.foreground == text)
+            );
             assert!(
                 frame.labels[1][0]
                     .text
                     .cells
                     .iter()
-                    .all(|cell| cell.fg == text)
+                    .all(|cell| cell.paint.foreground == text)
             );
         }
     }

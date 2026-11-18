@@ -1,30 +1,37 @@
 //! Derive the editor header, line numbers and text from the active Tabpage.
 
-use super::{EditorWindow, TEXT_OVERSCAN};
+use super::{
+    EditorWindow, TEXT_OVERSCAN,
+    signs::{EditorGutter, RowSigns},
+};
 use crate::{
     grid::{
-        render::{Frame, Rect},
+        render::{CellPaint, Frame, Rect},
         windows::WindowFrame,
     },
     ui::{
         icons::Icon,
-        theme::{CURRENT, GOLD, MUTED, PREEDIT, TEXT, ThemeComponent, WARNING_TEXT},
+        theme::{
+            CURRENT, GOLD, MUTED, PREEDIT, TEXT, ThemeComponent, WARNING_TEXT, syntax_color,
+            syntax_highlight_groups,
+        },
     },
 };
-use nanobug_plugin_sdk::language::Highlight;
+use nanobug::vim::InputMappings;
+use nanobug_plugin_sdk::language::{Highlight, SyntaxKind};
 
 /// Empty source columns between the rendered text and the Markdown split divider.
 const MARKDOWN_SOURCE_RIGHT_PADDING: usize = 1;
 /// Reserve two digits before expanding the gutter for longer documents.
 const MIN_LINE_NUMBER_COLUMNS: usize = 2;
 
-/// Resolve the foreground role at document byte `offset` from sorted `highlights`.
-fn syntax_foreground(highlights: &[Highlight], offset: usize) -> Option<u32> {
+/// Find the syntax role at document byte `offset` from sorted `highlights`.
+fn syntax_kind(highlights: &[Highlight], offset: usize) -> Option<SyntaxKind> {
     let index = highlights.partition_point(|span| span.range.end <= offset);
     highlights
         .get(index)
         .filter(|span| span.range.start <= offset)
-        .map(|span| crate::ui::theme::syntax_color(span.kind))
+        .map(|span| span.kind)
 }
 
 /// Right-facing fold marker with a tight crop at the arrow tip.
@@ -66,17 +73,7 @@ impl EditorWindow {
         if self.terminal().is_some() {
             return body;
         }
-        let options = self.window_options();
-        let number_width = if options.number || options.relativenumber {
-            self.vim()
-                .line_count()
-                .to_string()
-                .len()
-                .max(MIN_LINE_NUMBER_COLUMNS)
-        } else {
-            1 // Retain the fold and diagnostic gutter without reserving digits.
-        };
-        let gutter = (number_width + 2).min(body.w);
+        let gutter = self.gutter(body.w).width;
         let width = body.w - gutter;
         let padding = if self.markdown_view_mode() == Some(super::MarkdownViewMode::Split) {
             MARKDOWN_SOURCE_RIGHT_PADDING.min(width.saturating_sub(1))
@@ -91,6 +88,21 @@ impl EditorWindow {
         }
     }
 
+    /// Resolve the current buffer's line-number and sign columns inside the source viewport.
+    fn gutter(&self, available: usize) -> EditorGutter {
+        let options = self.window_options();
+        let number_width = if options.number || options.relativenumber {
+            self.vim()
+                .line_count()
+                .to_string()
+                .len()
+                .max(MIN_LINE_NUMBER_COLUMNS)
+        } else {
+            1 // Retain the fold and diagnostic gutter without reserving digits.
+        };
+        EditorGutter::new(number_width, available, self.vim().doc.has_signs())
+    }
+
     /// Index of the clickable fold marker within a `gutter`-cell row, leaving one cell before the text.
     pub(super) fn fold_arrow_column(gutter: usize) -> Option<usize> {
         gutter.checked_sub(2).filter(|&column| column > 0)
@@ -101,6 +113,7 @@ impl EditorWindow {
         &self,
         context: WindowFrame<'_>,
         visible_cols: usize,
+        mappings: &InputMappings,
     ) -> EditorFrames {
         let mut edit = Frame::new(context.area.w, context.area.h);
         edit.set_theme_component(ThemeComponent::Editor);
@@ -119,7 +132,7 @@ impl EditorWindow {
                 edit.vertical_rule(divider, row, MUTED);
             }
         }
-        let (numbers, text) = self.content_frames(context, |_| None);
+        let (numbers, text) = self.content_frames_with_mappings(context, |_| None, mappings);
         EditorFrames {
             chrome: edit,
             numbers,
@@ -134,6 +147,16 @@ impl EditorWindow {
         &self,
         context: WindowFrame<'_>,
         color_at: impl Fn(usize) -> Option<u32>,
+    ) -> (Frame, Frame) {
+        self.content_frames_with_mappings(context, color_at, self.register.input_mappings())
+    }
+
+    /// Resolve shared Ex styles while keeping each rendering pane's own match slots.
+    fn content_frames_with_mappings(
+        &self,
+        context: WindowFrame<'_>,
+        color_at: impl Fn(usize) -> Option<u32>,
+        mappings: &InputMappings,
     ) -> (Frame, Frame) {
         let buffer = &self.buffers[self.active];
         if let Some(terminal) = &buffer.terminal {
@@ -158,8 +181,8 @@ impl EditorWindow {
         let substitution = vim.substitution_match();
         let body = self.text_area(context.area);
         let source = self.source_body(context.area);
-        let gutter = body.x - source.x;
-        let number_width = gutter.saturating_sub(2);
+        let gutter = self.gutter(source.w);
+        let number_width = gutter.number.len();
         let divider_padding = source.x + source.w - (body.x + body.w);
         if body.h == 0 {
             return (Frame::new(0, 0), Frame::new(0, 0));
@@ -172,7 +195,7 @@ impl EditorWindow {
             caret_logical_row
         };
         let first = buffer.scroll.first_cell();
-        let mut numbers = Frame::viewport(gutter, body.h + 1, first);
+        let mut numbers = Frame::viewport(gutter.width, body.h + 1, first);
         numbers.set_theme_component(ThemeComponent::Gutter);
         let (left, left_padding) = if rows.is_wrapped() {
             (0, 0)
@@ -189,43 +212,147 @@ impl EditorWindow {
         text.keep_whole_graphemes(body.x..body.x + body.w);
         let highlights = buffer.highlights();
         let markdown = buffer.markdown_highlights();
-        let foreground = |offset| {
-            syntax_foreground(highlights, offset)
-                .or_else(|| color_at(offset))
-                .or_else(|| {
+        let base = CellPaint::new(TEXT, 0, false);
+        let normal = (!active)
+            .then(|| mappings.highlight_override("NormalNC"))
+            .flatten()
+            .or_else(|| mappings.highlight_override("Normal"))
+            .map_or(base, |style| base.with_highlight(style));
+        let search = mappings.highlight_override("Search");
+        let visual = mappings.highlight_override("Visual");
+        let syntax = [
+            SyntaxKind::Keyword,
+            SyntaxKind::Type,
+            SyntaxKind::Function,
+            SyntaxKind::String,
+            SyntaxKind::Constant,
+            SyntaxKind::Comment,
+            SyntaxKind::Attribute,
+        ]
+        .map(|kind| {
+            syntax_highlight_groups(kind)
+                .iter()
+                .find_map(|group| mappings.highlight_override(group))
+        });
+        let source_styles = |offset, tint| {
+            let mut paint = normal;
+            if tint != 0 {
+                paint.background = tint;
+            }
+            let (kind, fallback) = if let Some(kind) = syntax_kind(highlights, offset) {
+                (Some(kind), None)
+            } else if let Some(color) = color_at(offset) {
+                (None, Some(color))
+            } else {
+                (
                     markdown
                         .as_deref()
-                        .and_then(|spans| syntax_foreground(spans, offset))
-                })
-                .unwrap_or(TEXT)
+                        .and_then(|spans| syntax_kind(spans, offset)),
+                    None,
+                )
+            };
+            if let Some(kind) = kind {
+                if let Some(style) = syntax[kind as usize] {
+                    paint = paint.with_highlight(style);
+                } else {
+                    paint.foreground = syntax_color(kind);
+                }
+            } else if let Some(color) = fallback {
+                paint.foreground = color;
+            }
+            if let Some(style) = buffer.message_highlight(offset) {
+                paint = paint.with_highlight(style);
+            }
+            paint
+        };
+        let doc = &vim.doc;
+        let signs = doc.signs();
+        let sign_column = gutter
+            .diagnostic
+            .and_then(|_| mappings.highlight_override("SignColumn"));
+        let cursor_sign_column = gutter.diagnostic.and_then(|_| {
+            mappings
+                .highlight_override("CursorLineSign")
+                .or(sign_column)
+                .or_else(|| mappings.highlight_style("CursorLineSign"))
+        });
+        let visible_start = rows
+            .row(first)
+            .map_or(0, |row| doc.starts[row.line.saturating_sub(1)]);
+        let visible_end = rows
+            .row((first + body.h).min(rows.len().saturating_sub(1)))
+            .map_or(doc.text.len(), |row| {
+                let end = doc.folded_end_row(row.line).unwrap_or(row.line);
+                doc.starts.get(end + 2).copied().unwrap_or(doc.text.len())
+            });
+        let slot_matches = super::ex_matches::visible_matches(
+            self.register.ex_matches(),
+            mappings,
+            &doc.text,
+            visible_start..visible_end,
+        );
+        let ex_style = |offset| {
+            slot_matches
+                .iter()
+                .flatten()
+                .find_map(|rule| rule.at(offset))
         };
         let mut painted_line = None;
         for visible in 0..=body.h {
             let display_row = first + visible;
             let Some(visual_row) = rows.row(display_row).filter(|row| row.line <= last_line) else {
+                gutter.paint_sign(&mut numbers, visible, None, sign_column);
                 numbers.text(
-                    number_width.saturating_sub(1),
+                    gutter.number.end.saturating_sub(1),
                     visible,
                     "~",
                     MUTED,
                     number_width.min(1),
                 );
+                if normal.background != 0 {
+                    text.tint(visible, 0, width, normal.background);
+                }
                 continue;
             };
             let line = visual_row.line;
             let current = display_row == caret_display_row && active;
             if current {
-                numbers.tint(visible, 0, gutter, CURRENT);
+                numbers.tint(visible, 0, gutter.width, CURRENT);
                 if divider_padding > 0 {
                     // The left outline is centered in its border cell. Match its half-column gap.
                     text.extend_row_tint(visible, CURRENT);
                 }
             }
-            if visual_row
+            // Several adjacent visual rows can share one composed or folded line.
+            if painted_line
+                .as_ref()
+                .is_none_or(|(previous, _, _, _, _)| *previous != line)
+            {
+                painted_line = Some((
+                    line,
+                    buffer.painted_line(line, composition),
+                    vim.selection_on_line(line),
+                    vim.search_highlights(vim.doc.line_range(line)),
+                    RowSigns::new(&signs, line, line == caret_line && active, mappings),
+                ));
+            }
+            let (_, painted, selection, matches, signs_on_line) = painted_line.as_ref().unwrap();
+            let first_segment = visual_row
                 .segment
                 .as_ref()
-                .is_none_or(|segment| segment.bytes.start == 0)
-            {
+                .is_none_or(|segment| segment.bytes.start == 0);
+            let column_style = if line == caret_line && active {
+                cursor_sign_column
+            } else {
+                sign_column
+            };
+            gutter.paint_sign(
+                &mut numbers,
+                visible,
+                first_segment.then_some(signs_on_line),
+                column_style,
+            );
+            if first_segment {
                 let distance = vim.doc.display_row(line).abs_diff(caret_logical_row);
                 if options.number || options.relativenumber {
                     let number = if options.relativenumber && (!options.number || distance != 0) {
@@ -238,41 +365,32 @@ impl EditorWindow {
                     } else {
                         MUTED
                     };
-                    numbers.text(
-                        0,
+                    numbers.highlighted_text(
+                        gutter.number.start,
                         visible,
                         &format!("{number:>number_width$}"),
                         number_color,
                         number_width,
+                        signs_on_line.number,
                     );
                 }
-                if let Some(column) = Self::fold_arrow_column(gutter) {
+                if let Some(column) = Self::fold_arrow_column(gutter.width) {
                     let diagnostic = buffer.diagnostic_on_line(line);
+                    if diagnostic && let Some(diagnostic_column) = gutter.diagnostic {
+                        numbers.text(diagnostic_column, visible, "!", WARNING_TEXT, 1);
+                    }
                     if vim.doc.folded_at(line) {
-                        let icon = if diagnostic {
+                        let icon = if diagnostic && gutter.diagnostic.is_none() {
                             DIAGNOSTIC_FOLD_ARROW
                         } else {
                             FOLD_ARROW
                         };
                         numbers.right_aligned_icon(column, visible, icon, 56);
-                    } else if diagnostic {
+                    } else if diagnostic && gutter.diagnostic.is_none() {
                         numbers.text(column, visible, "!", WARNING_TEXT, 1);
                     }
                 }
             }
-            // Several adjacent visual rows can share one composed or folded line.
-            if painted_line
-                .as_ref()
-                .is_none_or(|(previous, _, _, _)| *previous != line)
-            {
-                painted_line = Some((
-                    line,
-                    buffer.painted_line(line, composition),
-                    vim.selection_on_line(line),
-                    vim.search_highlights(vim.doc.line_range(line)),
-                ));
-            }
-            let (_, painted, selection, matches) = painted_line.as_ref().unwrap();
             let (fragment, byte_start, tab_column) =
                 visual_row
                     .segment
@@ -280,8 +398,18 @@ impl EditorWindow {
                         let byte_start = segment.bytes.start;
                         (&painted.text[segment.bytes], byte_start, segment.tab_column)
                     });
-            let tint = if current { CURRENT } else { 0 };
-            text.viewport_line(
+            let tint = if current { CURRENT } else { normal.background };
+            let tint = signs_on_line.line.map_or(tint, |style| {
+                CellPaint::new(TEXT, tint, false)
+                    .with_highlight(style)
+                    .background
+            });
+            let decorate = |paint: CellPaint| {
+                signs_on_line
+                    .line
+                    .map_or(paint, |style| paint.with_highlight(style))
+            };
+            text.styled_viewport_line(
                 visible,
                 context
                     .spacing
@@ -295,13 +423,11 @@ impl EditorWindow {
                         .filter(|suffix| byte >= suffix.start_byte)
                     {
                         return if byte < suffix.closing_byte {
-                            (0xffffff, tint, true)
+                            CellPaint::new(0xffffff, tint, true)
                         } else {
-                            (
-                                foreground(suffix.closing_offset + byte - suffix.closing_byte),
-                                tint,
-                                false,
-                            )
+                            let offset = suffix.closing_offset + byte - suffix.closing_byte;
+                            let paint = decorate(source_styles(offset, tint));
+                            ex_style(offset).map_or(paint, |style| paint.with_highlight(style))
                         };
                     }
                     if painted
@@ -309,7 +435,7 @@ impl EditorWindow {
                         .as_ref()
                         .is_some_and(|range| range.contains(&byte))
                     {
-                        (GOLD, PREEDIT, false)
+                        CellPaint::new(GOLD, PREEDIT, false)
                     } else {
                         let byte = byte
                             - painted
@@ -318,19 +444,33 @@ impl EditorWindow {
                                 .filter(|range| byte >= range.end)
                                 .map_or(0, |range| range.len());
                         let offset = vim.doc.starts[line] + byte;
+                        let paint = decorate(source_styles(offset, tint));
+                        let matched = ex_style(offset);
                         if selection
                             .as_ref()
                             .or(substitution.as_ref())
                             .is_some_and(|range| range.contains(&offset))
                         {
-                            (foreground(offset), selection_tint, false)
+                            let mut paint =
+                                matched.map_or(paint, |style| paint.with_highlight(style));
+                            if let Some(style) = visual {
+                                paint.with_highlight(style)
+                            } else {
+                                paint.background = selection_tint;
+                                paint
+                            }
+                        } else if let Some(style) = matched {
+                            paint.with_highlight(style)
                         } else if matches
                             .get(matches.partition_point(|hit| hit.end <= offset))
                             .is_some_and(|hit| hit.contains(&offset))
                         {
-                            (GOLD, selection_tint, false)
+                            search.map_or_else(
+                                || CellPaint::new(GOLD, selection_tint, false),
+                                |style| paint.with_highlight(style),
+                            )
                         } else {
-                            (foreground(offset), tint, false)
+                            paint
                         }
                     }
                 },

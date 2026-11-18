@@ -43,6 +43,7 @@ Copy-Item plugins/sdk/examples/nanobug-plugin.toml,plugins/sdk/examples/detect.j
 - SQL 方言规则可读取 `host.context.projectSqlDialect` 中显式保存的项目方言 ID。自动模式下该属性缺省，缓冲区覆盖仅用于当前 SQL 文件的路由。
 - 多个模块可以把 `rule` 指向同一个 JS 文件。该文件用扁平的 `export default { document: async host => …, complete: async host => … }` 导出规则，键与清单的 `[[modules]].id` 一一对应。宿主每次只调用当前模块的函数，同步和异步函数均可使用。原有直接写 `return` 的异步函数体也继续支持。
 - `host.documentExtension()` 返回不含点号且 ASCII 字母转为小写的当前文档扩展名，无扩展名时返回 `null`。该查询只追踪扩展名变化，所以改名或切换到同类型文件时可继续沿用原判断。
+- 声明 `document_filetypes = ["python"]` 的模块可以用 `host.documentFiletype()` 读取当前缓冲区显式指定的文件类型，未指定时得到 `null`。规则随显式类型变更重新评估。类型匹配且具备 `read_document` 权限时，WASM 回调通过 `Input.document_filetype` 得到该值。模块仍可用 `document_extensions` 处理自动匹配，并使用 `DocumentSnapshot.path` 处理真实路径。
 - 可以通过 `host.exists`、`host.readFile`、`host.readBytes`、`host.scanText`、`host.readDocument`、`host.list` 查询已授权数据。分段读取返回下一位置及是否结束。`readFile` 和 `scanText` 使用 UTF-8，二进制文件可分段用 `readBytes`。文件接口读取磁盘内容，文档接口读取宿主正文。
 - 激活规则需要读取项目外文件时，在清单顶层声明 `permissions = ["read_rule_paths"]` 和 `rule_paths`。例如 Windows 本地包可以填写 `rule_paths = ['C:\LocalFixture\status.txt']`。最多列出四个准确的绝对文件路径。JS 调用时传入与清单相同的路径字符串，可查询存在、读取文本或字节、扫描文本。目录列出、正文、写入和业务 WASM 均使用各自的权限。编辑器先显示清单中的路径，用户确认后才访问这些路径并在本机保存授权。文件更新、创建和删除会触发重算。父目录被替换后，可重新安装当前版本并确认路径来恢复授权。规则文件查询拒绝路径中的 `..`、符号链接和 Windows 目录联接，并支持获准的网络共享文件。主动联网接口由业务模块的权限控制。
 - 文档位置使用 UTF-8 字节偏移。每次打开和每次正文修改都有独立的标识。编辑结果需要使用同一次输入里的版本。宿主核对整个编辑组，再写入正文。未打开的 UTF-8 项目文件可以用 `ReadProjectText` 读取，显式命令将返回的路径和版本放入 `project_file_edits`。提议修改未打开的文件需要 `read_project` 和 `edit_document` 权限。同一预览可包含打开和未打开的文件。确认后，未打开的文件会成为未保存的缓冲区。写盘仍由用户保存。

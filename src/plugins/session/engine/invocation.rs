@@ -37,6 +37,22 @@ impl Engine {
     ) -> Option<Input> {
         let project = self.projects.get(&key.instance.project)?;
         let record = self.records.get(&key.namespace)?;
+        // A document refresh can send a delta in place of the full snapshot.
+        let filetype_document = document.or_else(|| {
+            matches!(event, PluginEvent::DocumentChanged)
+                .then(|| self.active_document(key))
+                .flatten()
+        });
+        let document_filetype = filetype_document
+            .filter(|_| record.grants.contains(&Permission::ReadDocument))
+            .and_then(|snapshot| self.document_filetype(project.id, snapshot.opening))
+            .filter(|filetype| {
+                self.lifecycle
+                    .wanted
+                    .get(key)
+                    .is_some_and(|module| module.document_filetypes.contains(*filetype))
+            })
+            .map(str::to_owned);
         let document = document.map(|snapshot| snapshot.as_ref().clone());
         let settings = self
             .config
@@ -67,6 +83,7 @@ impl Engine {
         Some(Input {
             event,
             document,
+            document_filetype,
             settings,
             draft,
             viewport: self.layouts.get(key).copied(),

@@ -19,6 +19,9 @@ impl Vim {
 
     /// Record the range of a completed text operation and expose its new special marks.
     pub(super) fn set_operated_range(&mut self, range: Range<usize>) {
+        if super::current_mark_modifiers().lock_marks {
+            return;
+        }
         self.operated = Some(range);
         self.ex_hidden_marks.remove(&'[');
         self.ex_hidden_marks.remove(&']');

@@ -6,6 +6,103 @@ use gpui::{FontId, Keystroke, NoopTextSystem};
 use nanobug::{document::Document, vim::Mode};
 use std::{fs, path::Path, sync::Arc};
 
+/// Ex styles compose with SDK-provided syntax spans and clear back to the live theme.
+#[test]
+fn ex_highlight_overlays_retained_language_plugin_spans() -> Result<(), String> {
+    use crate::{
+        grid::windows::WindowFrame,
+        ui::theme::{TEXT, syntax_color},
+    };
+    use nanobug::{
+        plugins::session::{DocumentPresentation, Key},
+        vim::Action,
+    };
+    use nanobug_plugin_sdk::{
+        Instance,
+        language::{ByteRange, DocumentFeatures, Highlight, SyntaxKind},
+    };
+
+    let doc = Document::new("let TODO other\n");
+    let version = (doc.opening, doc.revision);
+    let mut editor = EditorWindow::new(doc);
+    editor.buffers[0].set_presentation(Some((
+        Key {
+            namespace: "language".into(),
+            instance: Instance {
+                project: 1,
+                module: "document".into(),
+            },
+        },
+        Arc::new(DocumentPresentation {
+            version,
+            generation: 1,
+            features: DocumentFeatures {
+                highlights: vec![
+                    Highlight {
+                        range: ByteRange { start: 0, end: 3 },
+                        kind: SyntaxKind::Keyword,
+                    },
+                    Highlight {
+                        range: ByteRange { start: 4, end: 14 },
+                        kind: SyntaxKind::Comment,
+                    },
+                ],
+                ..Default::default()
+            },
+        }),
+    )));
+    let spacing = TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 9.);
+    let context = WindowFrame {
+        area: Rect {
+            w: 28,
+            h: 6,
+            ..Default::default()
+        },
+        selected: false,
+        modal_open: false,
+        controls_hovered: false,
+        spacing: &spacing,
+    };
+    let paint = |pane: &EditorWindow, column| {
+        pane.content_frames(context, |_| None)
+            .1
+            .cell_paint_at(0, column)
+    };
+    let ex = |pane: &mut EditorWindow, command: &str| -> Result<(), String> {
+        let edit = pane.edit(|vim, register| vim.execute_ex_line(command, register));
+        match edit.action {
+            Action::None if !pane.vim().ex_failed() => Ok(()),
+            other => Err(format!("{command}: {other:?} {}", pane.vim().message)),
+        }
+    };
+    assert_eq!(
+        paint(&editor, 4).foreground,
+        syntax_color(SyntaxKind::Comment)
+    );
+    ex(&mut editor, "hi Comment guifg=#112233 gui=italic")?;
+    assert_eq!(
+        paint(&editor, 0).foreground,
+        syntax_color(SyntaxKind::Keyword)
+    );
+    assert_eq!(paint(&editor, 4).foreground, 0x112233);
+    ex(&mut editor, "hi TodoMatch guifg=#eeaa22 guibg=#443322")?;
+    ex(&mut editor, "match TodoMatch /TODO/")?;
+    assert_eq!(paint(&editor, 4).foreground, 0xeeaa22);
+    assert_eq!(paint(&editor, 4).background, 0x443322ff);
+    assert_eq!(paint(&editor, 9).foreground, 0x112233);
+    ex(&mut editor, "match")?;
+    assert_eq!(paint(&editor, 4).foreground, 0x112233);
+    ex(&mut editor, "hi clear Comment")?;
+    assert_eq!(paint(&editor, 4).foreground, TEXT);
+    ex(&mut editor, "hi clear")?;
+    assert_eq!(
+        paint(&editor, 4).foreground,
+        syntax_color(SyntaxKind::Comment)
+    );
+    assert_eq!(editor.buffers[0].highlights().len(), 2);
+    Ok(())
+}
+
 /// Page keys can traverse a Markdown paragraph that spans more than one screen without newlines.
 #[test]
 fn markdown_pages_through_one_wrapped_source_line() {

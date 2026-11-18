@@ -25,3 +25,81 @@ the operated text.
                                                       *expression* *@=*
 Use Ctrl+R = in Insert or Command-line mode to evaluate an expression and
 insert its result. With @=, the result is used as a sequence of Normal keys.
+
+                                                      *:highlight*
+:highlight lists highlight groups, and :highlight {group} shows one group.
+Define or update a group with colors and GUI attributes. Group names are
+case-insensitive. Colors can use a common name or #RRGGBB notation.
+
+    :highlight Reminder guifg=#ffd700 gui=bold
+    :highlight Reminder guibg=DarkBlue
+    :highlight link Notice Reminder
+    :highlight default link OptionalNotice Reminder
+
+Use :highlight clear {group} to reset one group, or :highlight clear to
+reset all groups to the theme defaults. Use :highlight link {group} NONE
+to remove a link. :verbose highlight {group} includes its script origin
+when available.
+
+                                                      *:match* *:2match* *:3match*
+Use :match {group} /{pattern}/ to highlight matching text in the current
+window. The group already has to exist. The match stays active when switching
+buffers in that window. Matching is case-sensitive unless the pattern uses \c.
+You can replace the slashes with another delimiter.
+
+    :match Reminder /TODO/
+    :2match Search #FIXME#
+    :3match Search /\cwarning/
+
+The three slots coexist. If patterns overlap, the lowest slot number has
+priority. Use :match none, :2match none, or :3match none to clear the
+corresponding slot. Entering the command with no arguments also clears its slot.
+
+                                                      *:echohl*
+:echohl {group} sets the style of subsequent :echo, :echon, and :echomsg
+output. :echohl None resets the style. Redirected output stays plain text.
+
+    :echohl Reminder
+    :echomsg 'Check this file before committing'
+    :echohl None
+
+                                                      *:sign* *:sign-define*
+Use :sign define {name} to create or update a sign. Its text may use
+one or two display cells. texthl styles the sign text, linehl styles the
+whole line, numhl styles the line number, and culhl styles the sign on
+the cursor line when cursorline is enabled. Use priority= to choose the
+definition's default placement priority.
+
+    :highlight SignReminder guifg=#ffd700
+    :sign define Reminder text=!! texthl=SignReminder
+    :sign list Reminder
+
+The icon= field is stored and listed for compatibility with Neovim.
+Use text= for a visible sign in the gutter.
+
+                                                      *:sign-place* *:sign-place-list*
+Place a defined sign at a one-based line. IDs are unique in each group
+within a buffer. Reusing the same ID and group moves or updates its sign.
+Every window displaying that buffer sees the same placements.
+
+    :sign place 1 line=3 name=Reminder group=work
+    :sign place 1 name=Reminder group=work priority=20
+    :sign place group=*
+
+Use buffer= after the other arguments to target an open buffer by its
+:buffers number. A final file= takes the exact filename, including spaces.
+:sign place with no ID lists signs in the current Session. Omitting group=
+selects the global sign group. Use group=* to include all groups.
+
+                                                      *:sign-unplace* *:sign-jump*
+Use :sign unplace {id} to remove a sign from the selected group. Use *
+instead of the ID to remove every sign in that group. With no ID, remove
+one matching sign at the cursor. :sign jump {id} moves to the sign.
+
+    :sign jump 1 group=work
+    :sign unplace 1 group=work
+    :sign unplace * group=*
+
+                                                      *:sign-list* *:sign-undefine*
+:sign list shows all definitions. :sign list {name} shows a single
+definition, and :sign undefine {name} removes it.

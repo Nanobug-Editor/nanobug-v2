@@ -2,6 +2,7 @@
 
 mod file;
 
+use super::recovery::RecoveryFile;
 use std::{
     collections::BTreeMap,
     sync::Arc,
@@ -30,6 +31,8 @@ struct Entry {
     time: u64,
     /// Whether the current text of this entry was written to disk.
     saved: bool,
+    /// Original baseline of a recovered draft still present in this state.
+    recovery_file: Option<RecoveryFile>,
 }
 
 /// Older states sorted by creation order, keeping abandoned redo branches available to g+ and g-.
@@ -120,12 +123,14 @@ impl History {
         });
         current.child = Some(self.next);
         let time = now().max(current.time);
+        let recovery_file = current.recovery_file;
         self.bytes += text.len();
         self.entries.insert(
             self.next,
             Entry {
                 parent: Some(self.current),
                 time,
+                recovery_file,
                 ..Entry::default()
             },
         );
@@ -147,7 +152,9 @@ impl History {
         while let Some(entry) = self.entries.get(&id) {
             id = if redo { entry.child? } else { entry.parent? };
             let snapshot = self.entries.get(&id)?.snapshot.as_ref()?;
-            if snapshot.text.as_str() != text {
+            if snapshot.text.as_str() != text
+                || self.entries[&id].recovery_file != self.recovery_file()
+            {
                 return Some(id);
             }
         }
@@ -228,6 +235,26 @@ impl History {
             .get_mut(&self.current)
             .expect("live history entry")
             .saved = true;
+    }
+
+    /// Return the original disk baseline of the recovered text in this history state.
+    pub(super) fn recovery_file(&self) -> Option<RecoveryFile> {
+        self.entries[&self.current].recovery_file
+    }
+
+    /// Associate the current history state with `recovery_file` when restoring a draft.
+    pub(super) fn set_recovery_file(&mut self, recovery_file: Option<RecoveryFile>) {
+        self.entries
+            .get_mut(&self.current)
+            .expect("live history entry")
+            .recovery_file = recovery_file;
+    }
+
+    /// Drop all write baselines for the prior path when the buffer receives a new filename.
+    pub(super) fn forget_recovery_files(&mut self) {
+        for entry in self.entries.values_mut() {
+            entry.recovery_file = None;
+        }
     }
 
     /// Extend the current undo block on the next checkpoint, unless undo/redo preceded it.

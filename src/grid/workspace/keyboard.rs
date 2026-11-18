@@ -1101,6 +1101,9 @@ impl Workspace {
         let (revision, caret) = (doc.revision, doc.cursor);
         let area = self.active_editor_area();
         let directory = self.ex_current_dir().to_owned();
+        if matches!(event.keystroke.key.as_str(), "tab" | "a" | "d" | "l") {
+            self.refresh_ex_language_completion();
+        }
         let project = self.projects.active_mut();
         let mode = project.editor.vim().mode;
         project

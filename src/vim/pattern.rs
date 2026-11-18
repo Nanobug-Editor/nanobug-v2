@@ -4,11 +4,15 @@ use super::{
     Action, Register, ScreenMotionResolver, Vim,
     motions::{Kind, Motion},
 };
-use crate::i18n;
+use crate::{
+    document::{MarkModifiers, current_mark_modifiers, with_mark_modifiers},
+    i18n,
+};
 use regex::{Captures, Regex, RegexBuilder};
 use std::{collections::VecDeque, ops::Range};
 
 /// Last confirmed search, including the direction of its prompt.
+#[derive(Clone)]
 pub(super) struct Search {
     /// User-entered pattern used in feedback and empty-pattern substitutions.
     text: String,
@@ -52,6 +56,8 @@ pub(super) struct Confirmation {
     shift: isize,
     revision: u64,
     initial_revision: u64,
+    /// Restore the replacement command's mark behavior on confirmation.
+    marks: MarkModifiers,
 }
 
 impl Confirmation {
@@ -177,6 +183,16 @@ impl Vim {
         preview: Option<usize>,
         register: &mut Register,
     ) {
+        self.with_search_pattern(|vim| vim.apply_confirmed_search(text, preview, register));
+    }
+
+    /// Perform a confirmed search even when its temporary pattern must be discarded.
+    fn apply_confirmed_search(
+        &mut self,
+        text: &str,
+        preview: Option<usize>,
+        register: &mut Register,
+    ) {
         let operator = self.search_operator.take();
         if !text.is_empty() {
             if !self.set_search(text, self.prompt == '?') {
@@ -233,9 +249,22 @@ impl Vim {
         } else {
             word.to_owned()
         };
-        if self.set_search(&text, backward) {
-            self.doc.cursor = range.start;
-            self.search(false, count);
+        self.with_search_pattern(|vim| {
+            if vim.set_search(&text, backward) {
+                vim.doc.cursor = range.start;
+                vim.search(false, count);
+            }
+        });
+    }
+
+    /// Let a motion use its own pattern while preserving the previous search register.
+    fn with_search_pattern(&mut self, run: impl FnOnce(&mut Self)) {
+        let saved = super::ex_window_modifiers::ex_keeps_patterns()
+            .then(|| (self.last_search.clone(), self.search_highlights_hidden));
+        run(self);
+        if let Some((search, hidden)) = saved {
+            self.last_search = search;
+            self.search_highlights_hidden = hidden;
         }
     }
 
@@ -498,13 +527,15 @@ impl Vim {
                 return;
             }
         };
-        self.last_search = Some(Search {
-            text: command.pattern.clone(),
-            regex: regex.clone(),
-            backward: false,
-        });
-        self.search_highlights_hidden = false;
-        self.last_substitution = Some(command.clone());
+        if !super::ex_window_modifiers::ex_keeps_patterns() {
+            self.last_search = Some(Search {
+                text: command.pattern.clone(),
+                regex: regex.clone(),
+                backward: false,
+            });
+            self.search_highlights_hidden = false;
+            self.last_substitution = Some(command.clone());
+        }
         if confirm && !command.count_only {
             self.begin_substitute_confirmation(rows, &command, &regex);
             return;
@@ -560,6 +591,9 @@ impl Vim {
 
     /// Use the global pattern for both the search register and repeat-substitution patterns.
     pub(super) fn remember_global_pattern(&mut self, pattern: String, regex: Regex) {
+        if super::ex_window_modifiers::ex_keeps_patterns() {
+            return;
+        }
         self.search_highlights_hidden = false;
         if let Some(substitute) = &mut self.last_substitution {
             substitute.pattern.clone_from(&pattern);
@@ -607,6 +641,7 @@ impl Vim {
             shift: 0,
             revision: self.doc.revision,
             initial_revision: self.doc.revision,
+            marks: current_mark_modifiers(),
         });
         self.show_substitution_match();
     }
@@ -676,11 +711,13 @@ impl Vim {
                 last = Some(range.start);
                 if key != "n" {
                     let shift = occurrence.replacement.len() as isize - range.len() as isize;
-                    self.replace(
-                        range,
-                        &occurrence.replacement,
-                        self.doc.revision == prompt.initial_revision,
-                    );
+                    with_mark_modifiers(prompt.marks, || {
+                        self.replace(
+                            range,
+                            &occurrence.replacement,
+                            self.doc.revision == prompt.initial_revision,
+                        );
+                    });
                     prompt.shift += shift;
                     prompt.revision = self.doc.revision;
                 }
@@ -868,6 +905,37 @@ enum Syntax {
     VeryMagic,
     /// Unescaped characters are all literal.
     Literal,
+}
+
+/// Separate a match regexp from its Ex suffix without losing Vim pattern escapes.
+pub(super) fn regexp_delimited(text: &str) -> Option<(&str, &str)> {
+    let mut chars = text.char_indices();
+    let (_, delimiter) = chars.next()?;
+    let mut syntax = Syntax::Normal;
+    let mut in_class = false;
+    while let Some((at, ch)) = chars.next() {
+        if !in_class && ch == delimiter {
+            return Some((&text[delimiter.len_utf8()..at], &text[at + ch.len_utf8()..]));
+        }
+        if ch == '\\' {
+            let (_, escaped) = chars.next()?;
+            if !in_class {
+                match escaped {
+                    'm' => syntax = Syntax::Normal,
+                    'M' => syntax = Syntax::NoMagic,
+                    'v' => syntax = Syntax::VeryMagic,
+                    'V' => syntax = Syntax::Literal,
+                    '[' if matches!(syntax, Syntax::NoMagic) => in_class = true,
+                    _ => {}
+                }
+            }
+        } else if in_class {
+            in_class = ch != ']';
+        } else if ch == '[' && matches!(syntax, Syntax::Normal | Syntax::VeryMagic) {
+            in_class = true;
+        }
+    }
+    None
 }
 
 /// Translate Vim grouping, quantifiers, word boundaries and magic/case switches into regex.

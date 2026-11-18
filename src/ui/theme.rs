@@ -1,5 +1,6 @@
 //! Editor palettes and bundled monospace font descriptors shared by native and SDK drawing.
 
+mod highlight;
 mod palette;
 mod preferences;
 
@@ -9,6 +10,7 @@ pub(crate) use palette::{
     TEXT, TREE_GUIDE, ThemeComponent, WARNING_BORDER, WARNING_TEXT, load_for_editor,
 };
 
+pub(crate) use highlight::syntax_highlight_groups;
 pub(crate) use preferences::AppearanceChange;
 
 use gpui::{App, Font, FontFeatures, Global, PlatformTextSystem, WindowAppearance, font};

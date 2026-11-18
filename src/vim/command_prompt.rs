@@ -89,6 +89,10 @@ pub(super) struct State {
     pub(super) overstrike: bool,
     /// Alternate file in the editor pane, supplied by its native owner.
     pub(super) alternate_path: Option<PathBuf>,
+    /// Language server IDs and names available in the originating Session.
+    language_servers: Vec<String>,
+    /// Filetype names declared by plugins in this workspace.
+    filetypes: Vec<String>,
     /// Configured local thesaurus files for Insert-mode synonym completion.
     pub(super) thesaurus: Vec<PathBuf>,
     /// Original source caret before starting the current incremental search.
@@ -149,6 +153,25 @@ struct History {
 }
 
 impl Vim {
+    /// Update the server and filetype names offered as Ex arguments by the host.
+    pub fn set_language_completion(
+        &mut self,
+        mut servers: Vec<String>,
+        mut filetypes: Vec<String>,
+    ) {
+        servers.sort_unstable();
+        servers.dedup();
+        filetypes.sort_unstable();
+        filetypes.dedup();
+        if self.command_prompt.language_servers != servers
+            || self.command_prompt.filetypes != filetypes
+        {
+            self.command_prompt.language_servers = servers;
+            self.command_prompt.filetypes = filetypes;
+            self.command_prompt.completion = None;
+        }
+    }
+
     /// Supply the active pane's alternate buffer `path` for the # register.
     pub fn set_alternate_file(&mut self, path: Option<PathBuf>) {
         self.command_prompt.alternate_path = path;
@@ -350,12 +373,77 @@ impl Vim {
         head: &str,
         register: &Register,
     ) -> Option<(usize, Vec<String>)> {
+        if let Some((begin, groups)) =
+            super::ex_match::completion(head, |prefix| register.input_maps.highlight_groups(prefix))
+        {
+            return (!groups.is_empty()).then_some((begin, groups));
+        }
         let (_, name_and_args) = self.ex_range(head)?;
-        let trimmed = name_and_args.trim_start();
+        let mut trimmed = name_and_args.trim_start();
+        while let Some(command) = super::ex_window_modifiers::completion_tail(trimmed) {
+            trimmed = self.ex_range(command)?.1.trim_start();
+        }
         let leading = head.len() - trimmed.len();
         let (begin, matches) = if let Some(end) = trimmed.find(char::is_whitespace) {
             let (name, remainder) = trimmed.split_at(end);
             let option = remainder.trim_start();
+            if let Some((prefix, matches)) =
+                super::ex_sign::completion(name, remainder, register, |prefix| {
+                    path_candidates(self.completion_directory(), prefix)
+                })
+            {
+                return (!matches.is_empty()).then_some((head.len() - prefix.len(), matches));
+            }
+            if let Some((prefix, matches)) =
+                super::ex_highlight::complete_argument(name, remainder, register)
+            {
+                return (!matches.is_empty()).then_some((head.len() - prefix.len(), matches));
+            }
+            if name == "lsp" {
+                let (prefix, matches) =
+                    if let Some((verb, args)) = option.split_once(char::is_whitespace) {
+                        super::ex_languages::LspCommand::parse(verb)?;
+                        let prefix = args.trim_start();
+                        (
+                            prefix,
+                            self.command_prompt
+                                .language_servers
+                                .iter()
+                                .filter(|name| name.starts_with(prefix))
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        )
+                    } else {
+                        (
+                            option,
+                            super::ex_languages::LspCommand::NAMES
+                                .iter()
+                                .copied()
+                                .filter(|word| word.starts_with(option))
+                                .map(str::to_owned)
+                                .collect(),
+                        )
+                    };
+                return (!matches.is_empty()).then_some((head.len() - prefix.len(), matches));
+            }
+            if name.starts_with("filet") && "filetype".starts_with(name) {
+                let matches = ["detect", "off", "on"]
+                    .into_iter()
+                    .filter(|word| word.starts_with(option))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                return (!matches.is_empty()).then_some((head.len() - option.len(), matches));
+            }
+            if name.starts_with("setf") && "setfiletype".starts_with(name) {
+                let prefix = option
+                    .strip_prefix("FALLBACK ")
+                    .map_or(option, str::trim_start);
+                let mut matches = self.filetype_candidates(prefix);
+                if prefix == option && "FALLBACK".starts_with(prefix) {
+                    matches.insert(0, "FALLBACK".into());
+                }
+                return (!matches.is_empty()).then_some((head.len() - prefix.len(), matches));
+            }
             if matches!(
                 name,
                 "set" | "se" | "setlocal" | "setl" | "setglobal" | "setg"
@@ -369,6 +457,13 @@ impl Vim {
                         .then_some((head.len() - prefix.len(), candidates));
                 }
                 let fragment = option.split_whitespace().last().unwrap_or_default();
+                if let Some(prefix) = fragment
+                    .strip_prefix("filetype=")
+                    .or_else(|| fragment.strip_prefix("ft="))
+                {
+                    let matches = self.filetype_candidates(prefix);
+                    return (!matches.is_empty()).then_some((head.len() - prefix.len(), matches));
+                }
                 let option_name = fragment
                     .strip_prefix("no")
                     .or_else(|| fragment.strip_prefix("inv"))
@@ -388,6 +483,15 @@ impl Vim {
             {
                 return (!matches.is_empty()).then_some((head.len() - argument.len(), matches));
             }
+            if matches!(name, "echoh" | "echohl") {
+                let mut matches = register.input_maps.highlight_groups(option);
+                if "none".starts_with(&option.to_ascii_lowercase()) {
+                    matches.push("None".into());
+                }
+                matches.sort_unstable();
+                matches.dedup();
+                return (!matches.is_empty()).then_some((head.len() - option.len(), matches));
+            }
             if let Some(completion) = self.user_ex_completion(name, register) {
                 use super::script::UserExCompletion;
                 let argument = remainder.rsplit(char::is_whitespace).next().unwrap_or("");
@@ -405,6 +509,15 @@ impl Vim {
                         .collect(),
                 };
                 return (!matches.is_empty()).then_some((head.len() - argument.len(), matches));
+            }
+            if super::ex_recovery::recover_verb(name).is_some() {
+                let path = remainder.trim_start();
+                let matches =
+                    path_candidates(self.completion_directory(), &path.replace("\\ ", " "))
+                        .into_iter()
+                        .map(|candidate| candidate.replace(' ', "\\ "))
+                        .collect::<Vec<_>>();
+                return (!matches.is_empty()).then_some((head.len() - path.len(), matches));
             }
             let (command, _) = ExCommand::parse(name)?;
             let path = if command.takes_path() {
@@ -429,8 +542,15 @@ impl Vim {
                     .iter()
                     .chain(super::ex_buffer_lifecycle::NAMES)
                     .chain(super::ex_catalog::NAMES)
+                    .chain(super::ex_highlight::NAMES)
+                    .chain(super::ex_echo_highlight::NAMES)
                     .chain(super::ex_history::NAMES)
+                    .chain(super::ex_languages::NAMES)
+                    .chain(super::ex_match::NAMES)
                     .chain(super::ex_message_modifiers::NAMES)
+                    .chain(super::ex_recovery::NAMES)
+                    .chain(super::ex_redirect::NAMES)
+                    .chain(super::ex_sign::NAMES)
                     .chain(super::ex_window_modifiers::NAMES)
                     .chain(super::session_export::NAMES)
                     .chain(super::ex_state::NAMES)
@@ -442,11 +562,30 @@ impl Vim {
             if "nohlsearch".starts_with(trimmed) {
                 candidates.push("nohlsearch".into());
             }
+            if super::ex_recovery::recover_verb(trimmed) == Some(true) {
+                candidates.push("recover!".into());
+            }
             candidates.sort_unstable();
             candidates.dedup();
             (leading, candidates)
         };
         (!matches.is_empty()).then_some((begin, matches))
+    }
+
+    /// Complete a plugin-declared filetype or the active buffer's inferred name.
+    fn filetype_candidates(&self, prefix: &str) -> Vec<String> {
+        let current = self.filetype();
+        let mut matches = self
+            .command_prompt
+            .filetypes
+            .iter()
+            .chain((!current.is_empty()).then_some(&current))
+            .filter(|name| name.starts_with(prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        matches
     }
 }
 
@@ -606,6 +745,35 @@ mod tests {
             vim.key("Enter", &mut register),
             Action::Open("目录/文 件.txt".into())
         );
+    }
+
+    /// Recover accepts a command bang and escaped filenames from the host directory.
+    #[test]
+    fn recovery_completion_preserves_bang_and_path_spaces() {
+        let project = tempfile::tempdir().unwrap();
+        fs::write(project.path().join("a b.rs"), "").unwrap();
+        let mut vim = Vim::new(Document::new("sample"));
+        let mut register = Register::default();
+        vim.set_completion_directory(project.path());
+        prompt(&mut vim, &mut register, ":", "rec!");
+        vim.key("Tab", &mut register);
+        assert_eq!(vim.command, "recover!");
+        vim.key("Escape", &mut register);
+
+        prompt(&mut vim, &mut register, ":", r"recover! a\ ");
+        vim.key("Tab", &mut register);
+        assert_eq!(vim.command, r"recover! a\ b.rs");
+        assert_eq!(
+            vim.key("Enter", &mut register),
+            Action::Recovery(super::super::RecoveryCommand::Recover {
+                file: r"a\ b.rs".into(),
+                force: true,
+            }),
+        );
+
+        prompt(&mut vim, &mut register, ":", "noswapfile edi");
+        vim.key("Tab", &mut register);
+        assert_eq!(vim.command, "noswapfile edit");
     }
 
     /// History is shared within a pane, prefix-filtered, and restores text after the draft caret.

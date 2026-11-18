@@ -1,6 +1,8 @@
-//! Ex modifiers that apply to a command's native editor window operations.
+//! Ex modifiers that apply to one editor command.
 
-use super::{Action, Vim};
+use super::{Action, InputMappings, MessageModifier, Register, Vim};
+use crate::document::{MarkModifiers, with_mark_modifiers};
+use std::cell::Cell;
 
 /// Canonical modifier names offered by the prompt.
 pub(super) const NAMES: &[&str] = &[
@@ -15,7 +17,46 @@ pub(super) const NAMES: &[&str] = &[
     "vertical",
     "browse",
     "confirm",
+    "keepalt",
+    "keepjumps",
+    "keepmarks",
+    "keeppatterns",
+    "lockmarks",
+    "noswapfile",
+    "verbose",
 ];
+
+thread_local! {
+    static RETENTION: Cell<(bool, bool)> = const { Cell::new((false, false)) };
+}
+
+/// Report whether the current Ex operation preserves the window's alternate buffer.
+pub fn ex_keeps_alternate() -> bool {
+    RETENTION.with(|state| state.get().0)
+}
+
+/// Report whether the current Ex operation preserves search and substitution patterns.
+pub(super) fn ex_keeps_patterns() -> bool {
+    RETENTION.with(|state| state.get().1)
+}
+
+/// Restore command retention even when nested command evaluation aborts.
+struct RetentionScope((bool, bool));
+
+impl Drop for RetentionScope {
+    fn drop(&mut self) {
+        RETENTION.with(|state| state.set(self.0));
+    }
+}
+
+/// Preserve the previous diagnostic level when an Ex command requests a temporary level.
+struct VerboseScope<'a>(&'a InputMappings);
+
+impl Drop for VerboseScope<'_> {
+    fn drop(&mut self) {
+        self.0.end_ex_verbose();
+    }
+}
 
 /// Refer to a local split edge or an edge of the whole current Tabpage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +85,12 @@ pub struct WindowModifiers {
     pub browse: bool,
     /// Use confirmation in place of recoverable write or close errors.
     pub confirm: bool,
+    /// Disable draft checkpoints for the buffers first loaded by the command.
+    pub no_swapfile: bool,
+    pub keep_alt: bool,
+    pub keep_patterns: bool,
+    pub marks: MarkModifiers,
+    pub verbose: Option<u32>,
 }
 
 impl WindowModifiers {
@@ -55,22 +102,67 @@ impl WindowModifiers {
             tab: inner.tab.or_else(|| self.tab.clone()),
             browse: inner.browse || self.browse,
             confirm: inner.confirm || self.confirm,
+            no_swapfile: inner.no_swapfile || self.no_swapfile,
+            keep_alt: inner.keep_alt || self.keep_alt,
+            keep_patterns: inner.keep_patterns || self.keep_patterns,
+            marks: MarkModifiers {
+                keep_marks: inner.marks.keep_marks || self.marks.keep_marks,
+                keep_jumps: inner.marks.keep_jumps || self.marks.keep_jumps,
+                lock_marks: inner.marks.lock_marks || self.marks.lock_marks,
+            },
+            verbose: inner.verbose.or(self.verbose),
         }
     }
+
+    /// Report whether a command needs window layout, file selection, or prompt handling.
+    pub fn has_native_options(&self) -> bool {
+        self.placement.is_some()
+            || self.orientation.is_some()
+            || self.tab.is_some()
+            || self.browse
+            || self.confirm
+            || self.no_swapfile
+    }
+
+    /// Apply only the state owned by the command currently evaluated.
+    pub fn with_ex_state<T>(&self, mappings: &InputMappings, run: impl FnOnce() -> T) -> T {
+        let _verbose = self.verbose.map(|level| {
+            mappings.begin_ex_verbose(level);
+            VerboseScope(mappings)
+        });
+        let _retention = RetentionScope(RETENTION.with(|state| {
+            let (keep_alt, keep_patterns) = state.get();
+            state.replace((
+                self.keep_alt || keep_alt,
+                self.keep_patterns || keep_patterns,
+            ))
+        }));
+        let marks = crate::document::current_mark_modifiers();
+        with_mark_modifiers(
+            MarkModifiers {
+                keep_marks: self.marks.keep_marks || marks.keep_marks,
+                keep_jumps: self.marks.keep_jumps || marks.keep_jumps,
+                lock_marks: self.marks.lock_marks || marks.lock_marks,
+            },
+            run,
+        )
+    }
+}
+
+/// Clear keepjumps in commands indirectly invoked through scripts or functions.
+pub fn without_ex_keep_jumps<T>(run: impl FnOnce() -> T) -> T {
+    let mut marks = crate::document::current_mark_modifiers();
+    marks.keep_jumps = false;
+    with_mark_modifiers(marks, run)
 }
 
 impl Vim {
     /// Consume a chain of window modifiers, retaining its untouched inner command and addresses.
     pub(super) fn ex_window_modifiers(&mut self, text: &str) -> Option<Action> {
-        let mut tail = text.trim_start();
-        let mut modifiers = WindowModifiers::default();
-        while let Some((part, rest)) = parse_modifier(tail) {
-            modifiers = modifiers.overlay(part);
-            tail = rest.trim_start_matches([' ', '\t', ':']);
-        }
-        if modifiers == WindowModifiers::default() {
-            return None;
-        }
+        let (range, command) = text
+            .strip_prefix("'<,'>")
+            .map_or(("", text), |rest| ("'<,'>", rest));
+        let (modifiers, tail) = parse_modifiers(command)?;
         if tail.is_empty() {
             self.ex_failed = true;
             self.message =
@@ -79,12 +171,64 @@ impl Vim {
         }
         Some(Action::WindowModified {
             modifiers,
-            command: tail.to_owned(),
+            command: format!("{range}{tail}"),
         })
+    }
+
+    /// Expose the command itself to a source frame that may need to wait for native work.
+    pub fn source_ex_modifiers<'a>(
+        &self,
+        text: &'a str,
+        register: &Register,
+    ) -> Option<(WindowModifiers, Vec<MessageModifier>, &'a str)> {
+        if self.collecting_ex_lines() || super::script::defining_function(register) {
+            return None;
+        }
+        let (modifiers, messages, tail) = command_modifiers(text);
+        if tail.is_empty()
+            || modifiers.has_native_options()
+            || (modifiers == WindowModifiers::default() && messages.is_empty())
+            || (!messages.is_empty()
+                && !self
+                    .ex_range(tail)
+                    .is_some_and(|(_, body)| body.starts_with('!')))
+        {
+            return None;
+        }
+        Some((modifiers, messages, tail))
     }
 }
 
-/// Split exactly one modifier and any Tabpage address preceding it.
+/// Separate command and message prefixes from the text they scope.
+pub(super) fn command_modifiers(text: &str) -> (WindowModifiers, Vec<MessageModifier>, &str) {
+    let mut tail = text.trim_start_matches([' ', '\t', ':']);
+    let mut modifiers = WindowModifiers::default();
+    let mut messages = Vec::new();
+    loop {
+        if let Some((parsed, rest)) = parse_modifiers(tail) {
+            modifiers = modifiers.overlay(parsed);
+            tail = rest;
+        } else if let Some(Ok((parsed, rest))) = super::ex_message_modifiers::parse_modifier(tail) {
+            messages.push(parsed);
+            tail = rest.trim_start_matches([' ', '\t', ':']);
+        } else {
+            return (modifiers, messages, tail);
+        }
+    }
+}
+
+/// Split a modifier chain from its untouched inner command and address.
+pub(super) fn parse_modifiers(text: &str) -> Option<(WindowModifiers, &str)> {
+    let mut tail = text.trim_start();
+    let mut modifiers = WindowModifiers::default();
+    while let Some((part, rest)) = parse_modifier(tail) {
+        modifiers = modifiers.overlay(part);
+        tail = rest.trim_start_matches([' ', '\t', ':']);
+    }
+    (modifiers != WindowModifiers::default()).then_some((modifiers, tail))
+}
+
+/// Split exactly one modifier and its optional Tabpage address or verbosity level.
 fn parse_modifier(text: &str) -> Option<(WindowModifiers, &str)> {
     let prefix = text
         .bytes()
@@ -101,12 +245,30 @@ fn parse_modifier(text: &str) -> Option<(WindowModifiers, &str)> {
     let mut modifiers = WindowModifiers::default();
     if name == "tab" {
         modifiers.tab = Some(address.to_owned());
+    } else if name_is("verbose", 4) {
+        modifiers.verbose = Some(if address.is_empty() {
+            1
+        } else {
+            address.parse().ok()?
+        });
     } else if !address.is_empty() {
         return None;
     } else if name_is("browse", 3) {
         modifiers.browse = true;
     } else if name_is("confirm", 4) {
         modifiers.confirm = true;
+    } else if name_is("keepalt", 5) {
+        modifiers.keep_alt = true;
+    } else if name_is("keepjumps", 5) {
+        modifiers.marks.keep_jumps = true;
+    } else if name_is("keepmarks", 3) {
+        modifiers.marks.keep_marks = true;
+    } else if name_is("keeppatterns", 5) {
+        modifiers.keep_patterns = true;
+    } else if name_is("lockmarks", 3) {
+        modifiers.marks.lock_marks = true;
+    } else if name_is("noswapfile", 3) {
+        modifiers.no_swapfile = true;
     } else if name_is("aboveleft", 3) || name_is("leftabove", 5) {
         modifiers.placement = Some(WindowPlacement::Before);
     } else if name_is("belowright", 3) || name_is("rightbelow", 6) {
@@ -123,6 +285,12 @@ fn parse_modifier(text: &str) -> Option<(WindowModifiers, &str)> {
         return None;
     }
     Some((modifiers, tail))
+}
+
+/// Return a modifier's command line suffix after the user types a separating character.
+pub(super) fn completion_tail(text: &str) -> Option<&str> {
+    let (_, rest) = parse_modifier(text)?;
+    (!rest.is_empty()).then(|| rest.trim_start_matches([' ', '\t', ':']))
 }
 
 #[cfg(test)]
@@ -158,5 +326,73 @@ mod tests {
                 command: "5resize".into(),
             }
         );
+    }
+
+    /// The abbreviated swap modifier composes with a split and accepts a nested Ex command.
+    #[test]
+    fn noswapfile_overlays_other_ex_modifiers() {
+        let mut vim = Vim::new(Document::new("x\n"));
+        let mut register = Register::default();
+        assert_eq!(
+            vim.execute_ex_line(r"nos vertical split a\ b.rs", &mut register),
+            Action::WindowModified {
+                modifiers: WindowModifiers {
+                    orientation: Some(WindowOrientation::Vertical),
+                    no_swapfile: true,
+                    ..WindowModifiers::default()
+                },
+                command: r"split a\ b.rs".into(),
+            },
+        );
+        assert_eq!(
+            vim.execute_ex_line("noswapfile", &mut register),
+            Action::None
+        );
+        assert!(vim.ex_failed());
+    }
+
+    /// Restore both patterns after a substitution or motion and restore verbose after the command.
+    #[test]
+    fn ex_state_retains_patterns_and_scopes_verbosity() {
+        let mut vim = Vim::new(Document::new("before\ntarget\nbefore\nword word\n"));
+        let mut register = Register::default();
+        vim.execute_ex_line("1s/before/saved/", &mut register);
+        assert_eq!(vim.search_pattern(), Some("before"));
+        vim.execute_ex_line("keepp 2s/target/changed/", &mut register);
+        assert!(!vim.ex_failed(), "{}", vim.message);
+        assert_eq!(vim.search_pattern(), Some("before"));
+        vim.execute_ex_line("3&", &mut register);
+        assert_eq!(vim.doc.text, "saved\nchanged\nsaved\nword word\n");
+        vim.set_cursor(vim.doc.starts[3]);
+        vim.execute_ex_line("keeppatterns normal! *", &mut register);
+        assert_eq!(vim.doc.location(vim.doc.cursor), (3, 5));
+        assert_eq!(vim.search_pattern(), Some("before"));
+
+        vim.execute_ex_line("4verbose 0verb set verbose?", &mut register);
+        assert_eq!(vim.message, "verbose=0");
+        vim.execute_ex_line("verb set verbose?", &mut register);
+        assert_eq!(vim.message, "verbose=1");
+        assert_eq!(register.input_maps.ex_verbose(), 0);
+    }
+
+    /// Keep shell pipelines and their scope together through script lexing.
+    #[test]
+    fn source_preserves_scoped_shell_pipeline() {
+        let vim = Vim::new(Document::new("first\nsecond\n"));
+        let register = Register::default();
+        let statement = "silent kee 1,2! producer | consumer";
+        assert_eq!(vim.source_statements(statement), vec![statement]);
+        let (modifiers, messages, command) = vim.source_ex_modifiers(statement, &register).unwrap();
+        assert!(modifiers.marks.keep_marks);
+        assert!(matches!(
+            messages.as_slice(),
+            [MessageModifier::Silent {
+                ignore_error: false
+            }]
+        ));
+        assert_eq!(command, "1,2! producer | consumer");
+        let lines = vim.script_lines("keepjumps append\n  literal   | text\n.\n", 1);
+        assert!(lines[1].literal);
+        assert_eq!(lines[1].text, "  literal   | text");
     }
 }

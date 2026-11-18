@@ -69,6 +69,8 @@ enum Token<'a> {
     Name(&'a str),
     /// A read-only reference to a Vim register.
     Register(char),
+    /// An Ex option reference with an optional g: or l: scope.
+    Option(&'a str),
     /// Syntactic symbol, including an operator or delimiter.
     Symbol(&'static str),
 }
@@ -95,6 +97,18 @@ fn token(source: &str) -> Result<(Token<'_>, &str), String> {
         && let Some(name) = rest.chars().next()
     {
         return Ok((Token::Register(name), &rest[name.len_utf8()..]));
+    }
+    if let Some(rest) = source.strip_prefix('&')
+        && !rest.starts_with('&')
+    {
+        let name = rest
+            .strip_prefix("g:")
+            .or_else(|| rest.strip_prefix("l:"))
+            .unwrap_or(rest);
+        let length = name.bytes().take_while(u8::is_ascii_alphanumeric).count();
+        if length > 0 {
+            return Ok((Token::Option(&name[..length]), &name[length..]));
+        }
     }
     if ch.is_ascii_alphabetic() || ch == '_' {
         let name_len = source
@@ -343,6 +357,16 @@ impl<'source> Parser<'_, 'source> {
                 Value::String(self.vim.text_register(Some(name), self.register).text)
             }
             Token::Register(_) => Value::Null,
+            Token::Option(name) if active => match name {
+                "verbose" | "vbs" => Value::Integer(self.register.input_maps.ex_verbose().into()),
+                "verbosefile" | "vfile" => Value::String(
+                    self.register
+                        .input_maps
+                        .with_options(|options| options.verbosefile.clone()),
+                ),
+                _ => return Err(format!("Unknown option: {name}")),
+            },
+            Token::Option(_) => Value::Null,
             Token::Name(name) if self.take("(") => {
                 let args = self.sequence(")", active, depth)?;
                 if active {
@@ -631,7 +655,7 @@ impl<'source> Parser<'_, 'source> {
                 _ => "R",
             }
             .into()),
-            ("getreg", []) => S(self.register.text.clone()),
+            ("getreg", []) => S(self.register.read(None).text),
             ("getreg", [key]) => S(self
                 .vim
                 .text_register(text(key).chars().next(), self.register)

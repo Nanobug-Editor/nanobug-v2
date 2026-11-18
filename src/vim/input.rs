@@ -207,7 +207,7 @@ impl Vim {
             }
             return Action::None;
         }
-        self.message.clear();
+        self.clear_ex_message();
         if self.expression_prompt.is_some() && matches!(key, "Enter" | "Ctrl+j" | "Ctrl+m") {
             return self.submit_expression(register, resolve_screen);
         }

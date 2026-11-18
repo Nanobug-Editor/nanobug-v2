@@ -229,12 +229,31 @@ fn evaluate_rule(
     markers: &[&str],
     dialect: Option<&str>,
 ) -> (bool, bool, Vec<String>) {
+    evaluate_rule_with_context(
+        worker,
+        source,
+        module,
+        path,
+        markers,
+        json!({"projectSqlDialect": dialect}),
+    )
+}
+
+/// Evaluate one rule under an explicit host `context`, retaining its physical `path`.
+fn evaluate_rule_with_context(
+    worker: &mut Worker,
+    source: &str,
+    module: &str,
+    path: &str,
+    markers: &[&str],
+    context: Value,
+) -> (bool, bool, Vec<String>) {
     let extension = Path::new(path).extension().and_then(|part| part.to_str());
     let mut reply = worker.request(Request::Evaluate {
         id: 1,
         source: source.into(),
         module: Some(module.into()),
-        context: json!({"projectSqlDialect": dialect}),
+        context,
         remaining_ms: 5000,
     });
     loop {
@@ -378,6 +397,7 @@ fn exercise(
     assert!(module.accepts_document(document.path.as_deref()), "{id}");
     let mut input = Input {
         document: Some(document.clone()),
+        document_filetype: None,
         event: PluginEvent::Open,
         settings: Default::default(),
         draft: String::new(),
@@ -503,6 +523,167 @@ fn result(reply: Reply, package: &str) -> Output {
         Reply::Result { output, .. } => *output,
         other => panic!("{package}: {other:?}"),
     }
+}
+
+/// Install the Python pilot and exercise its rule, syntax and completion with a real extensionless path.
+#[test]
+#[ignore = "requires the built Python plugin ZIP in NANOBUG_LANGUAGE_ARCHIVES or dist/language-plugins"]
+fn release_python_explicit_filetype_with_no_extension() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let archives = std::env::var_os("NANOBUG_LANGUAGE_ARCHIVES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("dist/language-plugins"));
+    let profile = tempfile::tempdir().unwrap();
+    let store = InstallStore::new(profile.path().join("store"));
+    let prepared = store
+        .prepare(&archives.join("nanobug-python-plugin.zip"))
+        .unwrap();
+    let grants = prepared.release.manifest.permissions.clone();
+    let installed = store.install(prepared, &grants).unwrap();
+    let document = installed
+        .release
+        .manifest
+        .modules
+        .iter()
+        .find(|module| module.id == "document")
+        .unwrap();
+    assert!(document.document_filetypes.contains("python"));
+    let source = std::fs::read_to_string(
+        store
+            .verified_asset(&installed.release, document.rule.as_deref().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let mut rules = Worker::start("rules", None);
+    assert!(
+        evaluate_rule_with_context(
+            &mut rules,
+            &source,
+            "document",
+            "script",
+            &[],
+            json!({"documentFiletype": "python"})
+        )
+        .0
+    );
+    assert!(evaluate_rule(&mut rules, &source, "document", "script.py", &[], None).0);
+    assert!(
+        !evaluate_rule_with_context(
+            &mut rules,
+            &source,
+            "document",
+            "script.py",
+            &[],
+            json!({"documentFiletype": "text"})
+        )
+        .0
+    );
+
+    let mut wasm = Worker::start("wasm", Some(&store.root().join("wasmtime-cache.toml")));
+    let mut parser = Worker::start("syntax", None);
+    let module = store
+        .verified_asset(&installed.release, document.wasm.as_deref().unwrap())
+        .unwrap();
+    let instance = Instance {
+        project: 1,
+        module: "document".into(),
+    };
+    let doc = DocumentSnapshot {
+        path: Some("script".into()),
+        opening: 1,
+        revision: 1,
+        text: "def title():\n    return '中文'\n".into(),
+    };
+    let mut input = Input {
+        document: Some(doc.clone()),
+        document_filetype: Some("python".into()),
+        event: PluginEvent::Open,
+        settings: Default::default(),
+        draft: String::new(),
+        viewport: None,
+        canvas_sync: None,
+        open_documents: Vec::new(),
+    };
+    let opened = result(
+        wasm.request(Request::Open {
+            id: 1,
+            instance: instance.clone(),
+            wasm: module.clone(),
+            input: Box::new(input.clone()),
+            interactive: false,
+        }),
+        "python",
+    );
+    let [request] = opened.services.as_slice() else {
+        panic!("expected a syntax query")
+    };
+    let Service::QuerySyntax { language, query } = &request.operation else {
+        panic!("expected syntax query")
+    };
+    assert_eq!(language, "python");
+    let Reply::Parsed { value, .. } = parser.request(Request::QuerySyntax {
+        id: 2,
+        language: language.clone(),
+        query: query.clone(),
+        document: Box::new(doc),
+    }) else {
+        panic!("expected parsed Python")
+    };
+    input.event = PluginEvent::ServiceResult {
+        result: ServiceResult {
+            token: request.token,
+            value: Ok(value),
+        },
+    };
+    let highlighted = result(
+        wasm.request(Request::Call {
+            id: 3,
+            instance,
+            input: Box::new(input.clone()),
+            interactive: false,
+        }),
+        "python",
+    );
+    assert!(
+        highlighted
+            .document_features
+            .is_some_and(|features| !features.highlights.is_empty())
+    );
+
+    let instance = Instance {
+        project: 1,
+        module: "complete".into(),
+    };
+    input.event = PluginEvent::Open;
+    result(
+        wasm.request(Request::Open {
+            id: 4,
+            instance: instance.clone(),
+            wasm: module,
+            input: Box::new(input.clone()),
+            interactive: false,
+        }),
+        "python",
+    );
+    let current = input.document.as_mut().unwrap();
+    current.text = "pri".into();
+    current.revision += 1;
+    input.event = PluginEvent::Complete { offset: 3 };
+    let completed = result(
+        wasm.request(Request::Call {
+            id: 5,
+            instance,
+            input: Box::new(input),
+            interactive: false,
+        }),
+        "python",
+    );
+    assert!(
+        completed
+            .completion_items
+            .iter()
+            .any(|item| item.label == "print")
+    );
 }
 
 /// Verify the actual distribution packages, including each separate SQL dialect.

@@ -1,7 +1,7 @@
 //! Workspace-scoped user autocommands and their buffer matching.
 
 use super::split_word;
-use crate::vim::{Action, Register, Vim};
+use crate::vim::{Action, ExOrigin, Register, Vim};
 use regex::Regex;
 use std::{collections::BTreeSet, fmt::Write as _, path::Path};
 
@@ -31,7 +31,8 @@ impl ScriptEvent {
     }
 
     /// Canonical name used when listing autocommands.
-    fn name(self) -> &'static str {
+    /// Canonical event name in script listings and diagnostics.
+    pub fn name(self) -> &'static str {
         match self {
             Self::BufReadPost => "BufReadPost",
             Self::BufNewFile => "BufNewFile",
@@ -47,6 +48,8 @@ impl ScriptEvent {
 pub struct ScriptAutocmd {
     pub text: String,
     pub source: Option<String>,
+    /// Physical line of the original handler declaration.
+    pub source_line: usize,
     pub nested: bool,
 }
 
@@ -64,6 +67,8 @@ struct Entry {
     pattern: Pattern,
     text: String,
     source: Option<String>,
+    /// Physical location of the original handler declaration.
+    defined_at: Option<ExOrigin>,
     nested: bool,
     once: bool,
 }
@@ -180,6 +185,7 @@ impl crate::vim::InputMappings {
             matched.push(ScriptAutocmd {
                 text,
                 source: entry.source.clone(),
+                source_line: entry.defined_at.as_ref().map_or(1, ExOrigin::line),
                 nested: entry.nested,
             });
             !entry.once
@@ -209,6 +215,8 @@ impl Vim {
                 force,
                 self.doc.buffer_number(),
                 register.scripts.source.as_deref(),
+                register.input_maps.current_ex_origin(),
+                register.input_maps.ex_verbose() > 0,
             )
         } else if name.len() >= 4
             && ("doautocmd".starts_with(name) || "doautoall".starts_with(name))
@@ -270,6 +278,8 @@ impl Registry {
         force: bool,
         number: u64,
         source: Option<&str>,
+        defined_at: Option<ExOrigin>,
+        verbose: bool,
     ) -> Result<Action, String> {
         let (first, remaining) = split_word(args);
         let (group, args) = if self.groups.contains(first) {
@@ -314,7 +324,7 @@ impl Registry {
             }
             let mut result = String::from("--- Autocommands ---\n");
             for entry in self.entries.iter().filter(|entry| matches(entry, true)) {
-                let _ = writeln!(
+                let _ = write!(
                     result,
                     "{} {}  {}  {}",
                     entry.group.as_deref().unwrap_or(""),
@@ -322,6 +332,10 @@ impl Registry {
                     entry.pattern.name,
                     entry.text
                 );
+                if verbose && let Some(origin) = &entry.defined_at {
+                    origin.append_to(&mut result);
+                }
+                result.push('\n');
             }
             return Ok(Action::ShowListing(result));
         }
@@ -336,6 +350,7 @@ impl Registry {
                     pattern: Pattern::compile(&pattern.name, number)?,
                     text: text.into(),
                     source: source.map(str::to_owned),
+                    defined_at: defined_at.clone(),
                     nested,
                     once,
                 });

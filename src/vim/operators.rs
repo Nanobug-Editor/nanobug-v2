@@ -244,6 +244,11 @@ impl Vim {
         }
         let revision = self.doc.revision;
         let caret = edit_range.start;
+        if linewise && key == 'd' && !self.read_only {
+            let first = self.doc.location(start).0;
+            let end = self.doc.starts.partition_point(|&line| line < range.end);
+            self.doc.remove_sign_rows(first..end.max(first + 1));
+        }
         self.replace(edit_range, &replacement, true);
         self.doc.cursor = caret.min(self.doc.text.len());
         self.desired_column = None;
@@ -885,14 +890,20 @@ impl Vim {
         let start = range.start;
         let trailing_lf = self.doc.text[range.clone()].ends_with('\n');
         if trailing_lf && !output.is_empty() && !output.ends_with('\n') {
-            self.replace(range, &format!("{output}\n"), true);
+            self.replace_tracking_marks(
+                range,
+                &format!("{output}\n"),
+                true,
+                Some(output.lines().count()),
+            );
         } else {
+            let filter_lines = output.lines().count();
             let output = if trailing_lf {
                 output
             } else {
                 output.strip_suffix('\n').unwrap_or(output)
             };
-            self.replace(range, output, true);
+            self.replace_tracking_marks(range, output, true, Some(filter_lines));
         }
         self.set_cursor(start);
         Action::None

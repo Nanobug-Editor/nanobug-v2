@@ -334,34 +334,38 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let argument = escaped_path(path);
-        let previous = std::mem::replace(&mut self.active_ex_window_modifiers, modifiers);
         let probe = format!("{head} nanobug-file-operand");
-        let edit = self.projects.active_mut().editor.edit(|vim, register| {
-            let mut action = vim.execute_ex_line(&probe, register);
-            match &mut action {
-                Action::Files(command) => command.arguments = argument,
-                Action::Open(_) => {
-                    action = Action::Files(FileCommand {
-                        operation: FileOperation::Edit,
-                        count: None,
-                        force: head.ends_with('!'),
-                        arguments: argument,
-                    })
-                }
-                Action::ReadFile { path, .. }
-                | Action::PreviewOpen(path)
-                | Action::SaveAs { path, .. } => *path = argument,
-                Action::WriteFile { name, .. }
-                | Action::Split { file: name, .. }
-                | Action::TabNew(name)
-                | Action::Source { file: name, .. } => *name = Some(argument),
-                Action::Close(_) => {} // :xit may close an unchanged buffer without writing.
-                _ => return Action::None,
-            }
-            action
+        self.with_ex_window_modifiers(modifiers, |workspace| {
+            let edit = workspace
+                .projects
+                .active_mut()
+                .editor
+                .edit(|vim, register| {
+                    let mut action = vim.execute_ex_line(&probe, register);
+                    match &mut action {
+                        Action::Files(command) => command.arguments = argument,
+                        Action::Open(_) => {
+                            action = Action::Files(FileCommand {
+                                operation: FileOperation::Edit,
+                                count: None,
+                                force: head.ends_with('!'),
+                                arguments: argument,
+                            })
+                        }
+                        Action::ReadFile { path, .. }
+                        | Action::PreviewOpen(path)
+                        | Action::SaveAs { path, .. } => *path = argument,
+                        Action::WriteFile { name, .. }
+                        | Action::Split { file: name, .. }
+                        | Action::TabNew(name)
+                        | Action::Source { file: name, .. } => *name = Some(argument),
+                        Action::Close(_) => {} // :xit may close an unchanged buffer without writing.
+                        _ => return Action::None,
+                    }
+                    action
+                });
+            workspace.dispatch_window_modified_edit(edit, window, cx);
         });
-        self.dispatch_window_modified_edit(edit, window, cx);
-        self.active_ex_window_modifiers = previous;
         if self
             .projects
             .active_project()

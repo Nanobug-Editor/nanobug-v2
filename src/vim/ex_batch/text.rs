@@ -2,7 +2,9 @@
 
 use super::{abbreviated, pattern};
 use crate::{
-    document::display_width_with_tabstop,
+    document::{
+        MarkModifiers, current_mark_modifiers, display_width_with_tabstop, with_mark_modifiers,
+    },
     i18n,
     vim::{Action, Mode, Register, ScreenMotionResolver, Vim, options::MAX_COLUMNS},
 };
@@ -20,6 +22,8 @@ pub(in crate::vim) struct LineInput {
     lines: Vec<String>,
     /// Carry horizontal indentation into each new interactive prompt line.
     autoindent: bool,
+    /// Restore Ex mark behavior when the final period commits the edit.
+    marks: MarkModifiers,
 }
 
 impl Vim {
@@ -156,6 +160,7 @@ impl Vim {
                     replace: name.starts_with('c').then_some(rows),
                     lines: Vec::new(),
                     autoindent,
+                    marks: current_mark_modifiers(),
                 });
                 self.mode = Mode::Command;
                 self.prompt = ':';
@@ -225,6 +230,11 @@ impl Vim {
         let Some(input) = self.ex_line_input.take() else {
             return;
         };
+        with_mark_modifiers(input.marks, || self.apply_ex_input(input));
+    }
+
+    /// Apply validated prompt text under the modifiers captured when collecting it.
+    fn apply_ex_input(&mut self, input: LineInput) {
         self.mode = Mode::Normal;
         self.command.clear();
         self.command_pos = 0;

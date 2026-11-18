@@ -1,9 +1,8 @@
 //! Keep the cursor history of one Vim window, including positions in other buffers.
 
 use super::{Action, Vim};
-use crate::document::Document;
+use crate::document::{Document, MarkEdit, current_mark_modifiers};
 use std::{
-    ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -121,7 +120,11 @@ impl JumpHistory {
         let mut history = self.0.lock().unwrap();
         let mut tail = None;
         let mut from = history.index;
-        if !forward && from == history.locations.len() && from != 0 {
+        if !forward
+            && from == history.locations.len()
+            && from != 0
+            && !current_mark_modifiers().keep_jumps
+        {
             // Save the caret at the first backwards step so forward navigation can return here.
             let mut with_tail = history.clone();
             with_tail.push(JumpLocation::at(doc));
@@ -156,17 +159,13 @@ impl JumpHistory {
         Ok(None)
     }
 
-    /// Rebase retained positions after `doc` replaces its old `range` with `inserted` bytes.
-    pub(super) fn shift(&self, doc: &Document, range: Range<usize>, inserted: usize) {
+    /// Rebase retained positions after a replacement, applying the command's mark rules.
+    pub(super) fn shift(&self, doc: &Document, edit: &MarkEdit) {
         for entry in &mut self.0.lock().unwrap().locations {
             if entry.opening != doc.opening || entry.revision.checked_add(1) != Some(doc.revision) {
                 continue;
             }
-            if entry.offset >= range.end {
-                entry.offset = entry.offset - range.len() + inserted;
-            } else if entry.offset >= range.start {
-                entry.offset = range.start;
-            }
+            entry.offset = edit.retained_position(doc, entry.offset);
             entry.line = doc.location(entry.offset);
             entry.revision = doc.revision;
         }
@@ -224,6 +223,9 @@ impl Vim {
 
     /// Record the active cursor before a confirmed jump, and update the previous-context marks.
     pub fn record_jump(&mut self) {
+        if current_mark_modifiers().keep_jumps {
+            return;
+        }
         self.marks.insert('\'', self.doc.cursor);
         self.marks.insert('`', self.doc.cursor);
         self.jump_history

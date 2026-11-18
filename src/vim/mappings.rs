@@ -1,8 +1,10 @@
 //! User-defined modal key maps, language maps and text abbreviations.
 
 mod config;
+mod ex_verbose;
 mod terminal;
 
+pub use ex_verbose::{ExOrigin, ExOriginScope};
 pub use terminal::TerminalStroke;
 
 use super::{
@@ -107,6 +109,8 @@ struct Rule {
     replacement: String,
     /// Definition text and its original leader, available for editable mappings.
     source: Option<RuleSource>,
+    /// Source location displayed by :verbose map or :verbose abbreviate.
+    defined_at: Option<ExOrigin>,
     /// Allow key maps while treating the right side as typed keys.
     recursive: bool,
     /// Defer replacing the right side with the result of an expression.
@@ -159,6 +163,7 @@ impl LoadedKeymap {
                 Rule {
                     replacement,
                     source: None,
+                    defined_at: None,
                     recursive: true,
                     expression: false,
                     restore_select: false,
@@ -202,10 +207,24 @@ struct Definitions {
     keymap: LoadedKeymap,
     /// Common options shared by the editors in a workspace.
     options: VimOptions,
+    /// Verbosity overrides and the origin of temporarily executing commands.
+    verbose: ex_verbose::State,
+    /// Names and styles used by Ex and retained editor rendering.
+    highlights: super::ex_highlight::Highlights,
+    /// Sign types available to every buffer, with styles retained by old placements.
+    signs: super::signs::SignDefinitions,
     /// Mappings declared without `<buffer>`.
     tables: MappingTables,
     /// Recent Ex messages shared by all editor windows in the workspace.
-    messages: VecDeque<String>,
+    messages: VecDeque<super::ExMessageOutput>,
+    /// Highlight group used for the workspace's next echo operation.
+    echo_highlight: Option<String>,
+    /// Current Ex redirection, independent of the active editor.
+    ex_redirection: Option<super::ex_redirect::Redirection>,
+    /// Ex output already recorded by commands that emit more than one message.
+    ex_output_sequence: u64,
+    /// Finished clipboard redirection awaiting transfer by the workspace.
+    redirected_clipboard: Option<String>,
     /// Overrides inherited by script commands dispatched inside a temporary Ex modifier.
     ex_message_modes: Vec<super::MessageModifier>,
     /// Latest Ex error text exposed through v:errmsg, including silent failures.
@@ -232,6 +251,134 @@ struct MappingTables {
 }
 
 impl InputMappings {
+    /// Define or update a workspace sign type using the supplied fields.
+    pub fn define_sign(
+        &self,
+        name: &str,
+        update: super::SignDefinitionUpdate,
+    ) -> Result<(), String> {
+        self.0.write().unwrap().signs.define(name, update)
+    }
+
+    /// Get the current sign type, resolving a padded numeric name to the same definition.
+    pub fn sign_definition(&self, name: &str) -> Option<super::SignDefinition> {
+        self.0.read().unwrap().signs.get(name, false)
+    }
+
+    /// Resolve sign styles created earlier, including the style of a retired type.
+    pub fn sign_render_definition(&self, name: &str) -> Option<super::SignDefinition> {
+        self.0.read().unwrap().signs.get(name, true)
+    }
+
+    /// Return the current sign types in stable order for listing or completion.
+    pub fn sign_definitions(&self) -> Vec<super::SignDefinition> {
+        self.0.read().unwrap().signs.list()
+    }
+
+    /// Undefine a sign type, or all types when `name` is absent.
+    /// Return false if a supplied name did not name an existing definition.
+    pub fn undefine_sign(&self, name: Option<&str>) -> bool {
+        self.0.write().unwrap().signs.undefine(name)
+    }
+
+    /// Refresh the default groups from the current native palette.
+    pub fn set_highlight_palette(
+        &self,
+        palette: impl IntoIterator<Item = (&'static str, super::HighlightStyle)>,
+    ) {
+        self.0.write().unwrap().highlights.set_palette(palette);
+    }
+
+    /// Resolve a known highlight group, following palette colors and Ex links.
+    pub fn highlight_style(&self, group: &str) -> Option<super::HighlightStyle> {
+        self.0.read().unwrap().highlights.style(group, false)
+    }
+
+    /// Return an explicitly configured group style to overlay on a native theme role.
+    pub fn highlight_override(&self, group: &str) -> Option<super::HighlightStyle> {
+        self.0.read().unwrap().highlights.style(group, true)
+    }
+
+    /// Complete names matching a case-insensitive prefix.
+    pub fn highlight_groups(&self, prefix: &str) -> Vec<String> {
+        self.0.read().unwrap().highlights.names(prefix)
+    }
+
+    /// Apply one operation with the current Ex source and verbosity, without nesting registry locks.
+    pub(super) fn apply_highlight(
+        &self,
+        command: super::ex_highlight::HighlightCommand,
+    ) -> Result<Option<super::ExMessageOutput>, String> {
+        let origin = self.current_ex_origin();
+        let verbose = self.ex_verbose() > 0;
+        self.0
+            .write()
+            .unwrap()
+            .highlights
+            .apply(command, origin, verbose)
+    }
+
+    /// Start capturing subsequent Ex messages into an open destination.
+    pub(super) fn start_redirection(&self, target: super::ex_redirect::Redirection) {
+        self.0.write().unwrap().ex_redirection = Some(target);
+    }
+
+    /// Close a destination and transfer collected output for finalization.
+    pub(super) fn take_redirection(&self) -> Option<super::ex_redirect::Redirection> {
+        self.0.write().unwrap().ex_redirection.take()
+    }
+
+    /// Start capturing to a file using the workspace-resolved path.
+    pub fn begin_redirect_file(
+        &self,
+        path: &std::path::Path,
+        mode: super::RedirectMode,
+    ) -> std::io::Result<()> {
+        self.start_redirection(super::ex_redirect::Redirection::file(path, mode)?);
+        Ok(())
+    }
+
+    /// A clipboard append starts with the host's current clipboard contents.
+    pub fn begin_redirect_clipboard(&self, existing: String) {
+        self.start_redirection(super::ex_redirect::Redirection::Clipboard(existing));
+    }
+
+    /// Transfer a completed capture to the native clipboard on the next editor action.
+    pub(super) fn finish_redirect_clipboard(&self, text: String) {
+        self.0.write().unwrap().redirected_clipboard = Some(text);
+    }
+
+    /// Drain text written to the clipboard by a completed Ex redirection.
+    pub fn take_redirected_clipboard(&self) -> Option<String> {
+        self.0.write().unwrap().redirected_clipboard.take()
+    }
+
+    /// Send output to the active redirection without feeding message history or verbose logging.
+    pub fn redirect_ex_output(&self, text: &str, newline: bool) {
+        if let Some(target) = self.0.write().unwrap().ex_redirection.as_mut() {
+            target.write(text, newline);
+        }
+    }
+
+    /// Send a rendered Ex message to active redirection and verbose output independently of display.
+    pub fn record_ex_output(&self, text: &str, newline: bool) {
+        self.redirect_ex_output(text, newline);
+        self.append_ex_verbosefile(text, newline);
+        let mut global = self.0.write().unwrap();
+        global.ex_output_sequence = global.ex_output_sequence.wrapping_add(1);
+    }
+
+    /// Detect whether a nested command already emitted its own output.
+    pub(super) fn ex_output_sequence(&self) -> u64 {
+        self.0.read().unwrap().ex_output_sequence
+    }
+
+    /// Whether a locally interpreted listing has a destination without a native view.
+    pub(super) fn capturing_ex_output(&self) -> bool {
+        let global = self.0.read().unwrap();
+        global.ex_redirection.is_some() || !global.options.verbosefile.is_empty()
+    }
+
     /// Remember `source` and `result` so :spellrepall can repeat the replacement in any window.
     pub(super) fn set_spelling_replacement(&self, source: String, result: String) {
         self.0.write().unwrap().spelling_replacement = Some((source, result));
@@ -249,7 +396,15 @@ impl InputMappings {
 
     /// Keep one nonempty Ex message for subsequent `:messages` queries.
     pub fn remember_ex_message(&self, message: &str) {
-        if message.is_empty() {
+        self.remember_styled_ex_message(super::ExMessageOutput {
+            text: message.into(),
+            spans: Vec::new(),
+        });
+    }
+
+    /// Keep the styles on a history entry after :echohl changes the active group.
+    pub(super) fn remember_styled_ex_message(&self, output: super::ExMessageOutput) {
+        if output.text.is_empty() {
             return;
         }
         let mut global = self.0.write().unwrap();
@@ -265,7 +420,21 @@ impl InputMappings {
         if global.messages.len() == 500 {
             global.messages.pop_front();
         }
-        global.messages.push_back(message.to_owned());
+        global.messages.push_back(output);
+    }
+
+    /// Select an existing group, with None or an unknown group restoring ordinary messages.
+    pub(super) fn set_echo_highlight(&self, group: &str) {
+        let selected = (!group.eq_ignore_ascii_case("None")
+            && self.highlight_style(group).is_some())
+        .then(|| group.to_owned());
+        self.0.write().unwrap().echo_highlight = selected;
+    }
+
+    /// Resolve the currently selected group when its next message is written.
+    pub(super) fn echo_highlight(&self) -> Option<super::HighlightStyle> {
+        let group = self.0.read().unwrap().echo_highlight.clone()?;
+        self.highlight_style(&group)
     }
 
     /// Push a scoped output policy before executing its nested command.
@@ -305,6 +474,20 @@ impl InputMappings {
             .fold(text.to_owned(), |text, mode| mode.filter_text(&text))
     }
 
+    /// Run filters on message text and keep the matching ranges' original styles.
+    pub fn filter_styled_ex_output(
+        &self,
+        output: super::ExMessageOutput,
+    ) -> super::ExMessageOutput {
+        self.0
+            .read()
+            .unwrap()
+            .ex_message_modes
+            .iter()
+            .rev()
+            .fold(output, |output, mode| mode.filter_styled_output(output))
+    }
+
     /// Retain the latest error for a Vim expression after an ignored command failure.
     pub fn remember_ex_error(&self, error: &str) {
         self.0.write().unwrap().ex_error = error.into();
@@ -316,22 +499,23 @@ impl InputMappings {
     }
 
     /// List the last `count` messages, or clear the history while keeping that many messages.
-    pub(super) fn ex_messages(&self, count: Option<usize>, clear: bool) -> String {
+    pub(super) fn ex_messages(&self, count: Option<usize>, clear: bool) -> super::ExMessageOutput {
         if clear {
             let mut global = self.0.write().unwrap();
             let drop = global.messages.len().saturating_sub(count.unwrap_or(0));
             global.messages.drain(..drop);
-            return String::new();
+            return super::ExMessageOutput::default();
         }
         let global = self.0.read().unwrap();
         let skip = count.map_or(0, |count| global.messages.len().saturating_sub(count));
-        global
-            .messages
-            .iter()
-            .skip(skip)
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join("\n")
+        let mut output = super::ExMessageOutput::default();
+        for record in global.messages.iter().skip(skip) {
+            if !output.text.is_empty() {
+                output.text.push('\n');
+            }
+            output.append_range(record, 0..record.text.len());
+        }
+        output
     }
 
     /// Inspect runtime digraphs while leaving insert input state in its buffer.
@@ -563,7 +747,7 @@ impl Vim {
                 let keymap = LoadedKeymap::from_table(self.completion_directory(), name, table);
                 self.input_maps.keymap = Some(keymap);
                 self.input_maps.clear_prefix();
-                self.message.clear();
+                self.clear_ex_message();
                 self.ex_failed = false;
                 true
             }
@@ -800,6 +984,7 @@ impl Vim {
             return true;
         }
 
+        let defined_at = register.input_maps.current_ex_origin();
         let mut shared;
         let mut scoped;
         let definitions = if local {
@@ -847,6 +1032,7 @@ impl Vim {
                                 lhs: left.to_owned(),
                                 leader: leader.clone(),
                             }),
+                            defined_at: defined_at.clone(),
                             recursive,
                             expression,
                             restore_select: matches!(
@@ -872,6 +1058,7 @@ impl Vim {
         register: &Register,
     ) {
         let mut output = Vec::new();
+        let verbose = register.input_maps.ex_verbose() > 0;
         let mut append = |table: &BTreeMap<Vec<String>, Rule>, scope| {
             for (keys, rule) in table {
                 let matches = if mode.abbreviations() {
@@ -885,7 +1072,11 @@ impl Vim {
                     } else {
                         display_mapping_keys(keys)
                     };
-                    output.push(format!("{lhs}  {scope}{}", rule.replacement));
+                    let mut entry = format!("{lhs}  {scope}{}", rule.replacement);
+                    if verbose && let Some(origin) = &rule.defined_at {
+                        origin.append_inline(&mut entry);
+                    }
+                    output.push(entry);
                 }
             }
         };
@@ -1308,6 +1499,7 @@ impl Vim {
         let rule = Rule {
             replacement,
             source: None,
+            defined_at: None,
             recursive,
             expression: false,
             restore_select,

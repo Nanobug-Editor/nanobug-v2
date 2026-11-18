@@ -39,11 +39,26 @@ impl Workspace {
             ));
             return;
         }
-        let prior = std::mem::replace(&mut self.active_ex_window_modifiers, merged);
-        if !self.active_ex_window_modifiers.browse || !self.browse_ex_command(command, window, cx) {
-            self.run_window_modified_command(command, window, cx);
-        }
+        self.with_ex_window_modifiers(merged, |workspace| {
+            if !workspace.active_ex_window_modifiers.browse
+                || !workspace.browse_ex_command(command, window, cx)
+            {
+                workspace.run_window_modified_command(command, window, cx);
+            }
+        });
+    }
+
+    /// Pair the native window context with the Vim state used by synchronous dispatch.
+    pub(super) fn with_ex_window_modifiers<T>(
+        &mut self,
+        modifiers: WindowModifiers,
+        run: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let mappings = self.input_mappings.clone();
+        let prior = std::mem::replace(&mut self.active_ex_window_modifiers, modifiers.clone());
+        let result = modifiers.with_ex_state(&mappings, || run(self));
         self.active_ex_window_modifiers = prior;
+        result
     }
 
     /// Resolve the current modifier's insertion point when a command requests a new window.

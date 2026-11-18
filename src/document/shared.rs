@@ -1,6 +1,6 @@
 //! Shared buffer storage, with an independent position in each view.
 
-use super::{Document, DocumentContent, anchor::Anchors, next_opening};
+use super::{Document, DocumentContent, anchor::Anchors, next_opening, signs::Signs};
 use std::{
     ops::{Deref, DerefMut},
     path::PathBuf,
@@ -13,6 +13,8 @@ pub(super) struct BufferDocument {
     number: u64,
     /// Zero or more tracked file positions shared by the buffer's views.
     pub(super) anchors: Anchors,
+    /// Placed line signs shared by each view with this buffer identity.
+    pub(super) signs: Signs,
     /// Own the contents once another view can outlive the view that published them.
     latest: Mutex<Option<Arc<DocumentContent>>>,
 }
@@ -23,6 +25,7 @@ impl BufferDocument {
         Self {
             number: opening,
             anchors: Anchors::default(),
+            signs: Signs::default(),
             latest: Mutex::new(None),
         }
     }
@@ -71,7 +74,9 @@ impl Document {
     pub fn detach_buffer(&mut self) {
         self.refresh_shared();
         if Arc::strong_count(&self.shared) > 1 {
-            self.shared = Arc::new(BufferDocument::new(next_opening()));
+            let detached = BufferDocument::new(next_opening());
+            detached.signs.copy_from(&self.shared.signs);
+            self.shared = Arc::new(detached);
         }
     }
 
@@ -83,17 +88,20 @@ impl Document {
         }
         let saved = self.saved.clone();
         let replacement = self.anchor_replacement(&saved);
+        let signs = self.sign_replacement(&saved);
         self.restore_folds(&saved);
         let content = Arc::make_mut(&mut self.content);
         content.text = (*saved).clone();
         content.history = Default::default();
         content.last_replacement = None;
         content.revision += 1;
+        content.saved_revision = Some(content.revision);
         self.reindex();
         self.cursor = self.text.floor_char_boundary(self.cursor);
-        if let Some((range, inserted)) = replacement {
-            self.shift_anchors(&range, inserted);
+        if let Some(marks) = replacement {
+            self.shift_anchors(&marks);
         }
+        self.shift_signs(signs);
         self.publish_content();
         true
     }
@@ -126,7 +134,7 @@ impl Document {
             return false;
         }
         let changed = self.revision != latest.revision;
-        if changed {
+        if changed && !latest.metadata_revised_since(self.revision) {
             if let Some((range, inserted)) = latest
                 .last_replacement
                 .as_ref()
@@ -151,6 +159,14 @@ impl Document {
             .text
             .floor_char_boundary(self.cursor.min(self.text.len()));
         changed
+    }
+}
+
+impl DocumentContent {
+    /// Check the newest published state before the receiving view has adopted it.
+    pub(super) fn metadata_revised_since(&self, before: u64) -> bool {
+        self.metadata_revisions
+            .is_some_and(|(from, end)| end == self.revision && (from..end).contains(&before))
     }
 }
 

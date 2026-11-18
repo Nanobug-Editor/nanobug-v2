@@ -8,6 +8,108 @@ fn editor(text: &str) -> (Vim, Register) {
     (Vim::new(Document::new(text)), Register::default())
 }
 
+/// Lock mark coordinates, but still adjust the previous-context mark when a line is deleted.
+#[test]
+fn ex_mark_modifiers_lock_named_marks_and_leave_context_mobile() {
+    let (mut vim, mut registers) = editor("head\n  beta\n gamma\n");
+    vim.set_cursor(vim.doc.starts[1] + 2);
+    vim.set_command_mark('a', &mut registers);
+    vim.set_command_mark('A', &mut registers);
+    vim.record_jump();
+    vim.set_operated_range(vim.doc.cursor..vim.doc.cursor + 1);
+
+    vim.execute_ex_line("lockmarks 1delete", &mut registers);
+    assert_eq!(vim.doc.text, "  beta\n gamma\n");
+    let locked = vim.doc.starts[1] + 2;
+    assert_eq!(vim.marks[&'a'], locked);
+    assert_eq!(vim.marks[&'\''], 2);
+    assert_eq!(vim.operated, Some(locked..locked + 1));
+    assert_eq!(
+        registers.file_marks.get('A').unwrap().offset_in(&vim.doc),
+        Some(locked)
+    );
+    vim.key("Ctrl+o", &mut registers);
+    assert_eq!(vim.doc.cursor, locked);
+
+    vim.execute_ex_line("1delete", &mut registers);
+    assert_eq!(vim.marks[&'a'], 2);
+    assert_eq!(
+        registers.file_marks.get('A').unwrap().offset_in(&vim.doc),
+        Some(2)
+    );
+}
+
+/// A filtered range retains marks on surviving output rows and rebases marks below the range.
+#[test]
+fn ex_mark_modifiers_keep_filter_marks_by_original_row() {
+    use crate::document::{MarkModifiers, with_mark_modifiers};
+
+    let (mut vim, mut registers) = editor("head\n east\n west\n tail\n");
+    for (row, local, global) in [(1, 'a', 'A'), (2, 'b', 'B'), (3, 'c', 'C')] {
+        vim.set_cursor(vim.doc.starts[row] + 1);
+        vim.set_command_mark(local, &mut registers);
+        vim.set_command_mark(global, &mut registers);
+    }
+    let range = vim.line_span(1, 2);
+    with_mark_modifiers(
+        MarkModifiers {
+            keep_marks: true,
+            ..MarkModifiers::default()
+        },
+        || vim.apply_filter(range, " north\n"),
+    );
+
+    assert_eq!(vim.doc.text, "head\n north\n tail\n");
+    assert_eq!(vim.marks[&'a'], vim.doc.starts[1] + 1);
+    assert_eq!(vim.marks[&'c'], vim.doc.starts[2] + 1);
+    assert!(!vim.marks.contains_key(&'b'));
+    assert_eq!(
+        registers.file_marks.get('B').unwrap().offset_in(&vim.doc),
+        Some(vim.doc.starts[1] + 1),
+    );
+    assert_eq!(
+        registers.file_marks.get('A').unwrap().offset_in(&vim.doc),
+        Some(vim.doc.starts[1] + 1),
+    );
+    assert_eq!(
+        registers.file_marks.get('C').unwrap().offset_in(&vim.doc),
+        Some(vim.doc.starts[2] + 1),
+    );
+}
+
+/// keepjumps protects jump and edit history across prompt dispatch and later confirmations.
+#[test]
+fn ex_mark_modifiers_keepjumps_through_prompts_and_edits() {
+    let (mut vim, mut registers) = editor("first\ntarget\nthird\nfourth\n");
+    vim.text("A!", &mut registers);
+    vim.key("Escape", &mut registers);
+    let last_change = vim.g.last_change();
+    let last_insert = vim.g.insertion;
+    vim.set_cursor(1);
+    vim.record_jump();
+    vim.set_cursor(vim.doc.starts[1]);
+    let before = vim.jump_history.list(&vim.doc);
+    vim.execute_ex_line("keepjumps normal! G", &mut registers);
+    assert_eq!(vim.doc.location(vim.doc.cursor).0, 3);
+    assert_eq!(vim.jump_history.list(&vim.doc), before);
+    assert_eq!(vim.marks[&'\''], 1);
+
+    vim.key(":", &mut registers);
+    vim.text("keepjumps 2delete", &mut registers);
+    vim.key("Enter", &mut registers);
+    assert_eq!(vim.doc.text, "first!\nthird\nfourth\n");
+    assert_eq!(vim.g.last_change(), last_change);
+
+    vim.execute_ex_line("keepjumps 2s/third/THIRD/c", &mut registers);
+    assert!(vim.substitute_confirmation_active());
+    vim.key("y", &mut registers);
+    assert_eq!(vim.doc.text, "first!\nTHIRD\nfourth\n");
+    assert_eq!(vim.g.last_change(), last_change);
+    assert_eq!(vim.g.insertion, last_insert);
+    vim.text("x", &mut registers);
+    assert_ne!(vim.g.last_change(), last_change);
+}
+
 /// Counted finds, repeats and operator motions consume one committed Unicode grapheme.
 #[test]
 fn native_literal_find_preserves_counts_operators_and_normal_keys() {

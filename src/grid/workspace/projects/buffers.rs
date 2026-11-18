@@ -4,7 +4,7 @@ use super::{EditorWindow, PaneId, Project};
 use crate::grid::windows::{editor::Buffer, terminal::Terminal};
 use nanobug::document::Document;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -86,6 +86,31 @@ impl Project {
         self.detached_buffers
             .get(&number)
             .is_none_or(|entry| entry.loaded)
+    }
+
+    /// Apply `:noswapfile` only to editable buffers first materialized after `before` was collected.
+    pub(in crate::grid::workspace) fn disable_swap_for_new_buffers(
+        &mut self,
+        before: &HashSet<u64>,
+    ) {
+        for editor in std::iter::once(&mut self.editor).chain(self.inactive_editors.values_mut()) {
+            for index in 0..editor.buffers().len() {
+                let buffer = &editor.buffers()[index];
+                if buffer.supports_shared_view()
+                    && !before.contains(&buffer.vim.doc.buffer_number())
+                {
+                    editor.edit_buffer(index, |vim, _| {
+                        vim.disable_swapfile();
+                        nanobug::vim::Action::None
+                    });
+                }
+            }
+        }
+        for (id, entry) in &mut self.detached_buffers {
+            if entry.loaded && !before.contains(id) {
+                entry.view.vim.disable_swapfile();
+            }
+        }
     }
 
     /// Visit retained text for close and write-all, including buffers without any label.

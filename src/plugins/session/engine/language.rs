@@ -189,6 +189,7 @@ impl Engine {
             .as_deref()
             .or(document.path.as_deref())
             .context("Open a file to format it")?;
+        let filetype = self.document_filetype(key.instance.project, document.opening);
         ensure!(
             pending.kind == CallKind::Format
                 && pending.reply.is_some()
@@ -197,7 +198,7 @@ impl Engine {
                     || Path::extension(path).is_some_and(|ext| ext.eq_ignore_ascii_case("rs")))
                 && self.lifecycle.wanted.get(key).is_some_and(|module| {
                     module.provides.contains(&Provider::Format)
-                        && module.accepts_document(Some(path))
+                        && module.accepts_filetype(Some(path), filetype)
                 }),
             "The formatter requires an active request for a supported file"
         );
@@ -302,7 +303,10 @@ impl Engine {
             return;
         };
         if (doc.opening, doc.revision) != version
-            || !self.lifecycle.wanted[key].accepts_document(doc.path.as_deref())
+            || !self.lifecycle.wanted[key].accepts_filetype(
+                doc.path.as_deref(),
+                self.document_filetype(key.instance.project, doc.opening),
+            )
         {
             return;
         }
@@ -350,6 +354,7 @@ impl Engine {
     /// Remove contributions as soon as their authorization, module or document version changes.
     pub(super) fn retain_presentations(&mut self) {
         let before = self.view.document_presentations.len();
+        let filetypes = &self.document_filetypes;
         self.view
             .document_presentations
             .retain(|key, presentation| {
@@ -378,7 +383,12 @@ impl Engine {
                         .and_then(|project| project.document.as_ref())
                         .is_some_and(|doc| {
                             (doc.opening, doc.revision) == presentation.version
-                                && self.lifecycle.wanted[key].accepts_document(doc.path.as_deref())
+                                && self.lifecycle.wanted[key].accepts_filetype(
+                                    doc.path.as_deref(),
+                                    filetypes
+                                        .get(&(key.instance.project, doc.opening))
+                                        .map(String::as_str),
+                                )
                         })
             });
         self.changed |= self.view.document_presentations.len() != before;

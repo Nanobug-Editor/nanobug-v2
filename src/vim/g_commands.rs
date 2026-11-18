@@ -117,7 +117,7 @@ pub(super) struct State {
     changes: Vec<usize>,
     change_index: usize,
     /// Last command feedback available to g<.
-    previous_message: String,
+    previous_message: super::ExMessageOutput,
     /// Whether a Visual-shaped selection accepts replacement text.
     pub(super) select: bool,
     /// Whether the Ex prompt should remain open after each command.
@@ -192,23 +192,19 @@ impl State {
         self.visual = Some((mode, anchor, caret));
     }
 
-    /// Adjust retained positions around the old byte `range` replaced by `bytes`.
-    pub(super) fn shift_positions(&mut self, range: &Range<usize>, bytes: usize) {
-        let adjust = |at: &mut usize| {
-            if *at >= range.end {
-                *at = *at - range.len() + bytes;
-            } else if *at >= range.start {
-                *at = range.start;
-            }
-        };
-        self.changes.iter_mut().for_each(adjust);
-        if let Some(at) = &mut self.insertion {
-            adjust(at);
+    /// Rebase the insertion, change and Visual marks while preserving history order.
+    pub(super) fn map_positions(
+        &mut self,
+        map_mark: impl Fn(usize) -> Option<usize>,
+        map_retained: impl Fn(usize) -> usize,
+    ) {
+        for position in &mut self.changes {
+            *position = map_retained(*position);
         }
-        if let Some((_, anchor, cursor)) = &mut self.visual {
-            adjust(anchor);
-            adjust(cursor);
-        }
+        self.insertion = self.insertion.and_then(map_mark);
+        self.visual = self
+            .visual
+            .map(|(mode, anchor, cursor)| (mode, map_retained(anchor), map_retained(cursor)));
     }
 }
 
@@ -273,8 +269,10 @@ impl Vim {
     /// Retain the most recent nonempty `message` emitted by a native editor action for g<.
     pub fn remember_host_message(&mut self, message: &str) {
         if !message.is_empty() {
-            self.g.previous_message.clear();
-            self.g.previous_message.push_str(message);
+            self.g.previous_message = super::ExMessageOutput {
+                text: message.to_owned(),
+                spans: Vec::new(),
+            };
         }
     }
 
@@ -401,7 +399,7 @@ impl Vim {
             "a" | "8" => self.character_info(key == "8"),
             "Ctrl+g" => self.file_statistics(),
             "s" => return Some(Action::Sleep(n as u64)),
-            "<" => self.message.clone_from(&self.g.previous_message),
+            "<" => self.publish_styled_ex_message(self.g.previous_message.clone()),
             "f" => return Some(self.file_at_cursor(count)),
             "F" => {
                 return Some(match self.path_under_cursor(true) {
@@ -920,7 +918,11 @@ impl Vim {
         }
         self.g.select &= self.mode.is_visual();
         self.g.ex_mode &= self.mode == Mode::Command;
-        if record_change && revision != self.doc.revision {
+        if record_change
+            && revision != self.doc.revision
+            && self.preserved_change_revision != Some(self.doc.revision)
+            && !super::current_mark_modifiers().keep_jumps
+        {
             self.ex_hidden_marks.remove(&'.');
             let changes = &mut self.g.changes;
             let boundary = |byte: usize| {
@@ -940,7 +942,7 @@ impl Vim {
             self.g.change_index = changes.len();
         }
         if !self.message.is_empty() {
-            self.g.previous_message.clone_from(&self.message);
+            self.g.previous_message = self.displayed_ex_message();
         }
     }
 

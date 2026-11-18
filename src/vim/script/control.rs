@@ -3,7 +3,7 @@
 mod variables;
 
 use super::{call_parts, split_fields, split_word, statements};
-use crate::vim::{Register, Vim, expression::Value, pattern};
+use crate::vim::{ExOrigin, Register, Vim, expression::Value, pattern};
 use regex::Regex;
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -14,6 +14,7 @@ pub use variables::ScriptTabScope;
 pub(super) use variables::{Variables, WindowVariables};
 
 /// A physical source line or one statement from its Ex pipeline.
+#[derive(Clone)]
 pub struct ScriptLine {
     pub number: usize,
     pub text: String,
@@ -86,20 +87,12 @@ impl ScriptProgram {
     }
 
     /// Start a function frame with its own locals and read-only arguments.
-    pub(super) fn function<'a>(
-        lines: impl IntoIterator<Item = &'a str>,
+    pub(super) fn function(
+        lines: impl IntoIterator<Item = ScriptLine>,
         arguments: BTreeMap<String, Value>,
         source: Option<String>,
     ) -> Result<Self, Failure> {
-        let input = lines
-            .into_iter()
-            .enumerate()
-            .map(|(index, text)| ScriptLine {
-                number: index + 1,
-                text: text.into(),
-                literal: false,
-            })
-            .collect();
+        let input = lines.into_iter().collect();
         Self::parse(input, source, Some(arguments), false)
     }
 
@@ -144,6 +137,11 @@ impl ScriptProgram {
         self.source.clone()
     }
 
+    /// Resolve a statement's location in the original source file.
+    pub fn ex_origin(&self, line: usize) -> Option<ExOrigin> {
+        self.source.as_deref().map(|path| ExOrigin::new(path, line))
+    }
+
     /// Advance to the next ordinary Ex line. A previous host failure can enter a catch block.
     pub fn next(
         &mut self,
@@ -152,7 +150,7 @@ impl ScriptProgram {
         failure: Option<String>,
     ) -> Result<Option<Arc<ScriptLine>>, Failure> {
         if let Some(message) = failure {
-            self.unwind(Flow::Error((self.last_line, message)))?;
+            self.unwind(Flow::Error((self.last_line, message)), register)?;
         }
         while let Some(frame) = self.frames.pop() {
             self.steps += 1;
@@ -176,10 +174,22 @@ impl ScriptProgram {
                         | Instruction::For(number, ..) => *number,
                     };
                     self.last_line = number;
-                    match self.step(vim, register, instruction) {
+                    let statement = match &instruction {
+                        Instruction::Line(line) => Some(line.clone()),
+                        _ => None,
+                    };
+                    let result = self.step(vim, register, instruction);
+                    if let Some(line) = statement
+                        && !matches!(result, Ok(Some(_)))
+                    {
+                        register
+                            .input_maps
+                            .trace_ex_line_from(&line.text, self.ex_origin(line.number).as_ref());
+                    }
+                    match result {
                         Ok(Some(line)) => return Ok(Some(line)),
                         Ok(None) => {}
-                        Err(error) => self.unwind(Flow::Error((number, error)))?,
+                        Err(error) => self.unwind(Flow::Error((number, error)), register)?,
                     }
                 }
                 Frame::While(number, condition, body) => {
@@ -191,14 +201,14 @@ impl ScriptProgram {
                             self.frames.push(Frame::Block(body, 0));
                         }
                         Ok(false) => {}
-                        Err(error) => self.unwind(Flow::Error((number, error)))?,
+                        Err(error) => self.unwind(Flow::Error((number, error)), register)?,
                     }
                 }
                 Frame::For(number, variables, mut values, body) => {
                     self.last_line = number;
                     if let Some(value) = values.pop_front() {
                         if let Err(error) = self.assign_for(vim, register, &variables, value) {
-                            self.unwind(Flow::Error((number, error)))?;
+                            self.unwind(Flow::Error((number, error)), register)?;
                         } else {
                             self.frames
                                 .push(Frame::For(number, variables, values, body.clone()));
@@ -206,14 +216,14 @@ impl ScriptProgram {
                         }
                     }
                 }
-                Frame::Try(protected, Phase::Body) => self.enter_finally(protected, None),
+                Frame::Try(protected, Phase::Body) => self.enter_finally(protected, None, register),
                 Frame::Try(protected, Phase::Catch(prior)) => {
                     self.restore_exception(prior);
-                    self.enter_finally(protected, None);
+                    self.enter_finally(protected, None, register);
                 }
                 Frame::Try(_, Phase::Finally(flow)) => {
                     if let Some(flow) = flow {
-                        self.unwind(flow)?;
+                        self.unwind(flow, register)?;
                     }
                 }
             }
@@ -269,6 +279,24 @@ impl ScriptProgram {
                     return Ok(Some(line));
                 }
                 let (word, arguments) = split_word(&line.text);
+                if !super::defining_function(register)
+                    && let Some(redirect) = crate::vim::ex_redirect::parse(&line.text)
+                {
+                    use crate::vim::ex_redirect::RedirectCommand;
+                    self.finish_redirection(vim, register)?;
+                    match redirect? {
+                        command @ (RedirectCommand::Variable(..)
+                        | RedirectCommand::End
+                        | RedirectCommand::Register(
+                            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '"',
+                            _,
+                        )) => {
+                            self.start_redirection(vim, register, command)?;
+                            return Ok(None);
+                        }
+                        _ => return Ok(Some(line)),
+                    }
+                }
                 let flow = match word {
                     "break" | "brea" => Flow::Break(line.number),
                     "continue" | "con" => Flow::Continue(line.number),
@@ -313,14 +341,21 @@ impl ScriptProgram {
                 {
                     return Err(format!("Unexpected argument to :{word}"));
                 }
-                self.unwind(flow).map_err(|(_, error)| error)?;
+                self.unwind(flow, register).map_err(|(_, error)| error)?;
             }
         }
         Ok(None)
     }
 
     /// Route a jump or failure through active :try frames before leaving their scopes.
-    fn unwind(&mut self, flow: Flow) -> Result<(), Failure> {
+    fn unwind(&mut self, flow: Flow, register: &Register) -> Result<(), Failure> {
+        if let Flow::Error((_, message)) = &flow
+            && register.input_maps.ex_verbose() >= 13
+        {
+            register
+                .input_maps
+                .trace_ex(13, &format!("Exception thrown: {message}"));
+        }
         while let Some(frame) = self.frames.pop() {
             match frame {
                 Frame::While(..) | Frame::For(..) => match flow {
@@ -348,14 +383,19 @@ impl ScriptProgram {
                             );
                             self.frames.push(Frame::Try(protected, Phase::Catch(prior)));
                             self.frames.push(Frame::Block(body, 0));
+                            if register.input_maps.ex_verbose() >= 13 {
+                                register
+                                    .input_maps
+                                    .trace_ex(13, &format!("Exception caught: {message}"));
+                            }
                             return Ok(());
                         }
-                        self.enter_finally(protected, Some(flow));
+                        self.enter_finally(protected, Some(flow), register);
                         return Ok(());
                     }
                     Phase::Catch(prior) => {
                         self.restore_exception(prior);
-                        self.enter_finally(protected, Some(flow));
+                        self.enter_finally(protected, Some(flow), register);
                         return Ok(());
                     }
                     Phase::Finally(_) => {}
@@ -376,8 +416,11 @@ impl ScriptProgram {
     }
 
     /// Enter the finally body with the preceding result saved until it completes.
-    fn enter_finally(&mut self, protected: Protected, flow: Option<Flow>) {
+    fn enter_finally(&mut self, protected: Protected, flow: Option<Flow>, register: &Register) {
         let body = protected.finally.clone();
+        if !body.is_empty() {
+            register.input_maps.trace_ex(14, "Entering :finally");
+        }
         self.frames
             .push(Frame::Try(protected, Phase::Finally(flow)));
         self.frames.push(Frame::Block(body, 0));

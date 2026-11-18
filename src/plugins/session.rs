@@ -16,7 +16,10 @@ pub use engine::developer::DeveloperSettings;
 pub use engine::sql_dialect::{is_generic_sql, is_sql_dialect};
 pub use trace::Trace;
 
-use super::package::{Identity, Installed, Manifest, Release};
+use super::{
+    package::{Identity, Installed, Manifest, Module, Release},
+    tools::rust_analyzer::Server,
+};
 use nanobug_plugin_sdk::{
     DocumentSnapshot, GridSurface, Instance, Output, Permission, PluginEvent,
 };
@@ -189,6 +192,84 @@ pub struct LanguageServerStatus {
     pub phase: LanguageServerPhase,
 }
 
+/// An editor request that changes a native language server's lifetime in one Session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanguageServerOperation {
+    /// Permit ordinary attachment and start the service when it is authorized and eligible.
+    Enable,
+    /// Stop the service and suppress automatic attachment for this Session.
+    Disable,
+    /// Stop the current instance until a new explicit request to start it.
+    Stop,
+    /// Wait for the current instance to stop, then attach a replacement.
+    Restart,
+}
+
+/// Server selection captured from the editor before dispatching an asynchronous operation.
+#[derive(Clone, Debug)]
+pub struct LanguageServerTarget {
+    /// Owning Session identity.
+    pub project: u64,
+    /// Originating document opening and physical path, if there is a file.
+    pub document: Option<(u64, PathBuf)>,
+    /// Exact plugin ID, plugin/module ID, or unique server name when explicitly supplied.
+    pub name: Option<String>,
+}
+
+/// A declared native server and its stable host address from one installed manifest.
+struct LanguageServerConfig<'a> {
+    key: Key,
+    plugin: &'a str,
+    module: &'a Module,
+    server: Server,
+}
+
+impl LanguageServerConfig<'_> {
+    /// Resolve the short and qualified plugin names prior to trying a server executable name.
+    fn matches_config(&self, selector: &str) -> bool {
+        selector == self.plugin
+            || selector.split_once('/').is_some_and(|(plugin, module)| {
+                (plugin == self.plugin || plugin == self.key.namespace) && module == self.module.id
+            })
+    }
+}
+
+/// Use the configured language server or the original manifest flag for older Rust packages.
+fn declared_server(module: &Module) -> Option<Server> {
+    module
+        .language_server
+        .or(module.rust_analyzer.then_some(Server::RustAnalyzer))
+}
+
+/// Enumerate the native language server declarations available in `project`.
+fn language_server_configs<'a>(
+    records: impl IntoIterator<Item = &'a Installed>,
+    project: u64,
+) -> Vec<LanguageServerConfig<'a>> {
+    records
+        .into_iter()
+        .filter(|record| record.enabled)
+        .flat_map(|record| {
+            let manifest = &record.release.manifest;
+            let namespace = manifest.identity().namespace();
+            manifest.modules.iter().filter_map(move |module| {
+                Some(LanguageServerConfig {
+                    key: Key {
+                        namespace: namespace.clone(),
+                        instance: Instance {
+                            project,
+                            module: module.id.clone(),
+                        },
+                    },
+                    plugin: &manifest.id,
+                    module,
+                    server: declared_server(module)?,
+                })
+            })
+        })
+        .collect()
+}
+
 /// Read-only state published as a whole. The native renderer never waits for a reply.
 #[derive(Clone, Default)]
 pub struct View {
@@ -241,6 +322,26 @@ pub struct View {
     pub configurations: Arc<BTreeMap<ConfigScope, ConfigView>>,
 }
 
+impl View {
+    /// List unambiguous native language-server selectors in `project` for command completion.
+    pub fn language_server_targets(&self, project: u64) -> impl Iterator<Item = String> {
+        let configs = language_server_configs(self.installed.iter(), project);
+        let mut names: BTreeMap<String, usize> = BTreeMap::new();
+        for config in configs {
+            for name in BTreeSet::from([
+                config.plugin.to_owned(),
+                format!("{}/{}", config.plugin, config.module.id),
+                config.server.name().to_owned(),
+            ]) {
+                *names.entry(name).or_default() += 1;
+            }
+        }
+        names
+            .into_iter()
+            .filter_map(|(name, count)| (count == 1).then_some(name))
+    }
+}
+
 /// Result and exact input version of an explicit editor request.
 #[derive(Debug)]
 pub struct CallResult {
@@ -251,6 +352,13 @@ pub struct CallResult {
 
 /// User and editor events queued on the supervisor.
 pub enum Action {
+    /// Apply a native language-server operation within an existing plugin Session.
+    ControlLanguageServer {
+        operation: LanguageServerOperation,
+        target: LanguageServerTarget,
+        /// Number of selected services once the engine accepts or completes the transition.
+        reply: async_channel::Sender<Result<usize, String>>,
+    },
     /// Read the named node ranges of an editor-owned document through the shared syntax worker.
     SyntaxNodes {
         language: &'static str,
@@ -353,7 +461,15 @@ pub enum Action {
     },
 }
 
-type Projects = (Option<u64>, Vec<Project>, BTreeMap<u64, String>);
+/// Explicit file types indexed by project ID and document opening.
+pub type DocumentFiletypes = BTreeMap<(u64, u64), String>;
+
+type Projects = (
+    Option<u64>,
+    Vec<Project>,
+    BTreeMap<u64, String>,
+    DocumentFiletypes,
+);
 type SharedProjects = Arc<Mutex<Arc<Projects>>>;
 type SharedView = Arc<Mutex<Arc<View>>>;
 type SharedDrafts = Arc<Mutex<BTreeMap<Key, String>>>;
@@ -368,6 +484,21 @@ pub struct Session {
 }
 
 impl Session {
+    /// Dispatch the native server `operation` and return its asynchronous acknowledgement.
+    pub fn control_language_server(
+        &self,
+        operation: LanguageServerOperation,
+        target: LanguageServerTarget,
+    ) -> anyhow::Result<async_channel::Receiver<Result<usize, String>>> {
+        let (reply, result) = async_channel::bounded(1);
+        self.send(Action::ControlLanguageServer {
+            operation,
+            target,
+            reply,
+        })?;
+        Ok(result)
+    }
+
     /// Ask the shared Tree-sitter worker for the named ranges in `document`'s `language`.
     pub fn syntax_nodes(
         &self,
@@ -438,7 +569,18 @@ impl Session {
         projects: Vec<Project>,
         dialects: BTreeMap<u64, String>,
     ) {
-        *self.projects.lock().unwrap() = Arc::new((active, projects, dialects));
+        self.projects_with_languages(active, projects, dialects, DocumentFiletypes::new());
+    }
+
+    /// Publish `projects` with SQL `dialects` and per-opening explicit `filetypes`.
+    pub fn projects_with_languages(
+        &self,
+        active: Option<u64>,
+        projects: Vec<Project>,
+        dialects: BTreeMap<u64, String>,
+        filetypes: DocumentFiletypes,
+    ) {
+        *self.projects.lock().unwrap() = Arc::new((active, projects, dialects, filetypes));
         self.wake.unpark();
     }
 

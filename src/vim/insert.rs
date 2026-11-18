@@ -79,8 +79,9 @@ impl Vim {
         let (start, mut values): (usize, Vec<String>) = match key {
             "Ctrl+r" => {
                 let prefix = &self.doc.text[word_start..cursor];
-                let values = register
-                    .completion_texts()
+                let texts = register.completion_texts().collect::<Vec<_>>();
+                let values = texts
+                    .iter()
                     .flat_map(|text| text.split(|ch| !word(ch)))
                     .filter(|text| !text.is_empty() && *text != prefix && text.starts_with(prefix))
                     .take(500)
@@ -501,7 +502,9 @@ impl Vim {
             }
         }
         self.trim_autoindent();
-        self.g.insertion = Some(self.doc.cursor);
+        if !super::current_mark_modifiers().keep_jumps {
+            self.g.insertion = Some(self.doc.cursor);
+        }
         let row = self.doc.location(self.doc.cursor).0;
         self.doc.cursor = self.doc.previous(self.doc.cursor).max(self.doc.starts[row]);
         self.insert = Session::default();

@@ -5,6 +5,13 @@ use super::*;
 impl Engine {
     pub(super) fn action(&mut self, action: Action) {
         match action {
+            Action::ControlLanguageServer {
+                operation,
+                target,
+                reply,
+            } => {
+                self.control_language_server(operation, target, reply);
+            }
             Action::SyntaxNodes {
                 language,
                 document,
@@ -159,7 +166,7 @@ impl Engine {
                     }
                 }
                 // Re-resolve newly installed language-server dependencies on an explicit retry.
-                self.analyzers.retain(|key, _| key.namespace != namespace);
+                self.retire_plugin_servers(&namespace);
                 self.rules.retry(&namespace);
             }
             Action::RetrySettings(key) => {

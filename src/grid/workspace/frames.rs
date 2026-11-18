@@ -168,6 +168,7 @@ impl Workspace {
                     spacing: &self.spacing,
                 },
                 self.layout.visible_cols,
+                &self.input_mappings,
             );
             let (top, bottom) = pane_border_offsets(area, &pane_areas, metrics);
             frames.chrome.offset_pane_borders(top, bottom);
@@ -362,10 +363,13 @@ impl Workspace {
             &self.spacing,
         );
 
+        let verbose = self.input_mappings.last_ex_diagnostic();
         let (message, color) = if !active.status.is_empty() {
             (active.status.as_str(), TEXT)
         } else if !vim.message.is_empty() {
             (vim.message.as_str(), TEXT)
+        } else if !verbose.is_empty() {
+            (verbose.as_str(), TEXT)
         } else if active.focus == Focus::Editor
             && let Some(message) = active.editor.buffer().caret_diagnostic()
         {
@@ -392,7 +396,19 @@ impl Workspace {
                 }
             }
         }
-        footer.label(0, message_start..message_end, message, color, &self.spacing);
+        if active.status.is_empty() && !vim.message.is_empty() && !vim.ex_message_spans().is_empty()
+        {
+            footer.highlighted_label(
+                0,
+                message_start..message_end,
+                message,
+                color,
+                &self.spacing,
+                |offset| nanobug::vim::ExMessageOutput::style_at(vim.ex_message_spans(), offset),
+            );
+        } else {
+            footer.label(0, message_start..message_end, message, color, &self.spacing);
+        }
         footer
     }
 
@@ -428,11 +444,11 @@ impl Workspace {
                 },
             );
         let editor_area = self.active_editor_area();
-        let mut editor = self
-            .projects
-            .active()
-            .editor
-            .frames(context(Focus::Editor, editor_area), layout.visible_cols);
+        let mut editor = self.projects.active().editor.frames(
+            context(Focus::Editor, editor_area),
+            layout.visible_cols,
+            &self.input_mappings,
+        );
         let (top, bottom) = pane_border_offsets(editor_area, &pane_areas, self.metrics);
         editor.chrome.offset_pane_borders(top, bottom);
         (

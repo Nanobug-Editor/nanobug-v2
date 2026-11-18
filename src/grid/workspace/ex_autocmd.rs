@@ -158,7 +158,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.script_events.suppressed += 1;
-        self.execute_user_ex(text, None, window, cx);
+        self.execute_user_ex(text, None, 1, window, cx);
         self.observe_script_buffer(window, cx);
         self.script_events.suppressed -= 1;
     }
@@ -296,13 +296,27 @@ impl Workspace {
             target.path.as_deref(),
             pattern,
         );
+        if !callbacks.is_empty() && self.input_mappings.ex_verbose() >= 8 {
+            self.input_mappings
+                .trace_ex(8, &format!("Executing {} autocommands", event.name()));
+        }
         for callback in callbacks {
             if self.projects.active_project().is_none() || self.modal_open() {
                 return false;
             }
             self.set_status(String::new());
             self.script_events.nesting.push(callback.nested);
-            self.execute_user_ex(&callback.text, callback.source.as_deref(), window, cx);
+            if self.input_mappings.ex_verbose() >= 9 {
+                self.input_mappings
+                    .trace_ex(9, &format!("autocommand {}", callback.text));
+            }
+            self.execute_user_ex(
+                &callback.text,
+                callback.source.as_deref(),
+                callback.source_line,
+                window,
+                cx,
+            );
             self.script_events.nesting.pop();
             if self
                 .projects

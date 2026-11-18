@@ -96,8 +96,10 @@ impl EditorWindow {
         let doc = &self.buffers[self.active].vim.doc;
         self.jump_history
             .update_path(doc.opening, doc.path.as_deref());
-        self.alternate = None;
-        self.alternate_path = Some(path);
+        if !nanobug::vim::ex_keeps_alternate() {
+            self.alternate = None;
+            self.alternate_path = Some(path);
+        }
     }
 
     /// Select a file by its label, retaining the outgoing buffer's viewport.
@@ -106,8 +108,10 @@ impl EditorWindow {
             return false;
         };
         self.cancel_pending();
-        self.alternate = Some(self.buffer().id);
-        self.alternate_path = None;
+        if !nanobug::vim::ex_keeps_alternate() {
+            self.alternate = Some(self.buffer().id);
+            self.alternate_path = None;
+        }
         self.active = index;
         self.reset_buffer_input();
         true
@@ -235,7 +239,7 @@ impl EditorWindow {
     /// Clear formatted feedback after the application changes locale.
     pub(in crate::grid) fn clear_messages(&mut self) {
         for buffer in &mut self.buffers {
-            buffer.vim.message.clear();
+            buffer.vim.clear_ex_message();
         }
     }
 

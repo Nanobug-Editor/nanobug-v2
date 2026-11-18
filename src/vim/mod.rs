@@ -9,9 +9,16 @@ mod compatibility;
 mod ex_batch;
 mod ex_buffer_lifecycle;
 mod ex_catalog;
+mod ex_echo_highlight;
 mod ex_files;
+mod ex_highlight;
 mod ex_history;
+mod ex_languages;
+mod ex_match;
 mod ex_message_modifiers;
+mod ex_recovery;
+mod ex_redirect;
+mod ex_sign;
 mod ex_state;
 mod ex_window_modifiers;
 mod ex_windows;
@@ -41,6 +48,7 @@ mod replay;
 mod script;
 mod session_export;
 pub mod shortcuts;
+mod signs;
 mod spelling;
 mod syntax_selection;
 #[cfg(test)]
@@ -48,17 +56,27 @@ mod tests;
 
 pub use commands::{Action, ArgumentCommand, BatchScope};
 pub use ex_buffer_lifecycle::{BufferCommand, BufferSet};
+pub use ex_echo_highlight::{ExMessageOutput, ExMessageSpan};
 pub use ex_files::search::{find_directory, find_file};
 pub use ex_files::{FileArgument, FileBuffer, FileCommand, FileDestination, FileOperation};
+pub use ex_highlight::{HighlightAttributes, HighlightStyle};
+pub use ex_languages::{FiletypeCommand, LspCommand};
+pub use ex_match::ExMatch;
 pub use ex_message_modifiers::MessageModifier;
-pub use ex_window_modifiers::{WindowModifiers, WindowOrientation, WindowPlacement};
+pub use ex_recovery::RecoveryCommand;
+pub use ex_redirect::RedirectMode;
+pub use ex_sign::{SignCommand, SignId, SignTarget};
+pub use ex_window_modifiers::{
+    WindowModifiers, WindowOrientation, WindowPlacement, ex_keeps_alternate, without_ex_keep_jumps,
+};
 pub use ex_windows::{ExModeChange, ViewInformation, ViewSize, WindowCommand};
 pub use file_marks::{FileMarkSnapshot, FileMarks};
 pub use filter::{run_ex_shell, run_filter};
 pub use hint::{Continuation, SequenceHint, VIEW_CONTINUATIONS};
 pub use jumplist::JumpHistory;
 pub use mappings::{
-    InputMappings, LEADER_KEY, MappingContinuation, PendingMappingHint, TerminalStroke,
+    ExOrigin, ExOriginScope, InputMappings, LEADER_KEY, MappingContinuation, PendingMappingHint,
+    TerminalStroke,
 };
 pub use menu::MenuEntry;
 pub use mode::Mode;
@@ -69,9 +87,10 @@ pub use script::{
     ScriptAutocmd, ScriptEvent, ScriptLine, ScriptProgram, ScriptTabScope, decode_ex_source,
 };
 pub use session_export::{ExportKind, SessionExport};
+pub use signs::{SignDefinition, SignDefinitionUpdate};
 pub use spelling::SPELL_SUGGESTION_KEYS;
 
-use crate::document::Document;
+use crate::document::{Document, MarkEdit, current_mark_modifiers};
 use motions::Find;
 use pattern::{Search, Substitution};
 use replay::Replay;
@@ -208,6 +227,8 @@ pub struct Vim {
     command_menu_origin: Option<menu::Origin>,
     /// Last feedback shown in the status line.
     pub message: String,
+    /// Byte ranges styled by the echoed message that is currently displayed.
+    ex_message_spans: Vec<ExMessageSpan>,
     /// Whether the latest programmatic Ex command reported an error.
     ex_failed: bool,
     /// Fixed Visual endpoint in UTF-8 bytes.
@@ -222,6 +243,8 @@ pub struct Vim {
     buffer_options: Option<std::sync::Arc<std::sync::RwLock<options::BufferOptions>>>,
     /// Window-local settings retained when this view's file label is inactive.
     view_options: Option<WindowOptions>,
+    /// Origins of :set assignments to this view's display options.
+    view_option_origins: BTreeMap<&'static str, ExOrigin>,
     /// Visible prompt and the byte position within its input.
     prompt: char,
     command_pos: usize,
@@ -270,6 +293,8 @@ pub struct Vim {
     marks: BTreeMap<char, usize>,
     /// Individually deleted special marks until their next normal update.
     ex_hidden_marks: std::collections::BTreeSet<char>,
+    /// An edit made under keepjumps before the outer keystroke records its change position.
+    preserved_change_revision: Option<u64>,
     /// Byte range affected by the latest completed operator or put.
     operated: Option<Range<usize>>,
     /// Jump locations shared with other buffers in this window.
@@ -300,6 +325,7 @@ impl Vim {
             command_selection: None,
             command_menu_origin: None,
             message: String::new(),
+            ex_message_spans: Vec::new(),
             ex_failed: false,
             anchor: 0,
             select_resume: false,
@@ -307,6 +333,7 @@ impl Vim {
             options: InputMappings::default(),
             buffer_options: None,
             view_options: None,
+            view_option_origins: BTreeMap::new(),
             prompt: ':',
             command_pos: 0,
             command_prompt: command_prompt::State::default(),
@@ -333,6 +360,7 @@ impl Vim {
             last_filter: String::new(),
             marks: BTreeMap::new(),
             ex_hidden_marks: std::collections::BTreeSet::new(),
+            preserved_change_revision: None,
             operated: None,
             jump_history: JumpHistory::default(),
             line_undo: None,
@@ -562,6 +590,17 @@ impl Vim {
 
     /// Change `range` to `text`, maintaining marks and the local U checkpoint.
     fn replace(&mut self, range: Range<usize>, text: &str, checkpoint: bool) {
+        self.replace_tracking_marks(range, text, checkpoint, None);
+    }
+
+    /// Track marks across a replacement, with a line count for a shell filter.
+    fn replace_tracking_marks(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        checkpoint: bool,
+        filter_lines: Option<usize>,
+    ) {
         if self.read_only || self.doc.text[range.clone()] == *text {
             return;
         }
@@ -578,20 +617,47 @@ impl Vim {
                 text: self.doc.line(row).to_owned(),
             });
         }
-        for position in self.marks.values_mut() {
-            if *position >= range.end {
-                *position = *position - range.len() + text.len();
-            } else if *position >= range.start {
-                *position = range.start;
-            }
-        }
-        self.g.shift_positions(&range, text.len());
+        let modifiers = current_mark_modifiers();
+        let edit = MarkEdit::new(&self.doc, range.clone(), text.len(), filter_lines);
+        let operated = if modifiers.lock_marks {
+            self.operated.as_ref().map(|range| {
+                let last = self.doc.previous(range.end.min(self.doc.text.len()));
+                (range.start, range.start.max(last))
+            })
+        } else {
+            None
+        };
         let checkpoint = self
             .ex_lines
             .as_mut()
             .map_or(checkpoint, |lines| lines.replace(&self.doc, &range, text));
         let checkpoint = self.replay.checkpoint(self.doc.revision, checkpoint);
-        self.doc.replace(range.clone(), text, checkpoint);
-        self.jump_history.shift(&self.doc, range, text.len());
+        self.doc
+            .replace_tracking_marks(range, text, checkpoint, &edit);
+        if modifiers.keep_jumps {
+            self.preserved_change_revision = Some(self.doc.revision);
+        }
+        let doc = &self.doc;
+        self.marks.retain(|name, position| {
+            if matches!(name, '\'' | '`') && modifiers.lock_marks {
+                *position = edit.context_position(doc, *position);
+                return true;
+            }
+            let Some(next) = edit.position(doc, *position, true) else {
+                return false;
+            };
+            *position = next;
+            true
+        });
+        self.g.map_positions(
+            |position| edit.position(doc, position, true),
+            |position| edit.retained_position(doc, position),
+        );
+        if modifiers.lock_marks {
+            self.operated = operated.map(|(start, last)| {
+                edit.retained_position(doc, start)..doc.next(edit.retained_position(doc, last))
+            });
+        }
+        self.jump_history.shift(doc, &edit);
     }
 }
