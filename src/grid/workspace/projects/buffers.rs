@@ -16,6 +16,23 @@ pub(super) struct DetachedBuffer {
 }
 
 impl Project {
+    /// Forward a committed preferences page to every retained editor and hidden buffer.
+    pub(in crate::grid::workspace) fn follow_vim_preferences(
+        &mut self,
+        next: &nanobug::vim::VimOptions,
+        changes: &[(String, serde_json::Value)],
+    ) {
+        self.editor.follow_vim_preferences(next, changes);
+        for editor in self.inactive_editors.values_mut() {
+            editor.follow_vim_preferences(next, changes);
+        }
+        for buffer in self.terminal_buffers.values_mut() {
+            buffer.vim.follow_preferences(next, changes);
+        }
+        for buffer in self.detached_buffers.values_mut() {
+            buffer.view.vim.follow_preferences(next, changes);
+        }
+    }
     /// Remember a filename and assign its stable number without reading the file.
     pub(in crate::grid::workspace) fn list_unloaded_file(
         &mut self,

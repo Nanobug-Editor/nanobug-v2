@@ -57,10 +57,12 @@ mod highlight_tests {
                         Highlight {
                             range: ByteRange { start: 0, end: 2 },
                             kind: SyntaxKind::Keyword,
+                            modifiers: Default::default(),
                         },
                         Highlight {
                             range: ByteRange { start: 6, end: 10 },
                             kind: SyntaxKind::Constant,
+                            modifiers: Default::default(),
                         },
                     ],
                     ..DocumentFeatures::default()
@@ -138,6 +140,8 @@ pub(in crate::grid) struct Buffer {
     presentation: Option<(nanobug::plugins::session::Key, Arc<DocumentPresentation>)>,
     /// Unchanged syntax spans remapped to the current revision while the parser catches up.
     retained_highlights: Option<(u64, Vec<Highlight>)>,
+    /// Native grammar and language-server spans, independently bound to a text snapshot.
+    pub(super) syntax_layers: [Option<Arc<nanobug::plugins::session::DocumentSyntax>>; 2],
     /// Native Markdown syntax cached independently of optional language providers.
     markdown_highlights: MarkdownHighlights,
     /// Styles captured with the text of an immutable Ex message listing.
@@ -246,6 +250,7 @@ impl Buffer {
             presentation: None,
             retained_highlights: None,
             markdown_highlights: MarkdownHighlights::default(),
+            syntax_layers: Default::default(),
             message_spans: Vec::new(),
             diagnostics: Vec::new(),
             sql_dialect: None,

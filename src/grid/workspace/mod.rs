@@ -42,6 +42,7 @@ mod projects;
 mod recent_projects;
 mod recovery;
 mod session_export;
+mod settings;
 mod sleep;
 mod start_page;
 mod tabs;
@@ -137,6 +138,19 @@ pub(crate) struct Workspace {
     file_picker_directory: Option<PathBuf>,
     /// Shortcut-help window owns popup visibility and cached content.
     help: HelpWindow,
+    /// Settings drafts and original values survive switching category pages.
+    settings: Option<crate::grid::windows::settings::Settings>,
+    /// Original stored overrides may differ from unsaved live preferences.
+    core_settings_baseline: settings::CoreBaseline,
+    /// Opening state of project cursor timings and the persisted preset.
+    cursor_settings_baseline: settings::CursorBaseline,
+    /// Identifies the dialog owning an asynchronous plugin catalog response.
+    settings_generation: u64,
+    settings_catalog_started: bool,
+    /// Serialize all setting writes, including compensating writes after an error.
+    settings_writing: bool,
+    /// Resume a native close after outstanding settings rollbacks finish.
+    close_after_settings: bool,
     /// Shared blurred workspace image for the shortcut and plugin popups.
     popup_backdrop: PopupBackdrop,
     /// Pending decisions for closing a pane, project or the native window.
@@ -236,6 +250,11 @@ impl Workspace {
             .then(|| nanobug::app_data::numbered_marks::path().ok())
             .flatten();
         let numbered_marks = numbered_marks::load(numbered_marks_path.as_deref());
+        let cursor_effect = if isolate_data {
+            Effect::Afterglow
+        } else {
+            settings::saved_cursor_effect()
+        };
         let recent_projects = if isolate_data {
             RecentProjects::in_memory()
         } else {
@@ -252,6 +271,20 @@ impl Workspace {
         let weak = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             weak.update(cx, |workspace, cx| {
+                if workspace.settings.is_some() {
+                    if workspace.settings_writing {
+                        return false;
+                    }
+                    workspace.settings_action(
+                        crate::grid::windows::settings::Action::Cancel,
+                        window,
+                        cx,
+                    );
+                    if workspace.settings.is_some() {
+                        workspace.close_after_settings = workspace.settings_writing;
+                        return false;
+                    }
+                }
                 if workspace.editor_close.is_some()
                     || workspace.picker_operation_pending()
                     || workspace.plugins.file_busy
@@ -350,6 +383,13 @@ impl Workspace {
             file_picker: None,
             file_picker_directory: None,
             help: HelpWindow::new(metrics, cx),
+            settings: None,
+            core_settings_baseline: Default::default(),
+            cursor_settings_baseline: Default::default(),
+            settings_generation: 0,
+            settings_catalog_started: false,
+            settings_writing: false,
+            close_after_settings: false,
             popup_backdrop: PopupBackdrop::default(),
             editor_close: None,
             forced_editor_close: None,
@@ -391,7 +431,7 @@ impl Workspace {
             scroll_epoch: Instant::now(),
             scroll_scheduled: false,
             last_cursor_space: None,
-            cursor: cx.new(|_| Cursor::new(Effect::Afterglow, config)),
+            cursor: cx.new(|_| Cursor::new(cursor_effect, config)),
             pane_resize: None,
             wheel: 0.,
             plugins: plugins::PluginCoordinator::new(
@@ -454,7 +494,8 @@ impl Workspace {
 
     /// Whether an overlay over the panes currently owns input.
     fn small_modal_open(&self) -> bool {
-        self.vim_menu.is_some()
+        self.settings.is_some()
+            || self.vim_menu.is_some()
             || self.command_window.is_some()
             || self.language_selection.is_some()
             || self.editor_close.is_some()

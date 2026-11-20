@@ -77,6 +77,11 @@ pub(super) struct LeaderBinding {
 /// Workspace leader mappings, including group names in display order.
 const LEADER_BINDINGS: &[LeaderBinding] = &[
     LeaderBinding {
+        sequence: ",",
+        description_key: "leader.open_settings",
+        shortcut: Some(ShellShortcut::OpenSettings),
+    },
+    LeaderBinding {
         sequence: "e",
         description_key: "leader.toggle_manager",
         shortcut: Some(ShellShortcut::ToggleManager),
@@ -329,6 +334,8 @@ enum ShellShortcut {
     OpenFilePicker,
     /// Open the native plugin manager.
     OpenPluginManager,
+    /// Edit core and plugin preferences in the two-pane settings overlay.
+    OpenSettings,
     /// Show shortcuts for the active pane or file picker.
     OpenHelp,
     /// Add a tab showing the start page.
@@ -531,6 +538,11 @@ impl Workspace {
         if !self.accepts_native_text() {
             return;
         }
+        if let Some(settings) = &mut self.settings {
+            settings.insert_text(text);
+            self.repaint_settings(window, cx);
+            return;
+        }
         if self.terminal_keys_active() {
             self.commit_terminal_text(text, !typed, window, cx);
             self.sync(window, cx);
@@ -655,6 +667,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.settings.is_some() {
+            self.settings_key(event, window, cx);
+            return;
+        }
         self.activate_input_mappings();
         if self.editor_sleep.is_none()
             && self.prefix.is_none()
@@ -1401,6 +1417,7 @@ impl Workspace {
             ShellShortcut::OpenLanguagePicker => self.open_language_picker(window, cx),
             ShellShortcut::OpenFilePicker => self.open_file_picker(window, cx),
             ShellShortcut::OpenPluginManager => self.open_plugin_manager(window, cx),
+            ShellShortcut::OpenSettings => self.open_settings(window, cx),
             ShellShortcut::OpenHelp => {
                 if self.file_picker.is_some() {
                     self.open_file_picker_help(window, cx);

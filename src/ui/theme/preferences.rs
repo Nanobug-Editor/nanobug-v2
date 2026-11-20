@@ -90,7 +90,13 @@ impl AppearanceChange {
 
     /// Persist this field at `path`, keeping values written by other editor windows.
     pub(crate) fn save(self, path: &Path) -> Result<()> {
-        let (key, value) = match self {
+        let (key, value) = self.field();
+        settings::save_ui_value(path, key, value)
+    }
+
+    /// Return the native TOML leaf so a preferences page can save its fields atomically.
+    pub(crate) fn field(self) -> (&'static str, Value) {
+        match self {
             Self::Theme(theme) => (
                 "theme",
                 Value::from(match theme {
@@ -108,8 +114,7 @@ impl AppearanceChange {
             ),
             Self::FontSize(size) => ("font_size", number_value(size)),
             Self::Zoom(percent) => ("zoom", number_value(percent)),
-        };
-        settings::save_ui_value(path, key, value)
+        }
     }
 }
 

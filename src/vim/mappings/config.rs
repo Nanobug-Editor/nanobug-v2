@@ -104,7 +104,10 @@ impl InputMappings {
                 Err(error) => keymap_error_message = Some(keymap_error(&keymap.name, error)),
             }
         }
-        *self.0.write().unwrap() = definitions;
+        // The native theme installs its palette before portable settings are loaded.
+        let mut live = self.0.write().unwrap();
+        definitions.highlights = std::mem::take(&mut live.highlights);
+        *live = definitions;
         if let Some(error) = keymap_error_message {
             return Err(anyhow!(error));
         }

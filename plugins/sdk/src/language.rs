@@ -12,18 +12,11 @@ pub struct ByteRange {
     pub end: usize,
 }
 
-/// Foreground roles resolved by the host's current theme.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SyntaxKind {
-    Keyword,
-    Type,
-    Function,
-    String,
-    Constant,
-    Comment,
-    Attribute,
-}
+/// Prefix for presentation queries that request the bundled grammar's fine-grained roles.
+/// A legacy runtime treats the prefix as an ordinary Tree-sitter query comment.
+pub const HIGHLIGHT_QUERY_PREFIX: &str = "; nanobug:highlights\n";
+mod highlight;
+pub use highlight::{SyntaxKind, SyntaxModifiers};
 
 /// One non-overlapping syntax span in the document.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -32,6 +25,9 @@ pub struct Highlight {
     pub range: ByteRange,
     /// Foreground role for text within the span.
     pub kind: SyntaxKind,
+    /// Optional semantic information independent of the underlying syntax role.
+    #[serde(default, skip_serializing_if = "SyntaxModifiers::is_empty")]
+    pub modifiers: SyntaxModifiers,
 }
 
 /// A declaration and the UTF-8 byte position of its name.
@@ -104,6 +100,43 @@ pub struct ProjectAncestors {
     pub document: Option<String>,
     /// Available UTF-8 files, ordered from the nearest directory to the project root.
     pub files: Vec<AncestorFile>,
+}
+
+#[cfg(test)]
+mod highlight_tests {
+    use super::*;
+
+    /// Wire values from old guests and new nested captures share the same presentation contract.
+    #[test]
+    fn captures_keep_string_escapes_and_old_wire_roles() {
+        let text = r#""中\n""#;
+        let captures = vec![
+            Capture {
+                name: "string".into(),
+                range: ByteRange {
+                    start: 0,
+                    end: text.len(),
+                },
+            },
+            Capture {
+                name: "string.escape".into(),
+                range: ByteRange { start: 4, end: 6 },
+            },
+        ];
+        let result = DocumentFeatures::from_captures(text, captures);
+        let roles: Vec<_> = result
+            .highlights
+            .iter()
+            .map(|span| (&text[span.range.start..span.range.end], span.kind.group()))
+            .collect();
+        assert_eq!(
+            roles,
+            [(r#""中"#, "String"), (r#"\n"#, "Escape"), ("\"", "String")]
+        );
+        let old: Highlight =
+            serde_json::from_str(r#"{"range":{"start":0,"end":1},"kind":"attribute"}"#).unwrap();
+        assert_eq!(old.kind.group(), "Attribute");
+    }
 }
 
 /// An ancestor file read for inspection.

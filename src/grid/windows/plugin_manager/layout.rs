@@ -1,7 +1,7 @@
 //! Geometry and rendering shared by the three top-level plugin pages.
 
 use super::{ManagerView, ManagerWindow, Page, Prompt};
-use crate::grid::windows::plugin_surface::field;
+use crate::grid::text_field as field;
 use crate::{
     grid::render::{
         Frame, LabelStyle, PromptRow, Rect, SEARCH_ICON, SHORTCUT_SEPARATOR, shortcut_hint,

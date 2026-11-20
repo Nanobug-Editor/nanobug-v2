@@ -9,11 +9,13 @@ mod frontend_exclusions;
 #[path = "rust_analyzer/tests.rs"]
 mod real_server_tests;
 mod scan_exclusions;
+mod semantic;
 mod servers;
 mod sql;
 mod vue;
 pub(in crate::plugins) use scan_exclusions::ProjectSettings;
 use scan_exclusions::ScanExclusions;
+pub use scan_exclusions::ScanOverride;
 pub use servers::Server;
 
 use crate::plugins::session::LanguageServerPhase;
@@ -75,6 +77,11 @@ pub(in crate::plugins) enum Event {
     Diagnostics {
         snapshot: Arc<DocumentSnapshot>,
         items: Vec<Value>,
+    },
+    /// A full, revision-matched semantic layer decoded in UTF-8 byte coordinates.
+    Semantic {
+        snapshot: Arc<DocumentSnapshot>,
+        spans: Vec<nanobug_plugin_sdk::language::Highlight>,
     },
     /// The session has stopped accepting requests.
     Failed(String),
@@ -273,6 +280,7 @@ struct Open {
     version: i32,
     /// Next pull request for this document version, if the server supports pull diagnostics.
     diagnose_at: Option<Instant>,
+    semantic_at: Option<Instant>,
 }
 
 /// A diagnostic pull tied to the precise version that was open when it was sent.
@@ -295,6 +303,7 @@ struct Client {
     incremental: bool,
     /// Some servers publish diagnostics only via a client request.
     pull_diagnostics: bool,
+    semantic: semantic::Tokens,
     diagnostic_serial: u64,
     diagnostic_requests: BTreeMap<String, DiagnosticRequest>,
     writer: SyncSender<Value>,
@@ -499,6 +508,7 @@ fn run(
             rust_loaded |= client.rust_quiescent || now.duration_since(started) >= INITIALIZE_WAIT;
             if server != Server::RustAnalyzer || rust_loaded {
                 client.request_diagnostics(now)?;
+                client.request_semantic_tokens(now)?;
             }
         }
         client.expire(now, event)?;
@@ -553,9 +563,10 @@ fn initialize(
             "initializationOptions": options,
             "capabilities": {
                 "general": {"positionEncodings": ["utf-16"]},
-                "workspace": {"configuration": true, "workspaceFolders": true},
+                "workspace": {"configuration": true, "workspaceFolders": true, "semanticTokens":{"refreshSupport":true}},
                 "window": {"workDoneProgress": true},
                 "textDocument": {
+                    "semanticTokens": {"requests":{"full":true},"formats":["relative"],"tokenTypes":semantic::TYPES,"tokenModifiers":semantic::MODIFIERS,"multilineTokenSupport":false,"overlappingTokenSupport":false},
                     "diagnostic": {"dynamicRegistration": false, "relatedDocumentSupport": false},
                     "publishDiagnostics": {"versionSupport": true},
                     "completion": {"completionItem": {"snippetSupport": false, "insertReplaceSupport": true}},
@@ -583,6 +594,7 @@ impl Client {
             hover: false,
             incremental: false,
             pull_diagnostics: false,
+            semantic: Default::default(),
             diagnostic_serial: 0,
             diagnostic_requests: BTreeMap::new(),
             writer,
@@ -618,6 +630,8 @@ impl Client {
         self.completion = matches!(self.server, Server::Html | Server::Css)
             || advertised(&capabilities["completionProvider"]);
         self.definition = advertised(&capabilities["definitionProvider"]);
+        self.semantic
+            .configure(&capabilities["semanticTokensProvider"]);
         self.hover = advertised(&capabilities["hoverProvider"]);
         let sync = &capabilities["textDocumentSync"];
         self.incremental = self.server != Server::RustAnalyzer
@@ -745,6 +759,7 @@ impl Client {
                     snapshot,
                     language,
                     version,
+                    semantic_at: Some(Instant::now() + DIAGNOSTIC_IDLE),
                     diagnose_at: self
                         .pull_diagnostics
                         .then(|| Instant::now() + DIAGNOSTIC_IDLE),
@@ -909,6 +924,11 @@ impl Client {
                         open.diagnose_at = Some(due);
                     }
                 }
+                if method == "workspace/semanticTokens/refresh" {
+                    for open in self.documents.values_mut() {
+                        open.semantic_at = Some(Instant::now() + DIAGNOSTIC_IDLE);
+                    }
+                }
                 self.answer_server(id, method, &message["params"])?;
             } else if method == "experimental/serverStatus" && self.server == Server::RustAnalyzer {
                 if let Some(quiescent) = message["params"]["quiescent"].as_bool() {
@@ -939,6 +959,9 @@ impl Client {
                 }
             }
             return Ok(());
+        }
+        if let Some(id) = message["id"].as_str() {
+            self.semantic_response(id, message.get("result"), event);
         }
         if let Some(id) = message["id"].as_str()
             && let Some(request) = self.diagnostic_requests.remove(id)
@@ -979,7 +1002,8 @@ impl Client {
         let result = match method {
             "window/workDoneProgress/create"
             | "window/showMessageRequest"
-            | "workspace/diagnostic/refresh" => Value::Null,
+            | "workspace/diagnostic/refresh"
+            | "workspace/semanticTokens/refresh" => Value::Null,
             "workspace/workspaceFolders" => self.workspace.clone(),
             "workspace/configuration" => Value::Array(
                 params["items"]

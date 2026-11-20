@@ -4,6 +4,19 @@ use super::{Buffer, EditorWindow};
 use crate::{grid::windows::terminal::Terminal, ui::ime::Composition};
 
 impl EditorWindow {
+    /// Update this pane and its retained buffers after editing global settings.
+    pub(in crate::grid) fn follow_vim_preferences(
+        &mut self,
+        next: &nanobug::vim::VimOptions,
+        changes: &[(String, serde_json::Value)],
+    ) {
+        let mut defaults = self.register.window_options();
+        defaults.follow_preferences(next, changes);
+        self.register.set_window_options(defaults);
+        for buffer in &mut self.buffers {
+            buffer.vim.follow_preferences(next, changes);
+        }
+    }
     /// Use the current layout's Tabpage script variables for this editor.
     pub(in crate::grid) fn set_script_tab_scope(&mut self, scope: nanobug::vim::ScriptTabScope) {
         self.register.set_script_tab_scope(scope);

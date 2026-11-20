@@ -240,10 +240,21 @@ impl Engine {
 
     /// Retire the instances selected by the plugin manager's existing retry command.
     pub(in crate::plugins::session::engine) fn retire_plugin_servers(&mut self, namespace: &str) {
+        self.retire_project_servers(namespace, None);
+    }
+
+    /// Reopen only live bindings affected by a manual exclusion change; suspended servers stay stopped.
+    pub(in crate::plugins::session::engine) fn retire_project_servers(
+        &mut self,
+        namespace: &str,
+        project: Option<u64>,
+    ) {
         let keys: Vec<_> = self
             .analyzers
             .keys()
-            .filter(|key| key.namespace == namespace)
+            .filter(|key| {
+                key.namespace == namespace && project.is_none_or(|id| id == key.instance.project)
+            })
             .cloned()
             .collect();
         for key in keys {
@@ -414,6 +425,7 @@ mod tests {
             documents: Vec::new(),
             languages: BTreeMap::new(),
             diagnostics: BTreeMap::new(),
+            semantics: BTreeMap::new(),
             calls: BTreeMap::new(),
             error: None,
         };
@@ -587,6 +599,31 @@ mod tests {
                 .count()
                 == 4
         );
+        ensure!(!test_root.join("overlapping-server").exists());
+
+        // Settings Apply restarts only this project, adopting the new exclusions in the handshake.
+        use crate::plugins::session::{ScanOverride, SettingsWrite};
+        let opening = ScanOverride::read(&test_root, "ts")?;
+        let changed = ScanOverride::Direct(vec!["generated".into()]);
+        for (before, after, excluded) in [
+            (opening.clone(), changed.clone(), true),
+            (changed, opening, false),
+        ] {
+            let prior = engine.analyzers[&first].server_id;
+            engine.write_settings_page(&SettingsWrite::Scan {
+                namespace: first.namespace.clone(),
+                digest: String::new(),
+                project: 1,
+                before,
+                after,
+            })?;
+            drive(&mut engine, |host| {
+                ready(host, &first) && host.analyzers[&first].server_id != prior
+            })?;
+            let initialize = fs::read_to_string(test_root.join("last-initialize.json"))?;
+            ensure!(initialize.contains("generated") == excluded);
+            ensure!(engine.analyzers[&second].server_id == peer_id);
+        }
         ensure!(!test_root.join("overlapping-server").exists());
 
         control(&mut engine, Stop, &named)?;

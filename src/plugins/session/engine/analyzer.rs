@@ -9,7 +9,8 @@ use crate::plugins::{
     package::Provider,
     query,
     session::{
-        DocumentDiagnostics, LanguageServerPhase, LanguageServerStatus, State, declared_server,
+        DocumentDiagnostics, DocumentSyntax, LanguageServerPhase, LanguageServerStatus, State,
+        declared_server,
     },
     tools::rust_analyzer::{self, Analyzer, Event, ProjectSettings, Request, Server},
 };
@@ -42,6 +43,7 @@ pub(super) struct Binding {
     /// Language identifiers sent for the explicitly typed document overlays.
     languages: BTreeMap<u64, &'static str>,
     diagnostics: BTreeMap<u64, Arc<DocumentDiagnostics>>,
+    semantics: BTreeMap<u64, Arc<DocumentSyntax>>,
     calls: BTreeMap<u64, Call>,
     error: Option<String>,
 }
@@ -69,6 +71,7 @@ impl Engine {
             .collect();
         let mut old = std::mem::take(&mut self.analyzers);
         let mut visible = BTreeMap::new();
+        let mut semantic = BTreeMap::new();
         let mut statuses = BTreeMap::<u64, LanguageServerStatus>::new();
         let mut errors = BTreeMap::new();
         for key in keys {
@@ -171,6 +174,7 @@ impl Engine {
                         documents: Vec::new(),
                         languages: BTreeMap::new(),
                         diagnostics: BTreeMap::new(),
+                        semantics: BTreeMap::new(),
                         calls: BTreeMap::new(),
                         error,
                     }
@@ -180,6 +184,12 @@ impl Engine {
                 if let Some(server) = &binding.server {
                     server.sync_with_languages(documents.clone(), languages.clone());
                 }
+                binding.semantics.retain(|opening, entry| {
+                    binding.languages.get(opening) == languages.get(opening)
+                        && documents.iter().any(|doc| {
+                            version(doc) == entry.version && doc.path.as_ref() == Some(&entry.path)
+                        })
+                });
                 binding.diagnostics.retain(|opening, entry| {
                     binding.languages.get(opening) == languages.get(opening)
                         && documents.iter().any(|doc| {
@@ -215,6 +225,14 @@ impl Engine {
                 }
                 true
             });
+            if let Some(layer) = project.document.as_ref().and_then(|d| {
+                binding
+                    .semantics
+                    .get(&d.opening)
+                    .filter(|s| s.version == version(d) && d.path.as_ref() == Some(&s.path))
+            }) {
+                semantic.insert(key.clone(), Arc::clone(layer));
+            }
             if let Some(diagnostic) = project.document.as_ref().and_then(|document| {
                 binding.diagnostics.get(&document.opening).filter(|entry| {
                     entry.version == version(document)
@@ -263,6 +281,14 @@ impl Engine {
                     .is_none_or(|previous| !Arc::ptr_eq(previous, value))
             });
         self.view.document_diagnostics = visible;
+        self.changed |= self.view.semantic_syntax.len() != semantic.len()
+            || semantic.iter().any(|(k, v)| {
+                self.view
+                    .semantic_syntax
+                    .get(k)
+                    .is_none_or(|old| !Arc::ptr_eq(old, v))
+            });
+        self.view.semantic_syntax = semantic;
         if self.view.language_servers != statuses {
             self.view.language_servers = statuses;
             self.changed = true;
@@ -488,6 +514,24 @@ impl Engine {
                 };
                 let _ = call.answer.try_send(response);
             }
+            Event::Semantic { snapshot, spans } => {
+                if binding
+                    .documents
+                    .iter()
+                    .any(|d| same_snapshot(d, &snapshot))
+                    && let Some(path) = &snapshot.path
+                {
+                    binding.semantics.insert(
+                        snapshot.opening,
+                        Arc::new(DocumentSyntax {
+                            grammar: None,
+                            version: version(&snapshot),
+                            path: path.clone(),
+                            highlights: spans,
+                        }),
+                    );
+                }
+            }
             Event::Diagnostics { snapshot, items } => {
                 if self.lifecycle.wanted[key]
                     .provides
@@ -512,6 +556,7 @@ impl Engine {
                 // Keep the worker receipt so a restart can wait for its exact teardown.
                 binding.phase = LanguageServerPhase::Failed;
                 binding.diagnostics.clear();
+                binding.semantics.clear();
                 for (_, call) in std::mem::take(&mut binding.calls) {
                     let _ = call.answer.try_send(Err(error.clone()));
                 }

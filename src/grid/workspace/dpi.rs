@@ -105,6 +105,9 @@ impl Workspace {
             (self.metrics, self.spacing) = measure(window, &self.glyphs, self.appearance);
         }
         let metrics = self.metrics;
+        if let Some(settings) = &self.settings {
+            settings.set_appearance(metrics, cx);
+        }
         if let Some(menu) = &self.vim_menu {
             menu.set_appearance(metrics, cx);
         }

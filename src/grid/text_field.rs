@@ -1,4 +1,4 @@
-//! Keep a plugin field's committed selection and visible graphemes in the host.
+//! Grapheme-aware selection, composition and horizontal clipping for grid text fields.
 
 use crate::ui::{
     ime::Composition,

@@ -1,4 +1,5 @@
 //! Vim defaults, window-local display and buffer-local editing options.
+mod preferences;
 
 use super::{ExOrigin, InputMappings, Register, Vim};
 use serde::{Deserialize, Serialize};
@@ -157,6 +158,9 @@ impl VimOptions {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub(super) struct BufferOptions {
+    /// Options explicitly assigned locally stay independent of settings-page edits.
+    #[serde(skip)]
+    local_defaults: u16,
     /// Visual spacing of a literal tab in this buffer.
     tabstop: usize,
     /// Indentation width. Zero follows tabstop.
@@ -190,6 +194,7 @@ impl Default for BufferOptions {
     fn default() -> Self {
         Self {
             tabstop: 4,
+            local_defaults: 0,
             shiftwidth: 4,
             textwidth: 0,
             expandtab: false,
@@ -208,6 +213,9 @@ impl Default for BufferOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WindowOptions {
+    /// Explicit per-view overrides are kept when the workspace edits its defaults.
+    #[serde(skip)]
+    local_defaults: u16,
     /// Display absolute line numbers, including on the current line in relative mode.
     pub number: bool,
     /// Display line distances from the current line.
@@ -225,6 +233,7 @@ impl Default for WindowOptions {
     fn default() -> Self {
         Self {
             number: true,
+            local_defaults: 0,
             relativenumber: true,
             wrap: None,
             scrollbind: false,
@@ -369,6 +378,7 @@ impl Vim {
     pub(super) fn set_buffer_tabstop(&mut self, columns: usize) {
         let mut buffer = self.buffer_options.as_ref().unwrap().write().unwrap();
         buffer.tabstop = columns;
+        buffer.local_defaults |= preferences::local_bit("tabstop");
         let origin = self.options.current_ex_origin();
         remember_origin(&mut buffer.origins, "tabstop", origin.as_ref());
         self.doc.set_tabstop(columns);
@@ -418,6 +428,7 @@ impl Vim {
         }
         let mut buffer = self.buffer_options.as_ref().unwrap().write().unwrap();
         buffer.swapfile = false;
+        buffer.local_defaults |= preferences::local_bit("swapfile");
         let origin = self.options.current_ex_origin();
         remember_origin(&mut buffer.origins, "swapfile", origin.as_ref());
     }
@@ -701,6 +712,24 @@ impl Vim {
                 }
                 Ok(None) => {
                     let origin = register.input_maps.current_ex_origin();
+                    if scope != Scope::Global {
+                        let mask = preferences::local_bit(name);
+                        let explicit =
+                            scope == Scope::Local && !matches!(setting, Setting::Inherit);
+                        let flags = if matches!(
+                            name,
+                            "number" | "relativenumber" | "wrap" | "scrollbind"
+                        ) {
+                            &mut window.local_defaults
+                        } else {
+                            &mut buffer.local_defaults
+                        };
+                        if explicit {
+                            *flags |= mask;
+                        } else {
+                            *flags &= !mask;
+                        }
+                    }
                     let is_window_local = matches!(
                         name,
                         "number" | "relativenumber" | "wrap" | "scrollbind" | "scrolloff"

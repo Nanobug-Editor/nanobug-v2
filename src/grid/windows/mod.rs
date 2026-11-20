@@ -4,6 +4,7 @@ pub(crate) mod editor;
 pub(in crate::grid) mod file_picker;
 pub(crate) mod help;
 pub(crate) mod manager;
+pub(in crate::grid) mod settings;
 pub(in crate::grid) mod start;
 pub(in crate::grid) mod terminal;
 pub(in crate::grid) mod vim_menu;

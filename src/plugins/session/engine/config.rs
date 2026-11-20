@@ -21,7 +21,7 @@ mod replacement;
 use replacement::{Displaced, Replacement, sync_parent};
 
 const LIMIT: u64 = 512 * 1024;
-const JOURNAL_LIMIT: u64 = 4 * LIMIT + 256 * 1024;
+const JOURNAL_LIMIT: u64 = 5 * LIMIT + 256 * 1024;
 const PROJECT_CONFIG: &str = ".nb/plugins.json";
 
 /// The selected rules and ordinary settings scope.
@@ -213,6 +213,9 @@ struct Journal {
     draft: Option<Config>,
     base: Option<String>,
     pending: Option<Config>,
+    /// Rebase unrelated in-progress manager edits only if a native page write reaches the project file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_rebased_draft: Option<Config>,
     #[serde(skip_serializing_if = "Option::is_none")]
     replacement: Option<Replacement>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -424,7 +427,9 @@ impl Scope {
                 .is_ok_and(|(hash, _)| hash.as_deref() == Some(&target_digest));
         if published {
             self.data.previous = Some(std::mem::replace(&mut self.data.applied, target.clone()));
-            if self.data.draft == prior.pending {
+            if let Some(draft) = self.data.pending_rebased_draft.take() {
+                self.data.draft = Some(draft);
+            } else if self.data.draft == prior.pending {
                 self.data.draft = None;
                 self.data.apply_issue = None;
             }
@@ -443,6 +448,7 @@ impl Scope {
             }
         }
         self.data.pending = None;
+        self.data.pending_rebased_draft = None;
         self.data.replacement = None;
         if let Err(error) = self.save_locked(lock) {
             self.data = prior;
@@ -513,6 +519,18 @@ impl Scope {
     }
 
     fn commit_with(&mut self, revision: u64, before_publish: impl FnOnce()) -> Result<()> {
+        let target = self.data.draft.clone().context("No changes to apply")?;
+        self.publish_target(revision, target, None, before_publish)
+    }
+
+    /// Publish a validated target while keeping unrelated plugin-manager edits in the journal.
+    fn publish_target(
+        &mut self,
+        revision: u64,
+        target: Config,
+        remaining: Option<Config>,
+        before_publish: impl FnOnce(),
+    ) -> Result<()> {
         self.refresh();
         ensure!(
             self.revision == revision,
@@ -526,7 +544,6 @@ impl Scope {
             self.error.is_none() && self.data.pending.is_none(),
             "Configuration cannot be written in its current state"
         );
-        let target = self.data.draft.clone().context("No changes to apply")?;
         if let Some(root) = &self.root {
             // Recover the local commit from the shared target if the process stops between writes.
             let path = project_path(root, PROJECT_CONFIG)?;
@@ -551,7 +568,9 @@ impl Scope {
             };
             self.data.pending = Some(target.clone());
             self.data.replacement = replacement.clone();
+            self.data.pending_rebased_draft = remaining;
             if let Err(error) = self.save_locked(&lock) {
+                self.data.pending_rebased_draft = None;
                 self.data.pending = None;
                 self.data.replacement = None;
                 if let Some(replacement) = &replacement {
@@ -591,7 +610,7 @@ impl Scope {
         }
         let prior = self.data.clone();
         self.data.previous = Some(std::mem::replace(&mut self.data.applied, target));
-        self.data.draft = None;
+        self.data.draft = remaining;
         self.data.pending = None;
         self.data.apply_issue = None;
         if let Err(error) = self.save() {
@@ -662,6 +681,90 @@ pub(super) struct Configurations {
 }
 
 impl Configurations {
+    /// Snapshot applied values without exposing an unrelated manager draft.
+    pub(super) fn committed_settings(&self) -> BTreeMap<ConfigScope, Config> {
+        self.scopes
+            .iter()
+            .map(|(&scope, state)| (scope, state.data.applied.clone()))
+            .collect()
+    }
+
+    /// Patch one manifest page against the latest committed config; unrelated draft entries survive.
+    pub(super) fn patch_settings(
+        &mut self,
+        scope: ConfigScope,
+        manifest: &Manifest,
+        owner_was_absent: bool,
+        patches: &[crate::plugins::session::SettingPatch],
+    ) -> Result<()> {
+        let state = self.scopes.get_mut(&scope).context("Project is closed")?;
+        self.dirty |= state.refresh();
+        let mut target = state.data.applied.clone();
+        let mut remaining = state.data.draft.clone();
+        for patch in patches {
+            let decl = manifest
+                .settings
+                .get(&patch.id)
+                .context("Plugin setting is no longer declared")?;
+            ensure!(
+                !decl.secret
+                    && (scope == ConfigScope::AllProjects
+                        || decl.project == matches!(scope, ConfigScope::Project(_))),
+                "Setting does not belong to this scope"
+            );
+            ensure!(
+                patch.after.iter().all(|(key, value)| (key == &patch.id
+                    || decl.renamed_from.contains(key))
+                    && (patch.restore_snapshot || decl.accepts_value(value))),
+                "Invalid value for {}",
+                patch.id
+            );
+            let apply = |config: &mut Config| -> Result<()> {
+                let settings = &mut config.plugin_mut(manifest.identity()).settings;
+                let keys = std::iter::once(&patch.id).chain(&decl.renamed_from);
+                let current: BTreeMap<_, _> = keys
+                    .clone()
+                    .filter_map(|id| settings.get(id).map(|v| (id.clone(), v.clone())))
+                    .collect();
+                ensure!(
+                    current == patch.before,
+                    "Setting {} changed in another view. Reopen settings.",
+                    patch.id
+                );
+                for key in keys {
+                    settings.remove(key);
+                }
+                settings.extend(patch.after.clone());
+                Ok(())
+            };
+            apply(&mut target)?;
+            if let Some(draft) = &mut remaining {
+                apply(draft)?;
+            }
+        }
+        if owner_was_absent {
+            let identity = manifest.identity();
+            for config in std::iter::once(&mut target).chain(remaining.iter_mut()) {
+                config.plugins.retain(|plugin| {
+                    plugin.identity != identity
+                        || !plugin.settings.is_empty()
+                        || !plugin.rules.is_empty()
+                });
+            }
+        }
+        if target == state.data.applied && remaining == state.data.draft {
+            return Ok(());
+        }
+        if !matches!(scope, ConfigScope::Project(_)) {
+            ensure!(
+                serde_json::to_vec(&target)?.len() as u64 <= LIMIT,
+                "Local configuration is too large"
+            );
+        }
+        let result = state.publish_target(state.revision, target, remaining, || {});
+        self.dirty = true;
+        result
+    }
     pub(super) fn new(root: PathBuf) -> Self {
         let global = Scope::load(root.join("config").join("global.json"), None);
         Self {
@@ -1530,6 +1633,87 @@ mod tests {
         assert_eq!(view[&scope].applied, initial);
         assert_eq!(view[&scope].draft, Some(draft));
         assert_eq!(view[&scope].external, Some(newest));
+        Ok(())
+    }
+
+    #[test]
+    fn settings_dialog_applies_project_field_without_committing_manager_draft() -> Result<()> {
+        use crate::plugins::session::SettingPatch;
+        use serde_json::json;
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root)?;
+        let project = Project {
+            id: 1,
+            root,
+            document: None,
+            open_documents: vec![],
+        };
+        let profile = temp.path().join("profile");
+        let scope = ConfigScope::Project(1);
+        let manifest: Manifest = serde_json::from_value(json!({
+            "name":"Example", "id":"example", "version":"1.0.0", "engines":{"nanobug":"*"},
+            "settings":{"color":{"title":"Color","default":"green","project":true,"renamed_from":["old"]},
+                "size":{"title":"Size","default":2,"project":true}}
+        }))?;
+        let key = manifest.identity().namespace();
+        let mut state = Configurations::new(profile.clone());
+        state.projects(std::iter::once(&project));
+        let opening = BTreeMap::from([("old".into(), json!("blue"))]);
+        let changed = BTreeMap::from([("color".into(), json!("red"))]);
+        let mut initial = Config::default();
+        initial.plugin_mut(manifest.identity()).settings = opening.clone();
+        state.stage(scope, initial)?;
+        let (revision, _) = state.prepare(scope, &BTreeMap::new())?;
+        state.commit(scope, revision)?;
+        state.stage_sdk(
+            scope,
+            &manifest,
+            BTreeMap::from([("size".to_owned(), json!(9))]),
+        )?;
+        let apply = || SettingPatch {
+            restore_snapshot: false,
+            id: "color".into(),
+            before: opening.clone(),
+            after: changed.clone(),
+        };
+        state.patch_settings(scope, &manifest, false, &[apply()])?;
+        assert!(
+            state
+                .patch_settings(scope, &manifest, false, &[apply()])
+                .is_err()
+        );
+        let mut reopened = Configurations::new(profile);
+        reopened.projects(std::iter::once(&project));
+        let view = reopened.take_view().unwrap();
+        assert_eq!(view[&scope].applied.plugin(&key).unwrap().settings, changed);
+        let draft = &view[&scope]
+            .draft
+            .as_ref()
+            .unwrap()
+            .plugin(&key)
+            .unwrap()
+            .settings;
+        assert_eq!(draft.get("size"), Some(&json!(9)));
+        assert_eq!(draft.get("color"), Some(&json!("red")));
+        reopened.patch_settings(
+            scope,
+            &manifest,
+            false,
+            &[SettingPatch {
+                restore_snapshot: true,
+                id: "color".into(),
+                before: changed,
+                after: opening.clone(),
+            }],
+        )?;
+        assert_eq!(
+            reopened.committed_settings()[&scope]
+                .plugin(&key)
+                .unwrap()
+                .settings,
+            opening
+        );
         Ok(())
     }
 

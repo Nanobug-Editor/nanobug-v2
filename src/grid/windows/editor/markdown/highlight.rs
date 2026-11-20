@@ -3,12 +3,10 @@
 use super::MARKDOWN_OPTIONS;
 use nanobug::document::Document;
 use nanobug_plugin_sdk::language::{ByteRange, Highlight, SyntaxKind};
-use pulldown_cmark::{Event, Parser, Tag};
+use pulldown_cmark::{Event, LinkType, Parser, Tag};
 use regex::Regex;
 use std::{
     cell::{Ref, RefCell},
-    cmp::Reverse,
-    collections::BinaryHeap,
     ops::Range,
     sync::LazyLock,
 };
@@ -51,33 +49,50 @@ fn parse(source: &str) -> Vec<Highlight> {
     let parser = Parser::new_ext(source, MARKDOWN_OPTIONS);
     let mut regions = Vec::new();
     for (_, definition) in parser.reference_definitions().iter() {
-        add(&mut regions, definition.span.clone(), SyntaxKind::Function);
+        let range = definition.span.clone();
+        add(&mut regions, range.clone(), SyntaxKind::MarkupLink);
+        if let Some(split) = source[range.clone()].find("]:") {
+            add_link_url(&mut regions, source, range.start + split + 2..range.end);
+        }
     }
     for (event, range) in parser.into_offset_iter() {
         let kind = match event {
-            Event::Start(Tag::Heading { .. }) => SyntaxKind::Keyword,
-            Event::Start(Tag::Emphasis | Tag::Strong | Tag::Strikethrough) => SyntaxKind::Attribute,
-            Event::Start(Tag::Link { .. } | Tag::Image { .. }) => SyntaxKind::Function,
-            Event::Start(Tag::CodeBlock(_)) | Event::Code(_) => SyntaxKind::String,
-            Event::Start(Tag::BlockQuote(_)) => SyntaxKind::Comment,
-            Event::FootnoteReference(_) | Event::TaskListMarker(_) | Event::Rule => {
-                SyntaxKind::Constant
+            Event::Start(Tag::Heading { .. }) => SyntaxKind::MarkupHeading,
+            Event::Start(Tag::Emphasis) => SyntaxKind::MarkupEmphasis,
+            Event::Start(Tag::Strong) => SyntaxKind::MarkupStrong,
+            Event::Start(Tag::Strikethrough) => SyntaxKind::MarkupStrike,
+            Event::Start(Tag::Link { link_type, .. } | Tag::Image { link_type, .. }) => {
+                if matches!(link_type, LinkType::Autolink | LinkType::Email) {
+                    SyntaxKind::MarkupUrl
+                } else {
+                    if link_type == LinkType::Inline
+                        && let Some(start) = inline_destination(&source[range.clone()])
+                    {
+                        add_link_url(&mut regions, source, range.start + start..range.end);
+                    }
+                    SyntaxKind::MarkupLink
+                }
             }
+            Event::Start(Tag::CodeBlock(_)) => SyntaxKind::MarkupCodeBlock,
+            Event::Code(_) => SyntaxKind::MarkupCode,
+            Event::Start(Tag::BlockQuote(_)) => SyntaxKind::MarkupQuote,
+            Event::TaskListMarker(_) => SyntaxKind::MarkupList,
+            Event::FootnoteReference(_) | Event::Rule => SyntaxKind::MarkupMarker,
             Event::Start(Tag::TableHead) => {
                 let divider = &source[range.end..];
                 let end = divider.find('\n').unwrap_or(divider.len());
                 add(
                     &mut regions,
                     range.end..range.end + end,
-                    SyntaxKind::Constant,
+                    SyntaxKind::MarkupMarker,
                 );
-                SyntaxKind::Type
+                SyntaxKind::MarkupTable
             }
             Event::Start(Tag::Item) => {
                 let item = source[range.clone()].trim_start_matches([' ', '\t']);
                 let start = range.end - item.len();
                 let marker = item.find(char::is_whitespace).unwrap_or(item.len());
-                add(&mut regions, start..start + marker, SyntaxKind::Constant);
+                add(&mut regions, start..start + marker, SyntaxKind::MarkupList);
                 continue;
             }
             Event::Start(Tag::FootnoteDefinition(_)) => {
@@ -85,7 +100,7 @@ fn parse(source: &str) -> Vec<Highlight> {
                     add(
                         &mut regions,
                         range.start..range.start + marker + 2,
-                        SyntaxKind::Constant,
+                        SyntaxKind::MarkupMarker,
                     );
                 }
                 continue;
@@ -95,7 +110,7 @@ fn parse(source: &str) -> Vec<Highlight> {
                     let kind = if markup.as_str().starts_with("<!--") {
                         SyntaxKind::Comment
                     } else {
-                        SyntaxKind::Type
+                        SyntaxKind::Tag
                     };
                     add(
                         &mut regions,
@@ -109,57 +124,75 @@ fn parse(source: &str) -> Vec<Highlight> {
         };
         add(&mut regions, range, kind);
     }
-    flatten(regions)
+    Highlight::flatten(regions)
 }
 
 /// Record a nonempty source `range` and its theme `kind` in `spans`.
 fn add(spans: &mut Vec<Highlight>, range: Range<usize>, kind: SyntaxKind) {
     if !range.is_empty() {
-        spans.push(Highlight {
-            range: ByteRange {
+        spans.push(Highlight::new(
+            ByteRange {
                 start: range.start,
                 end: range.end,
             },
             kind,
-        });
+        ));
     }
 }
 
-/// Flatten potentially nested `regions`, with inner syntax overriding its surrounding span.
-fn flatten(mut regions: Vec<Highlight>) -> Vec<Highlight> {
-    regions.sort_unstable_by_key(|span| span.range.start);
-    // Select the most recently started span, preferring the shorter span at equal starts.
-    let mut active: BinaryHeap<(usize, Reverse<usize>, usize)> = BinaryHeap::new();
-    let mut result: Vec<Highlight> = Vec::new();
-    let mut next = 0;
-    let mut offset = 0;
-    loop {
-        while let Some(span) = regions.get(next).filter(|span| span.range.start <= offset) {
-            active.push((span.range.start, Reverse(span.range.end), next));
-            next += 1;
+/// Locate the destination after the matching label bracket, including nested images.
+fn inline_destination(link: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut chars = link.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '[' => depth += 1,
+            ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && link[i + 1..].starts_with('(') {
+                    return Some(i + 2);
+                }
+            }
+            _ => {}
         }
-        while active.peek().is_some_and(|entry| entry.1.0 <= offset) {
-            active.pop();
-        }
-        let next_start = regions.get(next).map(|span| span.range.start);
-        let Some((_, Reverse(end), index)) = active.peek().copied() else {
-            let Some(start) = next_start else { break };
-            offset = start;
-            continue;
-        };
-        let end = next_start.map_or(end, |start| end.min(start));
-        let kind = regions[index].kind;
-        if let Some(previous) = result
-            .last_mut()
-            .filter(|previous| previous.range.end == offset && previous.kind == kind)
-        {
-            previous.range.end = end;
-        } else {
-            add(&mut result, offset..end, kind);
-        }
-        offset = end;
     }
-    result
+    None
+}
+
+/// Highlight the destination only, preserving the link label and optional title.
+fn add_link_url(spans: &mut Vec<Highlight>, source: &str, range: Range<usize>) {
+    let value = source[range.clone()].trim_start();
+    let start = range.end - value.len();
+    let angled = value.starts_with('<');
+    let mut depth = 0usize;
+    let mut chars = value.char_indices().skip(usize::from(angled));
+    let mut end = value.len();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '>' if angled => {
+                end = i;
+                break;
+            }
+            '(' if !angled => depth += 1,
+            ')' if !angled && depth > 0 => depth -= 1,
+            c if !angled && (c == ')' || c.is_whitespace()) => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    add(
+        spans,
+        start + usize::from(angled)..start + end,
+        SyntaxKind::MarkupUrl,
+    );
 }
 
 #[cfg(test)]
@@ -179,16 +212,17 @@ mod tests {
         );
         let spans = parse(text);
         for (token, expected) in [
-            ("# 标题", Some(SyntaxKind::Keyword)),
-            ("**强调**", Some(SyntaxKind::Attribute)),
-            ("[链接]", Some(SyntaxKind::Function)),
-            ("`代码`", Some(SyntaxKind::String)),
-            ("[x]", Some(SyntaxKind::Constant)),
-            ("<p align", Some(SyntaxKind::Type)),
+            ("# 标题", Some(SyntaxKind::MarkupHeading)),
+            ("**强调**", Some(SyntaxKind::MarkupStrong)),
+            ("[链接]", Some(SyntaxKind::MarkupLink)),
+            ("page.md", Some(SyntaxKind::MarkupUrl)),
+            ("`代码`", Some(SyntaxKind::MarkupCode)),
+            ("[x]", Some(SyntaxKind::MarkupList)),
+            ("<p align", Some(SyntaxKind::Tag)),
             ("正文", None),
-            ("fn main", Some(SyntaxKind::String)),
-            ("标头", Some(SyntaxKind::Type)),
-            ("| --- |", Some(SyntaxKind::Constant)),
+            ("fn main", Some(SyntaxKind::MarkupCodeBlock)),
+            ("标头", Some(SyntaxKind::MarkupTable)),
+            ("| --- |", Some(SyntaxKind::MarkupMarker)),
             ("内容", None),
         ] {
             let offset = text.find(token).expect(token);
@@ -213,7 +247,7 @@ mod tests {
     fn builtin_markdown_highlight_cache_follows_document_revision() {
         let mut doc = Document::new("# Heading");
         let cached = MarkdownHighlights::default();
-        assert_eq!(cached.get(&doc)[0].kind, SyntaxKind::Keyword);
+        assert_eq!(cached.get(&doc)[0].kind, SyntaxKind::MarkupHeading);
         doc.replace(0..2, "", true);
         assert!(cached.get(&doc).is_empty());
     }
@@ -253,11 +287,16 @@ mod tests {
         let (_, actual) = editor.content_frames(context, |_| None);
         let (_, expected) = editor.content_frames(context, |offset| {
             (offset < 9)
-                .then(|| syntax_color(SyntaxKind::Keyword))
+                .then(|| syntax_color(SyntaxKind::MarkupHeading))
                 .or_else(|| {
-                    (11..26)
+                    (18..25)
                         .contains(&offset)
-                        .then(|| syntax_color(SyntaxKind::Function))
+                        .then(|| syntax_color(SyntaxKind::MarkupUrl))
+                        .or_else(|| {
+                            (11..26)
+                                .contains(&offset)
+                                .then(|| syntax_color(SyntaxKind::MarkupLink))
+                        })
                 })
         });
         assert!(actual == expected);

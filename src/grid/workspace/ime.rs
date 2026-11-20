@@ -19,6 +19,9 @@ impl Workspace {
     /// Clear preedit when the active surface stops accepting text and sync the system IME.
     pub(super) fn sync_text_input(&mut self, window: &Window, cx: &mut Context<Self>) {
         if !self.accepts_native_text() {
+            if let Some(settings) = &mut self.settings {
+                settings.composition.clear();
+            }
             if let Some(history) = &mut self.command_window {
                 history.editor.composition_mut().clear();
             }
@@ -51,6 +54,9 @@ impl Workspace {
 
     /// Read preedit from the surface that currently owns native input.
     fn composition(&self) -> Option<&Composition> {
+        if let Some(settings) = &self.settings {
+            return settings.accepts_text().then_some(&settings.composition);
+        }
         if self.vim_menu.is_some() {
             return None;
         }
@@ -104,6 +110,13 @@ impl Workspace {
 
     /// Update preedit on the surface that currently owns native input.
     fn composition_mut(&mut self) -> Option<&mut Composition> {
+        if self.settings.is_some() {
+            return self
+                .settings
+                .as_mut()
+                .filter(|s| s.accepts_text())
+                .map(|s| &mut s.composition);
+        }
         if self.vim_menu.is_some() {
             return None;
         }
@@ -163,6 +176,9 @@ impl Workspace {
 
     /// Whether the active surface accepts native text input at this moment.
     pub(super) fn accepts_native_text(&self) -> bool {
+        if let Some(settings) = &self.settings {
+            return settings.accepts_text();
+        }
         if self.vim_menu.is_some() {
             return false;
         }
@@ -208,6 +224,10 @@ impl Workspace {
 
     /// Refresh the preedit and candidate anchor in `window` through `cx`.
     fn repaint_preedit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            self.repaint_settings(window, cx);
+            return;
+        }
         if self.help.is_open() {
             self.repaint_help(ScrollInput::Advance, window, cx);
         } else {
@@ -313,6 +333,16 @@ impl EntityInputHandler for Workspace {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if let Some(settings) = &self.settings {
+            if !settings.accepts_text() {
+                return None;
+            }
+            let (x, y) = settings.caret(self.settings_area(), &self.spacing)?;
+            return Some(Bounds::new(
+                self.metrics.at(x, y),
+                size(px(self.metrics.cw), px(self.metrics.lh)),
+            ));
+        }
         if let Some(bounds) = self.canvas_input_caret_bounds() {
             return Some(bounds);
         }

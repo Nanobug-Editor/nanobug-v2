@@ -6,6 +6,7 @@ use crate::grid::{
         editor::MarkdownViewMode,
         help::HelpWindow,
         manager::ManagerWindow,
+        settings::CursorRegion,
         start::{StartFocus, StartPage},
     },
 };
@@ -24,6 +25,8 @@ use nanobug::{
 /// Coordinate space owning the logical caret, used to rebase cursor animation during scrolling.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum CursorSpace {
+    /// Tree, form or floating selector in the settings overlay.
+    Settings(CursorRegion),
     /// Start page menu, selected project row or project filter.
     Start(StartFocus),
     /// File manager viewport.
@@ -66,6 +69,14 @@ pub(super) enum CursorSpace {
 impl Workspace {
     /// Resolve the logical caret's position and width in visual grid columns, plus its input state.
     pub(super) fn caret(&self) -> (f32, f32, f32, bool, bool) {
+        if let Some(settings) = &self.settings {
+            let insert = settings.accepts_text();
+            return settings
+                .caret(self.settings_area(), &self.spacing)
+                .map_or((0., 0., 1., insert, false), |(x, y)| {
+                    (x, y, 1., insert, true)
+                });
+        }
         if let Some((history, area)) = self.command_window.as_ref().zip(self.command_window_area())
         {
             return history.caret(area, &self.spacing);
@@ -169,6 +180,9 @@ impl Workspace {
 
     /// Coordinate system that should move with a scrolling viewport.
     fn cursor_space(&self) -> CursorSpace {
+        if let Some(settings) = &self.settings {
+            return CursorSpace::Settings(settings.cursor_region());
+        }
         if let Some(history) = &self.command_window {
             return if matches!(history.editor.vim().mode, Mode::Command | Mode::Search) {
                 CursorSpace::CommandWindowPrompt
@@ -311,7 +325,8 @@ impl Workspace {
                         )
                     })
                 }
-                CursorSpace::Start(_)
+                CursorSpace::Settings(_)
+                | CursorSpace::Start(_)
                 | CursorSpace::CommandLine
                 | CursorSpace::CommandWindow
                 | CursorSpace::CommandWindowPrompt
@@ -434,7 +449,9 @@ impl Workspace {
             None
         };
         let metrics = start.map_or(self.metrics, |_| StartPage::content_metrics(self.metrics));
-        let keyboard_caret = self.help.keyboard_caret(self.help_layout(), self.metrics);
+        let keyboard_caret = (space == CursorSpace::HelpKeyboard)
+            .then(|| self.help.keyboard_caret(self.help_layout(), self.metrics))
+            .flatten();
         let start_caret = start
             .zip(self.projects.start())
             .map(|(layout, page)| page.caret(layout, metrics, &self.spacing));
@@ -514,7 +531,8 @@ impl Workspace {
                     0.,
                 )
             }),
-            CursorSpace::Start(_)
+            CursorSpace::Settings(_)
+            | CursorSpace::Start(_)
             | CursorSpace::CommandLine
             | CursorSpace::CommandWindowPrompt
             | CursorSpace::HelpKeyboard
@@ -536,7 +554,8 @@ impl Workspace {
             painted_width = 2.;
         } else if matches!(
             space,
-            CursorSpace::Manager
+            CursorSpace::Settings(_)
+                | CursorSpace::Manager
                 | CursorSpace::HelpList
                 | CursorSpace::LanguageList
                 | CursorSpace::FilePicker
@@ -559,7 +578,15 @@ impl Workspace {
                 });
         }
         // The popup owns the cursor even while its animation crosses from the previous pane.
-        let (body, clip, head_clip) = if let Some(layout) = start {
+        let (body, clip, head_clip) = if let Some(settings) = &self.settings {
+            let viewport = settings.cursor_viewport(self.settings_area());
+            // Apply the focused pane's clip during scrolling; focus moves can cross its border.
+            (
+                Some(viewport.panel.clone()),
+                Some(viewport.clip(metrics)),
+                None,
+            )
+        } else if let Some(layout) = start {
             (
                 Some(self.start_panel.clone()),
                 Some(layout.area().pixels(metrics)),
@@ -656,9 +683,12 @@ impl Workspace {
             let scale = window.scale_factor();
             painted_width = painted_width.min((ink * scale).ceil() / scale);
         }
-        let height = self
-            .canvas_input_caret_bounds()
-            .map_or(metrics.lh, |bounds| f32::from(bounds.size.height));
+        let height = if space == CursorSpace::PluginInput {
+            self.canvas_input_caret_bounds()
+                .map_or(metrics.lh, |bounds| f32::from(bounds.size.height))
+        } else {
+            metrics.lh
+        };
         let geometry = Geometry::new(
             f32::from(target.x),
             f32::from(target.y),
@@ -725,7 +755,9 @@ impl Workspace {
                 self.corner_controls_at(window.mouse_position())
             };
         }
-        if self.vim_menu.is_some() {
+        if self.settings.is_some() {
+            self.advance_settings(cx);
+        } else if self.vim_menu.is_some() {
             self.advance_vim_menu(ScrollInput::Reveal);
         } else if self.command_window.is_some() {
             self.advance_command_window(inputs, cx);
@@ -780,7 +812,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.advance_definition_hover_scroll();
-        if self.vim_menu.is_some() {
+        if self.settings.is_some() {
+            self.advance_settings(cx);
+            self.refresh_settings(cx);
+        } else if self.vim_menu.is_some() {
             self.advance_vim_menu(inputs[1]);
             self.refresh_vim_menu(cx);
         } else if self.command_window.is_some() {
@@ -806,7 +841,9 @@ impl Workspace {
 
     /// Animate body transforms in `window` through `cx`, retaining cells between grid steps.
     pub(super) fn schedule_scroll(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let active = if let Some(menu) = &self.vim_menu {
+        let active = if let Some(settings) = &self.settings {
+            settings.scrolling()
+        } else if let Some(menu) = &self.vim_menu {
             menu.scrolling()
         } else if let Some(history) = &self.command_window {
             let buffer = history.editor.buffer();

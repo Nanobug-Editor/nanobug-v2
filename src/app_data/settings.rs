@@ -1,5 +1,8 @@
 //! Read and atomically update the editor's portable settings file.
 
+mod overrides;
+pub use overrides::OverrideFile;
+
 use anyhow::{Context, Result};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -87,18 +90,138 @@ pub fn save_ui_value(path: &Path, key: &str, mut value: Value) -> Result<()> {
     })
 }
 
+/// The original portable settings document used to recover the disk state at dialog open.
+#[derive(Default)]
+pub struct SettingsSnapshot(DocumentMut);
+
+impl SettingsSnapshot {
+    /// Read the on-disk baseline, including absent fields and unsaved-in-memory differences.
+    pub fn load(path: Option<&Path>) -> Result<Self> {
+        path.map(read)
+            .transpose()
+            .map(|doc| Self(doc.unwrap_or_default()))
+    }
+
+    /// Read the opening spelling of a string preference when restoring a settings page.
+    pub(crate) fn string(&self, keys: &[&str]) -> Option<&str> {
+        self.item(keys)?.as_str()
+    }
+
+    fn item(&self, keys: &[&str]) -> Option<&Item> {
+        let mut item = self.0.as_item();
+        for &key in keys {
+            item = item.get(key)?;
+        }
+        Some(item)
+    }
+}
+
+/// Settings that have been returned to their opening values should also regain their
+/// original representation on disk (including absence or an independently saved value).
+#[derive(Clone, Copy)]
+pub struct RestoreFields<'a> {
+    pub snapshot: &'a SettingsSnapshot,
+    pub names: &'a [&'a str],
+}
+
+/// Atomically change only the specified leaves, preserving unrelated concurrent writes.
+pub fn save_fields(
+    path: &Path,
+    fields: &[(&[&str], Option<Value>)],
+    restore: Option<RestoreFields<'_>>,
+) -> Result<()> {
+    update(path, |settings| edit_fields(settings, fields, restore))
+}
+
+/// Apply the leaf patch in memory, retaining neighboring entries and original decorations.
+fn edit_fields(
+    settings: &mut DocumentMut,
+    fields: &[(&[&str], Option<Value>)],
+    restore: Option<RestoreFields<'_>>,
+) -> Result<bool> {
+    let mut changed = false;
+    for (keys, value) in fields {
+        let (key, parents) = keys.split_last().context("Missing settings field")?;
+        let opening = restore.filter(|restore| restore.names.contains(key));
+        let value = if let Some(opening) = opening {
+            opening.snapshot.item(keys).and_then(Item::as_value)
+        } else {
+            value.as_ref()
+        };
+        let mut table: &mut dyn TableLike = settings.as_table_mut();
+        let mut absent = false;
+        for &parent in parents {
+            if value.is_none() && !table.contains_key(parent) {
+                absent = true;
+                break;
+            }
+            table = table
+                .entry(parent)
+                .or_insert(toml_edit::table())
+                .as_table_like_mut()
+                .with_context(|| format!("Expected a settings table at {parent}"))?;
+        }
+        if absent {
+            continue;
+        }
+        if let Some(mut next) = value.cloned() {
+            if let Some(old) = table.get(key).and_then(Item::as_value) {
+                *next.decor_mut() = old.decor().clone();
+                if next.to_string() == old.to_string() {
+                    continue;
+                }
+            }
+            table.insert(key, Item::Value(next));
+            changed = true;
+        } else {
+            changed |= table.remove(key).is_some();
+            if let Some(opening) = opening {
+                prune_new_tables(settings.as_table_mut(), parents, opening.snapshot, &[]);
+            }
+        }
+    }
+    Ok(changed)
+}
+
+/// Remove empty parent tables introduced by this dialog while retaining original tables
+/// and any entries another settings writer added after the dialog opened.
+fn prune_new_tables(
+    table: &mut dyn TableLike,
+    path: &[&str],
+    opening: &SettingsSnapshot,
+    parents: &[&str],
+) {
+    let Some((&key, tail)) = path.split_first() else {
+        return;
+    };
+    let Some(child) = table.get_mut(key).and_then(Item::as_table_like_mut) else {
+        return;
+    };
+    let mut full_path = parents.to_vec();
+    full_path.push(key);
+    prune_new_tables(child, tail, opening, &full_path);
+    if child.is_empty() && opening.item(&full_path).is_none() {
+        table.remove(key);
+    }
+}
+
 /// Apply `edit` to the latest settings at `path` under a lock and publish changes atomically.
 fn update(path: &Path, edit: impl FnOnce(&mut DocumentMut) -> Result<bool>) -> Result<()> {
     let _lock = super::lock_data_file(path)?;
     let mut settings = read(path)?;
     if edit(&mut settings)? {
-        let dir = path.parent().context("Settings file has no parent")?;
-        let mut staged = tempfile::NamedTempFile::new_in(dir)?;
-        staged.write_all(settings.to_string().as_bytes())?;
-        staged.as_file().sync_all()?;
-        staged
-            .persist(path)
-            .with_context(|| format!("Save {}", path.display()))?;
+        publish(path, &settings.to_string())?;
     }
+    Ok(())
+}
+
+fn publish(path: &Path, contents: &str) -> Result<()> {
+    let dir = path.parent().context("Settings file has no parent")?;
+    let mut staged = tempfile::NamedTempFile::new_in(dir)?;
+    staged.write_all(contents.as_bytes())?;
+    staged.as_file().sync_all()?;
+    staged
+        .persist(path)
+        .with_context(|| format!("Save {}", path.display()))?;
     Ok(())
 }

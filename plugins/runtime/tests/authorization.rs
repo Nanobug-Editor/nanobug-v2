@@ -224,6 +224,122 @@ fn label(session: &Session, key: &Key) -> Value {
     call(session, key).unwrap().output.service_value.unwrap()["settings"]["label"].clone()
 }
 
+/// The settings dialog uses the same running guest, committed scopes, and inherited fallback as editor commands.
+#[test]
+fn settings_dialog_restores_running_plugin_overrides_and_lists_installs_on_start_page() {
+    use nanobug::plugins::session::{SettingPatch, SettingsWrite};
+    use std::collections::BTreeMap;
+    let fixture = tempfile::tempdir().unwrap();
+    let archive = fixture.path().join("settings.zip");
+    bundle(
+        &archive,
+        "Settings fixture",
+        &[],
+        false,
+        "project=true",
+        json!({}),
+    );
+    let session = session(&fixture.path().join("profile"), false);
+    let identity = install(&session, &archive);
+    let namespace = identity.namespace();
+    let (reply, result) = async_channel::bounded(1);
+    session
+        .send(Action::SettingsCatalog {
+            project: None,
+            reply,
+        })
+        .unwrap();
+    let welcome = answer(&result).unwrap();
+    assert_eq!(welcome.scopes.len(), 1);
+    assert!(welcome.scans.is_empty());
+    let installed = &welcome.installed[0];
+    assert_eq!(installed.release.manifest.identity(), identity);
+    let digest = installed.release.digest.clone();
+    let write = |request| {
+        let (reply, result) = async_channel::bounded(1);
+        session.send(Action::WriteSettings(request, reply)).unwrap();
+        answer(&result).unwrap();
+    };
+    for (before, after) in [(true, false), (false, true)] {
+        write(SettingsWrite::Enabled {
+            namespace: namespace.clone(),
+            digest: digest.clone(),
+            before,
+            after,
+        });
+    }
+    let first = project(fixture.path(), 1);
+    let second = project(fixture.path(), 2);
+    session.projects(Some(1), vec![first, second]);
+    let owner = key(&identity, 1);
+    let other = key(&identity, 2);
+    wait(&session, |v| {
+        v.modules.get(&owner) == Some(&State::Ready) && v.modules.get(&other) == Some(&State::Ready)
+    });
+    let patch = |scope, before: Option<&str>, after: Option<&str>| {
+        let raw = |v: Option<&str>| {
+            v.map(|v| BTreeMap::from([("label".to_owned(), json!(v))]))
+                .unwrap_or_default()
+        };
+        write(SettingsWrite::Manifest {
+            namespace: namespace.clone(),
+            digest: digest.clone(),
+            scope,
+            owner_was_absent: true,
+            fields: vec![SettingPatch {
+                restore_snapshot: after.is_none(),
+                id: "label".into(),
+                before: raw(before),
+                after: raw(after),
+            }],
+        });
+    };
+    let observed = |key: &Key, wanted: &str| {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            match call(&session, key) {
+                Ok(call) => {
+                    let current = &call.output.service_value.unwrap()["settings"]["label"];
+                    if current == wanted {
+                        return;
+                    }
+                }
+                Err(error) if error.contains("adopting updated settings") => {}
+                Err(error) => panic!("Unexpected guest error: {error}"),
+            }
+            assert!(Instant::now() < deadline, "Guest did not adopt {wanted}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    patch(ConfigScope::AllProjects, None, Some("all"));
+    patch(ConfigScope::Project(1), None, Some("one"));
+    observed(&owner, "one");
+    observed(&other, "all");
+    patch(ConfigScope::Project(1), Some("one"), None);
+    observed(&owner, "all");
+    patch(ConfigScope::AllProjects, Some("all"), None);
+    observed(&owner, "fixture-default");
+    observed(&other, "fixture-default");
+    let (reply, result) = async_channel::bounded(1);
+    session
+        .send(Action::SettingsCatalog {
+            project: Some(1),
+            reply,
+        })
+        .unwrap();
+    let restored = answer(&result).unwrap();
+    assert!(
+        restored.scopes[&ConfigScope::Project(1)]
+            .plugin(&namespace)
+            .is_none()
+    );
+    assert!(
+        restored.scopes[&ConfigScope::AllProjects]
+            .plugin(&namespace)
+            .is_none()
+    );
+}
+
 fn admit_plan(
     session: &Session,
     owner: Key,

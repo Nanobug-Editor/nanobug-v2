@@ -3,6 +3,8 @@
 mod highlight;
 mod palette;
 mod preferences;
+mod syntax;
+pub(crate) use syntax::{syntax_example, syntax_section};
 
 pub(crate) use palette::{
     ACCENT, ACTIVE_FILE, CURRENT, CURSOR_TEXT, ERROR_BORDER, ERROR_TEXT, FOOTER_BLUE,
@@ -10,7 +12,6 @@ pub(crate) use palette::{
     TEXT, TREE_GUIDE, ThemeComponent, WARNING_BORDER, WARNING_TEXT, load_for_editor,
 };
 
-pub(crate) use highlight::syntax_highlight_groups;
 pub(crate) use preferences::AppearanceChange;
 
 use gpui::{App, Font, FontFeatures, Global, PlatformTextSystem, WindowAppearance, font};
@@ -21,18 +22,7 @@ pub const GRID_RULE_FONT_FAMILY: &str = "Nanobug Grid";
 /// Editor and chrome font size in logical pixels.
 pub const GRID_FONT_SIZE: f32 = 16.;
 /// Resolve plugin syntax `kind` to a host palette role used by retained editor cells.
-pub(crate) fn syntax_color(kind: nanobug_plugin_sdk::language::SyntaxKind) -> u32 {
-    use nanobug_plugin_sdk::language::SyntaxKind::*;
-    match kind {
-        Keyword => palette::SYNTAX_KEYWORD,
-        Type => palette::SYNTAX_TYPE,
-        Function => palette::SYNTAX_FUNCTION,
-        String => palette::SYNTAX_STRING,
-        Constant => palette::SYNTAX_CONSTANT,
-        Comment => palette::SYNTAX_COMMENT,
-        Attribute => palette::SYNTAX_ATTRIBUTE,
-    }
-}
+pub(crate) use palette::syntax_color;
 
 /// Bundled Rec Mono Casual, with code ligatures disabled to preserve separate cells.
 pub static GRID_TEXT_FONT: LazyLock<Font> = LazyLock::new(|| Font {

@@ -101,6 +101,9 @@ impl Workspace {
                 let (session, changes) = Session::start(options);
                 workspace.plugins.session = Some(session);
                 workspace.sync_plugin_projects();
+                if workspace.settings.is_some() && !workspace.settings_catalog_started {
+                    workspace.begin_plugin_catalog(window, cx);
+                }
                 if workspace.plugins.open {
                     workspace.plugin_refresh(window, cx);
                 }
@@ -203,20 +206,26 @@ impl Workspace {
             .map(|project| {
                 let id = project.plugin_scope;
                 let doc = &project.editor.vim().doc;
-                let document = (document_readers && doc.text.len() <= 120 * 1024).then(|| {
-                    let snapshot = self
-                        .plugins
-                        .snapshots
-                        .entry(id)
-                        .or_insert_with(|| Arc::new(snapshot_from(doc)));
-                    if snapshot.opening != doc.opening
-                        || snapshot.revision != doc.revision
-                        || snapshot.path != doc.path
-                    {
-                        *snapshot = Arc::new(snapshot_from(doc));
-                    }
-                    Arc::clone(snapshot)
-                });
+                let native = nanobug::plugins::session::builtin_syntax_grammar(
+                    doc.path.as_deref(),
+                    project.editor.vim().filetype_override().as_deref(),
+                )
+                .is_some();
+                let document =
+                    ((document_readers || native) && doc.text.len() <= 120 * 1024).then(|| {
+                        let snapshot = self
+                            .plugins
+                            .snapshots
+                            .entry(id)
+                            .or_insert_with(|| Arc::new(snapshot_from(doc)));
+                        if snapshot.opening != doc.opening
+                            || snapshot.revision != doc.revision
+                            || snapshot.path != doc.path
+                        {
+                            *snapshot = Arc::new(snapshot_from(doc));
+                        }
+                        Arc::clone(snapshot)
+                    });
                 let mut remaining = 512 * 1024;
                 let open_documents = if document_readers {
                     project
@@ -255,9 +264,11 @@ impl Workspace {
                 }
             })
             .collect::<Vec<_>>();
-        self.plugins
-            .snapshots
-            .retain(|id, _| document_readers && projects.iter().any(|project| project.id == *id));
+        self.plugins.snapshots.retain(|id, _| {
+            projects
+                .iter()
+                .any(|project| project.id == *id && project.document.is_some())
+        });
         self.plugins.open_snapshots.retain(|(id, opening), _| {
             projects.iter().any(|project| {
                 project.id == *id

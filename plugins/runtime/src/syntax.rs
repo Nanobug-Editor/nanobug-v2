@@ -1,6 +1,8 @@
 //! Shared, bounded Tree-sitter parsing in its own worker role.
 
+mod highlight;
 use crate::Output;
+use nanobug_plugin_sdk::language::HIGHLIGHT_QUERY_PREFIX;
 use nanobug_plugin_sdk::{
     Diagnostic, DocumentSnapshot, ErrorKind, Reply, Request,
     language::{ByteRange, Capture, SyntaxQuery},
@@ -78,6 +80,7 @@ struct Syntax {
     parser: Parser,
     trees: VecDeque<(Key, Tree, Option<Value>)>,
     queries: VecDeque<(String, String, Query)>,
+    highlights: highlight::GrammarHighlights,
     embedded_queries: BTreeMap<&'static str, Query>,
 }
 
@@ -169,6 +172,17 @@ impl Syntax {
         };
         let result = (|| {
             let mut result = capture(&entry.2, root, doc, deadline)?;
+            let rich = source.starts_with(HIGHLIGHT_QUERY_PREFIX);
+            if rich {
+                result.complete &= self.highlights.enrich(
+                    language,
+                    grammar,
+                    root,
+                    &doc.text,
+                    &mut result.captures,
+                    deadline,
+                );
+            }
             if (0..entry.2.pattern_count()).any(|index| {
                 entry
                     .2
@@ -176,7 +190,7 @@ impl Syntax {
                     .iter()
                     .any(|setting| setting.key.as_ref() == "nanobug.embedded")
             }) {
-                self.append_embedded(language, root, &doc.text, &mut result, deadline);
+                self.append_embedded(language, root, &doc.text, &mut result, deadline, rich);
             }
             Ok(serde_json::to_value(result)?)
         })();
@@ -192,6 +206,7 @@ impl Syntax {
         text: &str,
         result: &mut SyntaxQuery,
         deadline: Instant,
+        rich: bool,
     ) {
         if !matches!(
             language,
@@ -234,15 +249,30 @@ impl Syntax {
                 result.complete = false;
                 break;
             };
-            let (captures, complete) = query_captures(
+            let (mut captures, complete) = query_captures(
                 &self.embedded_queries[grammar_name],
                 tree.root_node(),
                 bytes,
-                range.start,
+                0,
                 limit,
                 deadline,
             );
-            result.complete &= complete;
+            if rich {
+                result.complete &= self.highlights.enrich(
+                    grammar_name,
+                    &grammar,
+                    tree.root_node(),
+                    &text[range.clone()],
+                    &mut captures,
+                    deadline,
+                );
+            }
+            result.complete &= complete && captures.len() <= limit;
+            captures.truncate(limit);
+            for capture in &mut captures {
+                capture.range.start += range.start;
+                capture.range.end += range.start;
+            }
             result.captures.extend(captures);
         }
         result.complete &= result.captures.len() < MAX_CAPTURES
@@ -682,6 +712,176 @@ const JSON_HIGHLIGHTS: &str = r#"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise the same opt-in query and SDK projection used by compiled language plugins.
+    #[test]
+    fn provider_can_assign_a_specific_role_to_framework_syntax() {
+        use nanobug_plugin_sdk::language::{DocumentFeatures, SyntaxKind};
+        let query = format!("{HIGHLIGHT_QUERY_PREFIX}(property_identifier) @function.builtin");
+        let doc = DocumentSnapshot {
+            opening: 9,
+            revision: 1,
+            path: None,
+            text: "app.special()".into(),
+        };
+        let result = Syntax::default()
+            .run("javascript".into(), &doc, Projection::Query(&query))
+            .unwrap();
+        let query: SyntaxQuery = serde_json::from_value(result).unwrap();
+        let spans = DocumentFeatures::from_captures(&doc.text, query.captures).highlights;
+        assert!(
+            spans
+                .iter()
+                .any(|s| &doc.text[s.range.start..s.range.end] == "special"
+                    && s.kind == SyntaxKind::BuiltinFunction)
+        );
+    }
+
+    /// Verify representative tokens and their innermost style in each language family.
+    #[test]
+    fn rich_roles_reach_source_tokens_in_each_family() {
+        use nanobug_plugin_sdk::language::{DocumentFeatures, SyntaxKind::*};
+        let mut worker = Syntax::default();
+        let cases: &[(
+            &str,
+            &str,
+            &[(&str, nanobug_plugin_sdk::language::SyntaxKind)],
+        )] = &[
+            (
+                "rust",
+                r#"/// TODO explain
+fn save<'a,T>(limit: usize) { let user = true; user.save(); user.name; println!("中\n"); 'outer: loop { break 'outer; } }"#,
+                &[
+                    ("TODO", TodoComment),
+                    ("fn save", Keyword),
+                    ("'a", Lifetime),
+                    ("T>", TypeParameter),
+                    ("limit", Parameter),
+                    ("usize", BuiltinType),
+                    ("user =", Variable),
+                    ("true", Boolean),
+                    ("save();", Method),
+                    ("name;", Field),
+                    ("println", Macro),
+                    ("\\n", Escape),
+                    ("'outer:", Label),
+                ],
+            ),
+            (
+                "rust",
+                "struct Buf; impl Buf { fn reset(&mut self) {} }",
+                &[("reset", Method)],
+            ),
+            (
+                "python",
+                "class User:\n    def __init__(self): pass\n    def save(self): pass\n",
+                &[("__init__", Constructor), ("save", Method)],
+            ),
+            (
+                "html",
+                r#"<svg xml:lang="en"></svg>"#,
+                &[("xml:lang", TagAttribute)],
+            ),
+            (
+                "javascript",
+                "const value = `prefix ${name}`; class Page { constructor() {} }",
+                &[
+                    ("${", Interpolation),
+                    ("name", Variable),
+                    ("constructor", Constructor),
+                ],
+            ),
+            (
+                "typescript",
+                "class User { save(limit: number) { return limit + 42; } }",
+                &[
+                    ("User", Class),
+                    ("save", Method),
+                    ("limit:", Parameter),
+                    ("return", Return),
+                    ("+", Operator),
+                    ("42", Number),
+                ],
+            ),
+            (
+                "tsx",
+                "const v = <UserCard disabled />;",
+                &[("UserCard", Component), ("disabled", TagAttribute)],
+            ),
+            (
+                "vue",
+                "<UserCard v-if=\"ok\" disabled></UserCard>",
+                &[
+                    ("UserCard", Component),
+                    ("v-if", TemplateDirective),
+                    ("disabled", TagAttribute),
+                ],
+            ),
+            (
+                "css",
+                ".card { color: red; }",
+                &[("card", CssSelector), ("color", CssProperty)],
+            ),
+            (
+                "sql",
+                "SELECT u.name AS title FROM users AS u WHERE id = $1;",
+                &[
+                    ("name", SqlColumn),
+                    ("title", SqlAlias),
+                    ("users", SqlTable),
+                    ("$1", SqlParameter),
+                ],
+            ),
+            (
+                "json",
+                r#"{"name":"name","v":null}"#,
+                &[(r#""name":"#, ConfigKey), ("null", Null)],
+            ),
+            ("toml", "port = 42", &[("port", ConfigKey), ("42", Number)]),
+            (
+                "yaml",
+                "port: true",
+                &[("port", ConfigKey), ("true", Boolean)],
+            ),
+            (
+                "c",
+                "#include <stdlib.h>\nint main(void) { return 0; }",
+                &[("#include", Directive), ("return", Return)],
+            ),
+        ];
+        let mut errors = Vec::new();
+        for (i, &(language, text, expected)) in cases.iter().enumerate() {
+            let doc = DocumentSnapshot {
+                opening: i as u64,
+                revision: 0,
+                path: None,
+                text: text.into(),
+            };
+            let result = worker
+                .run(
+                    language.into(),
+                    &doc,
+                    Projection::Query(HIGHLIGHT_QUERY_PREFIX),
+                )
+                .unwrap();
+            let result: SyntaxQuery = serde_json::from_value(result).unwrap();
+            let features = DocumentFeatures::from_captures(text, result.captures);
+            for &(fragment, kind) in expected {
+                let offset = text.find(fragment).unwrap();
+                let actual = features
+                    .highlights
+                    .iter()
+                    .find(|s| s.range.start <= offset && offset < s.range.end)
+                    .map(|s| s.kind);
+                if actual != Some(kind) {
+                    errors.push(format!(
+                        "{language} {fragment:?}: {actual:?}, expected {kind:?}"
+                    ));
+                }
+            }
+        }
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
 
     /// Return named ranges in original UTF-8 coordinates, including Markdown inline nodes.
     #[test]

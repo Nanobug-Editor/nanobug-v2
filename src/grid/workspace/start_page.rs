@@ -389,7 +389,10 @@ impl Workspace {
                 self.open_file_picker(window, cx);
                 return;
             }
-            StartAction::Config => self.set_status(i18n::text("start.config_unavailable").into()),
+            StartAction::Config => {
+                self.open_settings(window, cx);
+                return;
+            }
             StartAction::Quit => self.request_close(CloseTarget::Tab, window, cx),
         }
         self.sync(window, cx);

@@ -12,6 +12,136 @@ use std::{
     sync::Arc,
 };
 
+/// Source of editable exclusions. Absence can inherit the legacy Rust configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScanOverride {
+    Missing(Vec<String>),
+    Unset,
+    Direct(Vec<String>),
+}
+
+impl ScanOverride {
+    /// Editor-visible manual paths, excluding automatic plugin rules.
+    pub fn directories(&self) -> &[String] {
+        match self {
+            Self::Missing(paths) | Self::Direct(paths) => paths,
+            Self::Unset => &[],
+        }
+    }
+
+    /// Read the native TOML override, preserving inheritance information for Cancel.
+    pub fn read(root: &Path, plugin_id: &str) -> Result<Self> {
+        let path = scan_path(root, plugin_id)?;
+        match read_scan_document(&path)? {
+            Some(doc) => override_in(&doc),
+            None => Ok(Self::Missing(legacy_directories(root, plugin_id)?)),
+        }
+    }
+
+    /// Patch just the manual list. Preserve unrelated plugin TOML and reject stale writes.
+    pub(in crate::plugins) fn replace(
+        &self,
+        root: &Path,
+        plugin_id: &str,
+        next: &Self,
+    ) -> Result<()> {
+        for path in next.directories() {
+            validate_directory(path, plugin_id)?;
+        }
+        let path = scan_path(root, plugin_id)?;
+        let _lock = crate::app_data::lock_data_file(&path)?;
+        let document = read_scan_document(&path)?;
+        let current = match document.as_ref() {
+            Some(doc) => override_in(doc)?,
+            None => Self::Missing(legacy_directories(root, plugin_id)?),
+        };
+        ensure!(
+            current == *self,
+            "Scan exclusions changed on disk. Reopen settings."
+        );
+        let mut doc = document.unwrap_or_default();
+        if let Self::Direct(items) = next {
+            let array = items.iter().cloned().collect::<toml_edit::Array>();
+            let mut replacement = toml_edit::Value::Array(array);
+            if let Some(old) = doc.get("excludeDirs").and_then(toml_edit::Item::as_value) {
+                *replacement.decor_mut() = old.decor().clone();
+            }
+            doc["excludeDirs"] = toml_edit::Item::Value(replacement);
+        } else {
+            doc.remove("excludeDirs");
+        }
+        let contents = doc.to_string();
+        if let Self::Missing(opening) = next {
+            ensure!(
+                contents.trim().is_empty(),
+                "The new plugin file gained other settings. Reopen settings to preserve those edits."
+            );
+            ensure!(
+                &legacy_directories(root, plugin_id)? == opening,
+                "Inherited exclusions changed on disk. Reopen settings."
+            );
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
+        } else {
+            ensure!(contents.len() <= 64 * 1024, "Scan settings exceed 64 KiB");
+            crate::plugins::package::write_bytes(&path, contents.as_bytes())?;
+        }
+        Ok(())
+    }
+}
+
+fn scan_path(root: &Path, plugin_id: &str) -> Result<PathBuf> {
+    ensure!(
+        crate::plugins::package::valid_id(plugin_id),
+        "Invalid plugin ID"
+    );
+    crate::plugins::project_path(root, &format!(".nb/plugin-setting/{plugin_id}.toml"))
+}
+
+fn read_scan_document(path: &Path) -> Result<Option<toml_edit::DocumentMut>> {
+    match read_limited(path, 64 * 1024) {
+        Ok(bytes) => Ok(Some(std::str::from_utf8(&bytes)?.parse()?)),
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn override_in(doc: &toml_edit::DocumentMut) -> Result<ScanOverride> {
+    let Some(item) = doc.get("excludeDirs") else {
+        return Ok(ScanOverride::Unset);
+    };
+    let paths = item
+        .as_array()
+        .context("excludeDirs must be an array of paths")?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .context("Expected directory name")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ScanOverride::Direct(paths))
+}
+
+fn validate_directory(directory: &str, plugin_id: &str) -> Result<()> {
+    let mut components = Path::new(directory).components();
+    ensure!(
+        !directory.contains('\0')
+            && matches!(components.next(), Some(Component::Normal(_)))
+            && components.all(|part| matches!(part, Component::Normal(_))),
+        "Scan exclusions for plugin {plugin_id} must be relative to the workspace: {directory}"
+    );
+    Ok(())
+}
+
 /// Identify the owning plugin and the scan exclusions from its current JS match.
 pub(in crate::plugins) struct ProjectSettings {
     /// Validated package manifest ID used to name the project's TOML file.
@@ -45,22 +175,15 @@ impl ScanExclusions {
         let Some(settings) = settings else {
             return Ok(exclusions);
         };
-        let manual = manual_scan_settings(root, &settings.plugin_id)?;
+        let manual = ScanOverride::read(root, &settings.plugin_id)?;
         let mut seen = BTreeSet::new();
         for directory in settings
             .automatic_exclusions
             .iter()
-            .chain(manual.iter().flat_map(|settings| &settings.exclude_dirs))
+            .chain(manual.directories())
         {
             let path = Path::new(directory);
-            let mut components = path.components();
-            ensure!(
-                !directory.contains('\0')
-                    && matches!(components.next(), Some(Component::Normal(_)))
-                    && components.all(|part| matches!(part, Component::Normal(_))),
-                "Scan exclusions for plugin {} must be relative to the workspace: {directory}",
-                settings.plugin_id
-            );
+            validate_directory(directory, &settings.plugin_id)?;
             let relative = path.components().collect::<PathBuf>();
             if seen.insert(relative.clone()) {
                 let prefix = root.join(relative);
@@ -117,31 +240,52 @@ impl ScanExclusions {
     }
 }
 
-/// Read `plugin_id` settings under project `root`, with legacy fallback for Rust projects.
-fn manual_scan_settings(root: &Path, plugin_id: &str) -> Result<Option<ScanSettings>> {
-    const LIMIT: u64 = 64 * 1024;
-    let path = root
-        .join(".nb/plugin-setting")
-        .join(format!("{plugin_id}.toml"));
-    match read_limited(&path, LIMIT) {
-        Ok(bytes) => {
-            let settings = std::str::from_utf8(&bytes)
-                .context("Settings must be UTF-8")
-                .and_then(|text| Ok(toml::from_str(text)?))
-                .with_context(|| format!("Read {}", path.display()))?;
-            Ok(Some(settings))
-        }
-        Err(error)
-            if error
-                .downcast_ref::<io::Error>()
-                .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) =>
-        {
-            if plugin_id != "rust" {
-                return Ok(None);
-            }
-            let legacy = root.join(".nb/rust-analyzer.json");
-            read_json(&legacy, LIMIT).with_context(|| format!("Read {}", legacy.display()))
-        }
-        Err(error) => Err(error).with_context(|| format!("Read {}", path.display())),
+/// Only Rust inherits an earlier JSON list when the per-plugin TOML file is missing.
+fn legacy_directories(root: &Path, plugin_id: &str) -> Result<Vec<String>> {
+    if plugin_id != "rust" {
+        return Ok(vec![]);
+    }
+    let legacy = crate::plugins::project_path(root, ".nb/rust-analyzer.json")?;
+    let settings: Option<ScanSettings> =
+        read_json(&legacy, 64 * 1024).with_context(|| format!("Read {}", legacy.display()))?;
+    Ok(settings
+        .map(|settings| settings.exclude_dirs)
+        .unwrap_or_default())
+}
+
+#[cfg(test)]
+mod dialog_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn settings_dialog_scan_list_round_trips_inheritance_and_preserves_unrelated_fields()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        fs::create_dir_all(root.join(".nb"))?;
+        fs::write(
+            root.join(".nb/rust-analyzer.json"),
+            r#"{"excludeDirs":["legacy"]}"#,
+        )?;
+        let opening = ScanOverride::read(root, "rust")?;
+        assert_eq!(opening, ScanOverride::Missing(vec!["legacy".into()]));
+        let next = ScanOverride::Direct(vec!["build/缓存".into()]);
+        opening.replace(root, "rust", &next)?;
+        assert_eq!(ScanOverride::read(root, "rust")?, next);
+        assert!(opening.replace(root, "rust", &next).is_err());
+        next.replace(root, "rust", &opening)?;
+        assert_eq!(ScanOverride::read(root, "rust")?, opening);
+        let path = scan_path(root, "rust")?;
+        fs::write(&path, "# Preserve these fields\nworkers = 3\n")?;
+        ScanOverride::Unset.replace(root, "rust", &next)?;
+        let bad = ScanOverride::Direct(vec!["../elsewhere".into()]);
+        assert!(next.replace(root, "rust", &bad).is_err());
+        next.replace(root, "rust", &ScanOverride::Unset)?;
+        assert_eq!(
+            fs::read_to_string(path)?,
+            "# Preserve these fields\nworkers = 3\n"
+        );
+        Ok(())
     }
 }

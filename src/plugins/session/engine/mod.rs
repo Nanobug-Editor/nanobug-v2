@@ -2,6 +2,7 @@
 
 mod actions;
 mod assets;
+mod builtin_syntax;
 mod events;
 mod hot_reload;
 mod installation;
@@ -10,6 +11,7 @@ mod persistence;
 mod queue;
 mod runtime;
 mod services;
+mod settings_dialog;
 mod syntax;
 #[cfg(test)]
 mod tests;
@@ -128,6 +130,7 @@ struct Engine {
     last_canvas_prepare_us: BTreeMap<String, u64>,
     syntax: Arc<Mutex<Syntax>>,
     syntax_io: Pool,
+    builtin_syntax: builtin_syntax::State,
     tool_io: Pool,
     tool_writes: BTreeMap<Key, usize>,
     close_drains: BTreeMap<Option<u64>, tool_control::CloseDrain>,
@@ -231,6 +234,7 @@ impl Engine {
             last_canvas_prepare_us: BTreeMap::new(),
             syntax: Arc::new(Mutex::new(Syntax::default())),
             syntax_io: Pool::new(1, 8),
+            builtin_syntax: Default::default(),
             tool_io: Pool::new(2, 8),
             tool_writes: BTreeMap::new(),
             close_drains: BTreeMap::new(),
@@ -510,6 +514,7 @@ impl Engine {
                 self.lifecycle.runtimes.insert(name, runtime);
             }
         }
+        self.sync_builtin_syntax();
         self.sync_analyzers();
         self.advance_peer_calls();
         self.advance_credential_events();

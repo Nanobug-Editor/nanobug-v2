@@ -63,6 +63,40 @@ impl EditorWindow {
                                     })
                             })
                     });
+            let matches = |data: &nanobug::plugins::session::DocumentSyntax| {
+                data.version == (doc.opening, doc.revision) && doc.path.as_ref() == Some(&data.path)
+            };
+            let grammar = nanobug::plugins::session::builtin_syntax_grammar(
+                doc.path.as_deref(),
+                filetype.as_deref(),
+            );
+            let native = view
+                .builtin_syntax
+                .as_ref()
+                .filter(|(id, data)| *id == scope && data.grammar == grammar && matches(data))
+                .map(|(_, data)| data.clone())
+                .or_else(|| {
+                    buffer.syntax_layers[0]
+                        .as_ref()
+                        .filter(|data| data.grammar == grammar && matches(data))
+                        .cloned()
+                });
+            let semantic = view
+                .semantic_syntax
+                .iter()
+                .find(|(key, data)| key.instance.project == scope && matches(data))
+                .map(|(_, data)| data.clone());
+            for (slot, next) in buffer.syntax_layers.iter_mut().zip([native, semantic]) {
+                if !matches!((&*slot, &next), (None, None))
+                    && !slot
+                        .as_ref()
+                        .zip(next.as_ref())
+                        .is_some_and(|(a, b)| std::sync::Arc::ptr_eq(a, b))
+                {
+                    *slot = next;
+                    changed |= active;
+                }
+            }
             changed |= buffer.set_diagnostics(diagnostics) && active;
             if keep_folds {
                 buffer.retain_highlights();

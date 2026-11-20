@@ -68,7 +68,7 @@ impl Identity {
     }
 }
 
-fn valid_id(value: &str) -> bool {
+pub(super) fn valid_id(value: &str) -> bool {
     !value.is_empty()
         && !value.starts_with('-')
         && !value.ends_with('-')
@@ -815,12 +815,26 @@ impl InstallStore {
 
     /// Change activation without mutating the installed package.
     pub(super) fn set_enabled(&self, key: &str, enabled: bool) -> Result<()> {
+        self.change_enabled(key, None, enabled)
+    }
+
+    /// Compare the displayed release and activation state while holding the registry lock.
+    pub(super) fn change_enabled(
+        &self,
+        key: &str,
+        expected: Option<(&str, bool)>,
+        enabled: bool,
+    ) -> Result<()> {
         let _lock = self.lock_index()?;
         let mut index = self.read_index()?;
-        index
-            .get_mut(key)
-            .context("Plugin is not installed")?
-            .enabled = enabled;
+        let plugin = index.get_mut(key).context("Plugin is not installed")?;
+        if let Some((digest, before)) = expected {
+            ensure!(
+                plugin.release.digest == digest && plugin.enabled == before,
+                "Plugin installation changed. Reopen settings."
+            );
+        }
+        plugin.enabled = enabled;
         write_registry(&self.root.join(INSTALLED_INDEX), &index)
     }
 

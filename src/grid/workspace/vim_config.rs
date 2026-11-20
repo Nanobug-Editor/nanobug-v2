@@ -7,7 +7,10 @@ impl Workspace {
     /// Attach startup Vim defaults to existing project editors and report a load error.
     pub(super) fn load_vim_config(&mut self) {
         if let Some(path) = &self.vim_settings_path
-            && let Err(error) = self.input_mappings.load_config(path)
+            && let Err(error) = self
+                .input_mappings
+                .load_config(path)
+                .and_then(|()| self.input_mappings.load_highlight_preferences(path))
         {
             self.set_status(i18n::format("vim_config.load_failed", &[("error", &error)]));
         }

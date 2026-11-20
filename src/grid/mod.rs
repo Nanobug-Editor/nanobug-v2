@@ -2,6 +2,7 @@
 
 mod mnemonic;
 pub(crate) mod render;
+mod text_field;
 pub(crate) mod windows;
 mod workspace;
 

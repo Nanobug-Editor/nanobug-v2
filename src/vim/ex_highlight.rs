@@ -1,7 +1,13 @@
 //! Named Ex styles and links kept separately from the active GUI palette.
 
 use super::{Action, ExMessageOutput, ExOrigin, Register, Vim};
-use std::{collections::BTreeMap, fmt::Write as _};
+use nanobug_plugin_sdk::language::SyntaxKind;
+use std::{
+    collections::BTreeMap,
+    fmt::Write as _,
+    sync::{Arc, OnceLock},
+};
+mod preferences;
 
 pub(super) const NAMES: &[&str] = &["highlight"];
 
@@ -124,6 +130,14 @@ impl Group {
 
 /// Mutable highlighting shared by the workspace's Ex interpreters.
 pub(super) struct Highlights {
+    /// Immutable style snapshot shared by editors and splits until the next style change.
+    syntax: OnceLock<Arc<[Option<HighlightStyle>]>>,
+    /// GUI attributes applied through Settings, independent of palette colors and Ex links.
+    preferences: BTreeMap<String, preferences::GuiPreference>,
+    /// Foreground preferences stored independently from decorations.
+    foregrounds: BTreeMap<String, u32>,
+    /// A child inherits explicitly configured properties from its parent.
+    parents: BTreeMap<String, String>,
     /// Current GUI palette, indexed by case-insensitive names with the display spelling retained.
     palette: BTreeMap<String, (&'static str, HighlightStyle)>,
     /// User-defined groups and changes to palette groups.
@@ -135,6 +149,10 @@ pub(super) struct Highlights {
 impl Default for Highlights {
     fn default() -> Self {
         let mut groups = Self {
+            syntax: OnceLock::new(),
+            preferences: BTreeMap::new(),
+            parents: BTreeMap::new(),
+            foregrounds: BTreeMap::new(),
             palette: BTreeMap::new(),
             groups: BTreeMap::new(),
             reset_origin: None,
@@ -188,10 +206,61 @@ impl Highlights {
         &mut self,
         palette: impl IntoIterator<Item = (&'static str, HighlightStyle)>,
     ) {
+        self.syntax.take();
         self.palette = palette
             .into_iter()
             .map(|(name, style)| (name.to_ascii_lowercase(), (name, style)))
             .collect();
+    }
+
+    /// Install the acyclic default links supplied by the active palette.
+    pub(super) fn set_parents(&mut self, parents: Vec<(&'static str, &'static str)>) {
+        self.syntax.take();
+        self.parents = parents
+            .into_iter()
+            .map(|(child, parent)| (child.to_ascii_lowercase(), parent.to_ascii_lowercase()))
+            .collect();
+    }
+
+    /// Release the frame snapshot before changing a GUI or Ex preference.
+    pub(super) fn invalidate_syntax(&mut self) {
+        self.syntax.take();
+    }
+
+    /// Rebuild resolved syntax overrides once per style change, independently of the number of panes.
+    pub(super) fn syntax_styles(&self) -> Arc<[Option<HighlightStyle>]> {
+        self.syntax
+            .get_or_init(|| {
+                SyntaxKind::ALL
+                    .iter()
+                    .map(|kind| {
+                        let modifier = matches!(
+                            kind,
+                            SyntaxKind::Readonly | SyntaxKind::Static | SyntaxKind::Deprecated
+                        );
+                        self.style(kind.capture_group(), !modifier)
+                            .or_else(|| self.style(kind.group(), !modifier))
+                    })
+                    .collect()
+            })
+            .clone()
+    }
+
+    /// Check this group and its ancestors for any explicit property.
+    fn has_override<'a>(&'a self, mut key: &'a str) -> bool {
+        for _ in 0..=self.parents.len() {
+            if self.preferences.contains_key(key)
+                || self.foregrounds.contains_key(key)
+                || self.groups.get(key).is_some_and(Group::overrides_palette)
+            {
+                return true;
+            }
+            let Some(parent) = self.parents.get(key) else {
+                break;
+            };
+            key = parent;
+        }
+        false
     }
 
     /// List names whose stored spelling begins with `prefix`, ignoring ASCII case.
@@ -222,7 +291,7 @@ impl Highlights {
     /// Return the resolved style for a known group, optionally requiring an Ex override.
     pub(super) fn style(&self, name: &str, only_override: bool) -> Option<HighlightStyle> {
         let key = name.to_ascii_lowercase();
-        if only_override && !self.groups.get(&key).is_some_and(Group::overrides_palette) {
+        if only_override && !self.has_override(&key) {
             return None;
         }
         self.name(&key)?;
@@ -256,30 +325,56 @@ impl Highlights {
     /// Follow group links to a concrete style and resolve any `fg` or `bg` references.
     fn style_for<'a>(
         &'a self,
-        mut key: &'a str,
+        key: &'a str,
         normal: HighlightStyle,
         inherit_normal: bool,
     ) -> HighlightStyle {
-        let mut remaining = self.groups.len();
-        while let Some(link) = self.groups.get(key).and_then(|group| group.link.as_deref()) {
-            if remaining == 0 {
-                return HighlightStyle::default();
-            }
-            remaining -= 1;
-            key = link;
+        self.layer(
+            key,
+            self.base_style(key),
+            normal,
+            inherit_normal,
+            self.groups.len() + self.parents.len() + 1,
+        )
+    }
+
+    /// Explicit links replace the base. Parents contribute only their configured properties.
+    fn layer(
+        &self,
+        key: &str,
+        seed: HighlightStyle,
+        normal: HighlightStyle,
+        inherit_normal: bool,
+        remaining: usize,
+    ) -> HighlightStyle {
+        if remaining == 0 {
+            return HighlightStyle::default();
         }
         if key == "normal" && inherit_normal {
             return normal;
         }
-        let Some(group) = self.groups.get(key) else {
-            return self.base_style(key);
-        };
-        let mut style = if group.cleared {
+        let group = self.groups.get(key);
+        let link = group.and_then(|g| g.link.as_deref());
+        let mut style = if let Some(link) = link {
+            self.layer(
+                link,
+                self.base_style(link),
+                normal,
+                inherit_normal,
+                remaining - 1,
+            )
+        } else if group.is_some_and(|g| g.cleared) {
             HighlightStyle::default()
+        } else if let Some(parent) = self.parents.get(key) {
+            self.layer(parent, seed, normal, inherit_normal, remaining - 1)
         } else {
-            self.base_style(key)
+            seed
         };
-        for (key, value) in &group.fields {
+        for (key, value) in group
+            .filter(|_| link.is_none())
+            .into_iter()
+            .flat_map(|g| &g.fields)
+        {
             match (key.as_str(), value) {
                 ("guifg", Property::Color(color)) => style.foreground = color.resolve(normal),
                 ("guibg", Property::Color(color)) => style.background = color.resolve(normal),
@@ -288,6 +383,12 @@ impl Highlights {
                 ("blend", Property::Blend(value)) => style.blend = Some(*value),
                 _ => {}
             }
+        }
+        if let Some(value) = self.preferences.get(key) {
+            style.attributes = value.attributes;
+        }
+        if let Some(color) = self.foregrounds.get(key) {
+            style.foreground = Some(*color);
         }
         style
     }
@@ -326,6 +427,9 @@ impl Highlights {
         origin: Option<ExOrigin>,
         verbose: bool,
     ) -> Result<Option<ExMessageOutput>, String> {
+        if !matches!(command, HighlightCommand::List | HighlightCommand::Query(_)) {
+            self.invalidate_syntax();
+        }
         match command {
             HighlightCommand::List => {
                 let mut result = ExMessageOutput::default();
@@ -346,6 +450,8 @@ impl Highlights {
                 return Ok(Some(self.describe(&key, display, verbose)));
             }
             HighlightCommand::Reset => {
+                self.preferences.clear();
+                self.foregrounds.clear();
                 for (key, group) in &mut self.groups {
                     group.fields.clear();
                     group.link.clone_from(&group.default_link);
@@ -355,6 +461,8 @@ impl Highlights {
                 self.reset_origin = origin;
             }
             HighlightCommand::Clear(name) => {
+                self.preferences.remove(&name.to_ascii_lowercase());
+                self.foregrounds.remove(&name.to_ascii_lowercase());
                 let group = self.group(&name);
                 group.fields.clear();
                 group.link.clone_from(&group.default_link);
@@ -368,6 +476,12 @@ impl Highlights {
                 clear,
             } => {
                 if !default || !self.is_defined(&name.to_ascii_lowercase()) {
+                    if clear || fields.contains_key("gui") {
+                        self.preferences.remove(&name.to_ascii_lowercase());
+                    }
+                    if clear || fields.contains_key("guifg") {
+                        self.foregrounds.remove(&name.to_ascii_lowercase());
+                    }
                     let group = self.group(&name);
                     group.link = None;
                     if clear {
@@ -388,15 +502,19 @@ impl Highlights {
                 let target = to.as_ref().map(|name| name.to_ascii_lowercase());
                 if let Some(target) = target.as_deref() {
                     let mut next = Some(target);
-                    for _ in 0..=self.groups.len() {
+                    for _ in 0..=self.groups.len() + self.parents.len() {
                         let Some(link) = next else { break };
                         if link == key {
                             return Err(format!("Highlight link would form a cycle: {from}"));
                         }
-                        next = self
-                            .groups
-                            .get(link)
-                            .and_then(|group| group.link.as_deref());
+                        let group = self.groups.get(link);
+                        next = group.and_then(|g| g.link.as_deref()).or_else(|| {
+                            if group.is_some_and(|g| g.cleared) {
+                                None
+                            } else {
+                                self.parents.get(link).map(String::as_str)
+                            }
+                        });
                     }
                     if next.is_some() {
                         return Err(format!("Highlight link would form a cycle: {from}"));
@@ -411,6 +529,10 @@ impl Highlights {
                     };
                 if let Some(name) = to.as_deref() {
                     self.group(name);
+                }
+                if !blocked {
+                    self.preferences.remove(&key);
+                    self.foregrounds.remove(&key);
                 }
                 let group = self.group(&from);
                 if default && (force || group.default_link.is_none()) {
@@ -457,6 +579,9 @@ impl Highlights {
                         .iter()
                         .map(|(key, value)| (key.as_str(), value.display())),
                 );
+            }
+            if let Some(value) = self.preferences.get(key) {
+                fields.insert("gui", value.spelling.clone());
             }
             if fields.is_empty() {
                 text.push_str(" cleared");

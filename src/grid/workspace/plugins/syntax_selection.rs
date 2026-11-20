@@ -189,6 +189,8 @@ mod tests {
         fs::create_dir(&project)?;
         let path = project.join("main.rs");
         fs::write(&path, "fn needle() { let _ = \"中文\"; }\n")?;
+        let config = project.join("config.json");
+        fs::write(&config, r#"{"enabled":true,"level":12}"#)?;
         let session = Session::start(options(temp.path(), &profile)?).0;
         native_test::run_async(
             project,
@@ -239,8 +241,49 @@ mod tests {
                             .text
                             .starts_with("fn ()")
                     );
+                    workspace.open(config.clone(), native, cx);
+                    let doc = &workspace.projects.active().editor.vim().doc;
+                    ensure!(
+                        doc.path.as_deref().and_then(|p| p.file_name()) == config.file_name(),
+                        "unexpected active document {:?}",
+                        doc.path
+                    );
                     Ok(())
-                })
+                })?;
+                until(
+                    app,
+                    window,
+                    "native configuration syntax without a plugin",
+                    |workspace| {
+                        use nanobug_plugin_sdk::language::SyntaxKind;
+                        let Some((_, result)) = workspace.plugins.view.builtin_syntax.as_ref()
+                        else {
+                            return Ok(false);
+                        };
+                        let doc = &workspace.projects.active().editor.vim().doc;
+                        if Some(&result.path) != doc.path.as_ref()
+                            || result.version != (doc.opening, doc.revision)
+                        {
+                            return Ok(false);
+                        }
+                        for (token, role) in [
+                            ("enabled", SyntaxKind::ConfigKey),
+                            ("true", SyntaxKind::Boolean),
+                            ("12", SyntaxKind::Number),
+                        ] {
+                            let offset = doc.text.find(token).unwrap();
+                            ensure!(
+                                result.highlights.iter().any(|h| h.kind == role
+                                    && h.range.start <= offset
+                                    && offset < h.range.end),
+                                "{token} missing {role:?} in {:?}",
+                                result.highlights
+                            );
+                        }
+                        Ok(true)
+                    },
+                )
+                .await
             },
         )
     }

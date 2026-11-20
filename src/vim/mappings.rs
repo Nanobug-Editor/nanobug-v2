@@ -289,9 +289,29 @@ impl InputMappings {
         self.0.write().unwrap().highlights.set_palette(palette);
     }
 
+    /// Install default syntax group parents after updating the current palette.
+    pub fn set_highlight_inheritance(&self, parents: Vec<(&'static str, &'static str)>) {
+        self.0.write().unwrap().highlights.set_parents(parents);
+    }
+
+    /// Share the immutable syntax styles for the current palette and user settings.
+    pub fn syntax_styles(&self) -> Arc<[Option<super::HighlightStyle>]> {
+        self.0.read().unwrap().highlights.syntax_styles()
+    }
+
     /// Resolve a known highlight group, following palette colors and Ex links.
     pub fn highlight_style(&self, group: &str) -> Option<super::HighlightStyle> {
         self.0.read().unwrap().highlights.style(group, false)
+    }
+
+    /// Serialize changes to the shared style registry with Ex commands and rendering queries.
+    pub(super) fn edit_highlights<T>(
+        &self,
+        edit: impl FnOnce(&mut super::ex_highlight::Highlights) -> T,
+    ) -> T {
+        let mut maps = self.0.write().unwrap();
+        maps.highlights.invalidate_syntax();
+        edit(&mut maps.highlights)
     }
 
     /// Return an explicitly configured group style to overlay on a native theme role.

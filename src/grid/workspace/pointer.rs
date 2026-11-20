@@ -174,6 +174,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.settings.is_some() {
+            self.click_settings(event.position, window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if self.vim_menu.is_some() {
             self.click_vim_menu(event.position, window, cx);
             cx.stop_propagation();
@@ -402,7 +407,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.vim_menu.is_some() {
+        if self.settings.is_some() || self.vim_menu.is_some() {
             cx.stop_propagation();
             return;
         }
@@ -583,6 +588,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.settings.is_some() {
+            return;
+        }
         if self.vim_menu.is_some() {
             self.hover_vim_menu(event.position, cx);
             cx.stop_propagation();
@@ -685,6 +693,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.settings.is_some() {
+            return;
+        }
         if let Some(history) = &mut self.command_window {
             history.editor.stop_drag();
             cx.stop_propagation();
@@ -735,6 +746,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.settings.is_some() {
+            self.wheel_settings(event, window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if self.vim_menu.is_some() {
             self.wheel_vim_menu(event, window, cx);
             cx.stop_propagation();

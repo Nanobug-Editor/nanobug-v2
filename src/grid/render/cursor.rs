@@ -66,13 +66,28 @@ impl Cursor {
     }
     /// Select the adjacent behavior; `reverse` cycles backwards without changing document state.
     pub fn cycle(&mut self, reverse: bool, window: &Window, cx: &mut Context<Self>) -> Effect {
-        self.motion.advance(self.epoch.elapsed().as_secs_f64());
         let effect = self.motion.effect().next(reverse);
+        self.select_effect(effect, window, cx);
+        effect
+    }
+
+    /// Read the live preset, including changes made with F6 since the window opened.
+    pub(in crate::grid) fn effect(&self) -> Effect {
+        self.motion.effect()
+    }
+
+    /// Switch to a named preset while retaining the animated cursor's geometry.
+    pub(in crate::grid) fn select_effect(
+        &mut self,
+        effect: Effect,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.motion.advance(self.epoch.elapsed().as_secs_f64());
         self.motion.set_effect(effect);
         self.motion
             .set_visible(self.visible, self.epoch.elapsed().as_secs_f64());
         self.refresh(window, cx);
-        effect
     }
     /// Set the visible rectangle `target`, its `visible` state and `block` style, using
     /// `cell_width` for motion pacing. Schedule drawing in `window` through `cx`.

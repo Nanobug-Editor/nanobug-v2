@@ -31,6 +31,7 @@ mod rust_analyzer_test;
 #[cfg(all(test, windows))]
 mod rust_plugin_test;
 mod session_link;
+pub(super) mod settings_data;
 mod shortcuts;
 mod sql_dialect;
 mod surface_link;
@@ -94,7 +95,9 @@ pub(super) struct PluginCoordinator {
     traced_doc: Option<(u64, u64)>,
     /// Last document revision represented by the native workspace scene.
     traced_scene: Option<(u64, u64)>,
-    session: Option<Session>,
+    pub(super) session: Option<Session>,
+    /// Opening and last applied storage for the unified settings dialog.
+    pub(super) settings_sources: BTreeMap<String, settings_data::Source>,
     view: Arc<View>,
     panel: Entity<Panel>,
     manager: ManagerWindow,
@@ -159,6 +162,7 @@ impl PluginCoordinator {
             traced_doc: None,
             traced_scene: None,
             session: None,
+            settings_sources: BTreeMap::new(),
             view: Arc::new(View::default()),
             panel: cx.new(|_| Panel::new(metrics)),
             manager: ManagerWindow::default(),

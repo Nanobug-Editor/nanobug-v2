@@ -20,7 +20,7 @@ use super::{
 };
 use crate::ui::{
     icons::{Icon, IconCache},
-    theme::style,
+    theme::{ThemeComponent, style},
 };
 #[cfg(windows)]
 use gpui::WindowControlArea;
@@ -378,7 +378,7 @@ impl Render for Workspace {
                     .cursor(divider_cursor(axis))
             }));
         }
-        if self.has_canvas_button_callbacks() {
+        if self.settings.is_none() && self.has_canvas_button_callbacks() {
             root = root
                 .on_mouse_up(MouseButton::Middle, cx.listener(Self::plugin_canvas_up))
                 .on_mouse_up(MouseButton::Right, cx.listener(Self::plugin_canvas_up));
@@ -429,6 +429,10 @@ impl Render for Workspace {
             self.file_picker_message_layer()
         };
         let small_popup_bounds = small_popup.map(|area| area.pixels(self.metrics));
+        let settings_bounds = self
+            .settings
+            .as_ref()
+            .map(|_| self.settings_area().pixels(self.metrics));
         let leader_bounds = sequence_hint.map(|area| area.pixels(self.metrics));
         let modal_bounds = small_popup_bounds.filter(|_| small_modal.is_some());
         let message_bounds = message.as_ref().map(|layer| layer.bounds);
@@ -566,12 +570,14 @@ impl Render for Workspace {
             } else {
                 None
             };
-            if small_popup_bounds.is_some() || message_bounds.is_some() {
+            if small_popup_bounds.is_some() || message_bounds.is_some() || settings_bounds.is_some()
+            {
                 let viewport = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
                 let popup_cuts = leader_bounds
                     .into_iter()
                     .flat_map(|popup| self.leader_cutouts(popup, start_layout))
-                    .chain(modal_bounds);
+                    .chain(modal_bounds)
+                    .chain(settings_bounds);
                 let regions = visible_regions(viewport, popup_cuts.chain(message_bounds));
                 // Give each clip its own cached-view scope for the shared panels and cursor.
                 for (index, region) in regions.into_iter().enumerate() {
@@ -625,6 +631,7 @@ impl Render for Workspace {
                     // An interactive popup can cover part of the message while the timer runs.
                     let cuts = modal_bounds
                         .into_iter()
+                        .chain(settings_bounds)
                         .chain(leader_bounds)
                         .chain(inline_popup_bounds)
                         .chain(leader_bounds.into_iter().flat_map(|popup| {
@@ -719,13 +726,14 @@ impl Render for Workspace {
         if let Some(area) = sequence_hint {
             root = root.child(self.sequence_hint_element(area, cx));
         }
-        if plugin_popup.is_some()
-            || confirmation.is_none()
-                && (language_picker.is_some()
-                    || picker_prompt.is_some()
-                    || document_results.is_some()
-                    || command_window.is_some()
-                    || small_popup.is_none() && message_bounds.is_none())
+        if self.settings.is_none()
+            && (plugin_popup.is_some()
+                || confirmation.is_none()
+                    && (language_picker.is_some()
+                        || picker_prompt.is_some()
+                        || document_results.is_some()
+                        || command_window.is_some()
+                        || small_popup.is_none() && message_bounds.is_none()))
         {
             let history_hint = leader_bounds.filter(|hint| {
                 command_window
@@ -859,6 +867,63 @@ impl Render for Workspace {
             window,
         ) {
             root = root.cursor_pointer();
+        }
+        if let Some(settings) = &self.settings {
+            let area = self.settings_area();
+            let bounds = area.pixels(self.metrics);
+            let selector = settings.selector_layers(area, self.metrics);
+            let selector_bounds = selector.as_ref().map(|(bounds, _)| *bounds);
+            let overlay = div()
+                .id("settings-overlay")
+                .absolute()
+                .left_0()
+                .top_0()
+                .size_full()
+                .occlude()
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+                .on_scroll(cx.listener(Self::scroll))
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        move |viewport, _, window, cx| {
+                            // Leave the same window material exposed as behind the status bar.
+                            for strip in exposed_regions(viewport, bounds) {
+                                if !strip.is_empty() {
+                                    window.paint_quad(gpui::fill(strip, rgba(0x050a1480)));
+                                }
+                            }
+                            if let Some(tint) = style(cx)
+                                .for_component(ThemeComponent::Footer)
+                                .component_background()
+                            {
+                                window.paint_quad(gpui::fill(bounds, rgba(tint)));
+                            }
+                        },
+                    )
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .size_full(),
+                )
+                .children(
+                    settings
+                        .layers(area, self.metrics)
+                        .into_iter()
+                        .filter_map(|layer| layer_around_popup(layer, selector_bounds, window)),
+                )
+                .children(
+                    selector
+                        .into_iter()
+                        .flat_map(|(_, layers)| layers)
+                        .filter_map(|layer| layer_element(layer, window)),
+                );
+            let viewport = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
+            root = root.child(overlay.child(clipped_entity(
+                self.cursor.clone(),
+                viewport,
+                bounds,
+                window,
+            )));
         }
         let view = cx.entity();
         root.child(

@@ -5,6 +5,18 @@ use super::*;
 impl Engine {
     pub(super) fn action(&mut self, action: Action) {
         match action {
+            Action::SettingsCatalog { project, reply } => {
+                let result = self.settings_catalog(project);
+                let _ = reply.try_send(result.map_err(|error| format!("{error:#}")));
+            }
+            Action::WriteSettings(request, reply) => {
+                let result = self.write_settings_page(&request);
+                let _ = reply.try_send(
+                    result
+                        .map(|()| request)
+                        .map_err(|error| format!("{error:#}")),
+                );
+            }
             Action::ControlLanguageServer {
                 operation,
                 target,

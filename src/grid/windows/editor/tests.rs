@@ -22,7 +22,8 @@ fn ex_highlight_overlays_retained_language_plugin_spans() -> Result<(), String> 
         language::{ByteRange, DocumentFeatures, Highlight, SyntaxKind},
     };
 
-    let doc = Document::new("let TODO other\n");
+    let mut doc = Document::new("let TODO other\n");
+    doc.path = Some("main.rs".into());
     let version = (doc.opening, doc.revision);
     let mut editor = EditorWindow::new(doc);
     editor.buffers[0].set_presentation(Some((
@@ -41,10 +42,12 @@ fn ex_highlight_overlays_retained_language_plugin_spans() -> Result<(), String> 
                     Highlight {
                         range: ByteRange { start: 0, end: 3 },
                         kind: SyntaxKind::Keyword,
+                        modifiers: Default::default(),
                     },
                     Highlight {
                         range: ByteRange { start: 4, end: 14 },
                         kind: SyntaxKind::Comment,
+                        modifiers: Default::default(),
                     },
                 ],
                 ..Default::default()
@@ -100,6 +103,42 @@ fn ex_highlight_overlays_retained_language_plugin_spans() -> Result<(), String> 
         syntax_color(SyntaxKind::Comment)
     );
     assert_eq!(editor.buffers[0].highlights().len(), 2);
+    ex(&mut editor, "hi Field guifg=#778899")?;
+    ex(&mut editor, "hi Readonly gui=bold")?;
+    let overlay = nanobug::plugins::session::DocumentSyntax {
+        version,
+        path: "main.rs".into(),
+        grammar: None,
+        highlights: vec![Highlight {
+            range: ByteRange { start: 9, end: 14 },
+            kind: SyntaxKind::Field,
+            modifiers: nanobug_plugin_sdk::language::SyntaxModifiers(1 | 4),
+        }],
+    };
+    editor.buffers[0].syntax_layers[1] = Some(Arc::new(overlay.clone()));
+    let live = paint(&editor, 9);
+    assert_eq!(live.foreground, 0x778899);
+    let style = nanobug::vim::HighlightStyle {
+        attributes: nanobug::vim::HighlightAttributes {
+            bold: true,
+            strikethrough: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        live,
+        crate::grid::render::CellPaint::new(0x778899, live.background, false).with_highlight(style)
+    );
+    editor.buffers[0].syntax_layers[1] =
+        Some(Arc::new(nanobug::plugins::session::DocumentSyntax {
+            version: (version.0, version.1 + 1),
+            ..overlay
+        }));
+    assert_eq!(
+        paint(&editor, 9).foreground,
+        syntax_color(SyntaxKind::Comment)
+    );
     Ok(())
 }
 

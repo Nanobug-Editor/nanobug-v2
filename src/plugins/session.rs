@@ -5,6 +5,7 @@ mod profile;
 mod rules;
 mod trace;
 pub use super::pipe::PROCESS_MEMORY_LABEL;
+pub use super::tools::rust_analyzer::ScanOverride;
 pub use super::tools::{
     ToolOperation, ToolOperationState,
     background::{BackgroundToolPhase, BackgroundToolStatus},
@@ -159,6 +160,33 @@ pub struct DocumentPresentation {
     pub features: nanobug_plugin_sdk::language::DocumentFeatures,
 }
 
+/// Resolve the built-in highlighter used for documents without an official language package.
+pub fn builtin_syntax_grammar(
+    path: Option<&std::path::Path>,
+    filetype: Option<&str>,
+) -> Option<&'static str> {
+    let extension = filetype.or_else(|| path?.extension()?.to_str())?;
+    Some(match extension.to_ascii_lowercase().as_str() {
+        "json" | "jsonc" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
+        "lua" => "lua",
+        _ => return None,
+    })
+}
+
+/// Additional highlighting tied to the exact file and revision that was analyzed.
+#[derive(Clone)]
+pub struct DocumentSyntax {
+    /// Bundled grammar for lexical captures. Language-server overlays carry no grammar.
+    pub grammar: Option<&'static str>,
+    pub version: (u64, u64),
+    pub path: PathBuf,
+    pub highlights: Vec<nanobug_plugin_sdk::language::Highlight>,
+}
+
 /// Live diagnostics for one version of the current document.
 #[derive(Clone)]
 pub struct DocumentDiagnostics {
@@ -300,6 +328,10 @@ pub struct View {
     pub surfaces: BTreeMap<Key, Surface>,
     /// The latest valid presentation of the current document from each provider.
     pub document_presentations: BTreeMap<Key, Arc<DocumentPresentation>>,
+    /// Syntax for configuration and source formats that have a bundled grammar and no standard plugin.
+    pub builtin_syntax: Option<(u64, Arc<DocumentSyntax>)>,
+    /// Revision-matched semantic roles and modifiers from authorized language servers.
+    pub semantic_syntax: BTreeMap<Key, Arc<DocumentSyntax>>,
     /// Revision-matched diagnostics from the project language server.
     pub document_diagnostics: BTreeMap<Key, Arc<DocumentDiagnostics>>,
     /// Language server for each selected document, or a server started for the project.
@@ -352,6 +384,16 @@ pub struct CallResult {
 
 /// User and editor events queued on the supervisor.
 pub enum Action {
+    /// Capture installed manifests and committed configuration even before the first native frame update.
+    SettingsCatalog {
+        project: Option<u64>,
+        reply: async_channel::Sender<Result<SettingsCatalog, String>>,
+    },
+    /// Commit one settings page with acknowledgement from the owning supervisor.
+    WriteSettings(
+        SettingsWrite,
+        async_channel::Sender<Result<SettingsWrite, String>>,
+    ),
     /// Apply a native language-server operation within an existing plugin Session.
     ControlLanguageServer {
         operation: LanguageServerOperation,
@@ -458,6 +500,47 @@ pub enum Action {
         event: PluginEvent,
         reply: Option<async_channel::Sender<Result<CallResult, String>>>,
         timeout: Duration,
+    },
+}
+
+/// Committed data from the supervisor used to populate the native settings tree.
+pub struct SettingsCatalog {
+    pub installed: Arc<Vec<Installed>>,
+    pub scopes: BTreeMap<ConfigScope, Config>,
+    /// Project-specific manual scan lists; a malformed plugin file leaves other pages usable.
+    pub scans: BTreeMap<String, Result<ScanOverride, String>>,
+}
+
+/// A single manifest field, including its older names for lossless rollback.
+pub struct SettingPatch {
+    pub id: String,
+    pub before: BTreeMap<String, serde_json::Value>,
+    pub after: BTreeMap<String, serde_json::Value>,
+    /// Restore storage captured before this edit, including an older release's incompatible type.
+    pub restore_snapshot: bool,
+}
+
+/// Typed and scope-bound mutations supported by the settings dialog.
+pub enum SettingsWrite {
+    Enabled {
+        namespace: String,
+        digest: String,
+        before: bool,
+        after: bool,
+    },
+    Manifest {
+        namespace: String,
+        digest: String,
+        scope: ConfigScope,
+        owner_was_absent: bool,
+        fields: Vec<SettingPatch>,
+    },
+    Scan {
+        namespace: String,
+        digest: String,
+        project: u64,
+        before: ScanOverride,
+        after: ScanOverride,
     },
 }
 

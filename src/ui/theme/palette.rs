@@ -1,6 +1,7 @@
 //! Read editable palettes while keeping retained color roles independent of their RGB values.
 
 use anyhow::{Context, Result, bail, ensure};
+use nanobug_plugin_sdk::language::SyntaxKind;
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -106,10 +107,10 @@ impl ThemeComponent {
 }
 
 /// Optional color values indexed by retained role.
-type Colors = [Option<u32>; FIELDS.len()];
+const COLOR_COUNT: usize = FIELDS.len() + SyntaxKind::ALL.len();
+type Colors = [Option<u32>; COLOR_COUNT];
 
 /// The global colors and sparse component overrides for one theme.
-#[derive(Default)]
 struct Palette {
     /// Global colors after taking any values omitted by the user from the bundled file.
     global: Colors,
@@ -117,7 +118,63 @@ struct Palette {
     components: [Colors; ThemeComponent::COUNT],
 }
 
+impl Default for Palette {
+    fn default() -> Self {
+        Self {
+            global: [None; COLOR_COUNT],
+            components: [[None; COLOR_COUNT]; ThemeComponent::COUNT],
+        }
+    }
+}
+
+/// Stable retained role for this kind, preserving the original seven color keys.
+pub(crate) fn syntax_color(kind: SyntaxKind) -> u32 {
+    use SyntaxKind::*;
+    match kind {
+        Keyword => SYNTAX_KEYWORD,
+        Type => SYNTAX_TYPE,
+        Function => SYNTAX_FUNCTION,
+        String => SYNTAX_STRING,
+        Constant => SYNTAX_CONSTANT,
+        Comment => SYNTAX_COMMENT,
+        Attribute => SYNTAX_ATTRIBUTE,
+        _ => ROLE_START + (((FIELDS.len() + kind as usize) as u32) << 8),
+    }
+}
+
+/// Supply an initial palette role for independent language-specific groups.
+fn fallback_color(kind: SyntaxKind) -> u32 {
+    use SyntaxKind::*;
+    if let Some(parent) = kind.parent() {
+        return syntax_color(parent);
+    }
+    match kind {
+        Module | Tag | SqlTable | MarkupTable => SYNTAX_TYPE,
+        MarkupHeading | Operator => SYNTAX_KEYWORD,
+        MarkupLink | MarkupUrl => SYNTAX_FUNCTION,
+        MarkupCode | MarkupCodeBlock => SYNTAX_STRING,
+        MarkupEmphasis | MarkupStrong | MarkupStrike | TagAttribute | CssSelector | CssProperty
+        | ConfigKey | SqlParameter | Lifetime | Label => SYNTAX_ATTRIBUTE,
+        MarkupQuote => SYNTAX_COMMENT,
+        MarkupMarker | MarkupList => SYNTAX_CONSTANT,
+        _ => TEXT,
+    }
+}
+
 impl Palette {
+    /// Resolve a sparse syntax key through its ancestors after applying component overrides.
+    fn resolved(&self, component: Option<ThemeComponent>, mut index: usize) -> u32 {
+        loop {
+            if let Some(value) = component
+                .and_then(|c| self.component_color(c, index))
+                .or(self.global[index])
+            {
+                return value;
+            }
+            let kind = SyntaxKind::ALL[index - FIELDS.len()];
+            index = role_index(fallback_color(kind)).expect("built-in fallback color");
+        }
+    }
     /// Find the nearest explicit override of `index` starting in `component`.
     fn component_color(&self, mut component: ThemeComponent, index: usize) -> Option<u32> {
         loop {
@@ -146,7 +203,7 @@ static DEFAULTS: LazyLock<[Palette; 2]> = LazyLock::new(|| {
     [DARK, LIGHT].map(|template| {
         let palette = parse(template, None).expect("validate bundled theme TOML");
         assert!(
-            palette.global.iter().all(Option::is_some),
+            palette.global[..FIELDS.len()].iter().all(Option::is_some),
             "bundle every theme color"
         );
         palette
@@ -195,7 +252,7 @@ fn role_index(color: u32) -> Option<usize> {
         .checked_sub(ROLE_START)
         .filter(|offset| offset & 0xff == 0)
         .map(|offset| (offset >> 8) as usize)
-        .filter(|&index| index < FIELDS.len())
+        .filter(|&index| index < COLOR_COUNT)
 }
 
 /// Resolve `color` in the chosen `light` variant and optional `component`, preserving literal colors.
@@ -203,11 +260,20 @@ pub(super) fn resolve(light: bool, component: Option<ThemeComponent>, color: u32
     let Some(index) = role_index(color) else {
         return color;
     };
+    palette(light).resolved(component, index)
+}
+
+/// Return the configured foreground of a semantic modifier, which is transparent by default.
+pub(super) fn modifier_foreground(
+    light: bool,
+    component: Option<ThemeComponent>,
+    kind: SyntaxKind,
+) -> Option<u32> {
+    let index = role_index(syntax_color(kind))?;
     let palette = palette(light);
     component
-        .and_then(|scope| palette.component_color(scope, index))
+        .and_then(|region| palette.component_color(region, index))
         .or(palette.global[index])
-        .expect("the bundled palette supplies every role")
 }
 
 /// Find an explicit `color` override inherited by `component` in the chosen `light` variant.
@@ -259,6 +325,10 @@ fn migrate(parent: &Path, template: &str, light: bool) -> Result<String> {
     for (key, value) in values {
         read_color(&key, &value).with_context(|| format!("Migrate {}", legacy_path.display()))?;
         // Substitute only the value so the template's inline explanation survives migration.
+        if !document.contains_key(&key) {
+            document[&key] = toml_edit::value(value);
+            continue;
+        }
         let old = document[&key]
             .as_value_mut()
             .context("Bundled color missing")?;
@@ -273,7 +343,7 @@ fn migrate(parent: &Path, template: &str, light: bool) -> Result<String> {
 fn parse(document: &str, defaults: Option<&Palette>) -> Result<Palette> {
     let mut table: toml::Table = toml::from_str(document.trim_start_matches('\u{feff}'))?;
     let mut palette = Palette {
-        global: defaults.map(|value| value.global).unwrap_or_default(),
+        global: defaults.map_or([None; COLOR_COUNT], |value| value.global),
         ..Palette::default()
     };
     if let Some(components) = table.remove("components") {
@@ -322,8 +392,16 @@ fn read_value(key: &str, value: &toml::Value) -> Result<(usize, u32)> {
 
 /// Validate configured `value` against the hexadecimal width of color role `key`.
 fn read_color(key: &str, value: &str) -> Result<(usize, u32)> {
-    let Some((index, &(_, digits))) = FIELDS.iter().enumerate().find(|(_, field)| field.0 == key)
-    else {
+    let (index, digits) = if let Some((index, (_, digits))) =
+        FIELDS.iter().enumerate().find(|(_, field)| field.0 == key)
+    {
+        (index, *digits)
+    } else if let Some(kind) = SyntaxKind::ALL.iter().find(|kind| kind.theme_key() == key) {
+        (
+            role_index(syntax_color(*kind)).expect("syntax color role"),
+            6,
+        )
+    } else {
         bail!("Unknown theme color {key}");
     };
     let hex = value.strip_prefix('#').unwrap_or_default();
@@ -369,6 +447,25 @@ mod tests {
         assert!(load(&dark, false).is_err());
         assert_eq!(fs::read_to_string(&dark)?, "unknown = 1\n");
         assert!(load(&light, true).is_ok());
+        Ok(())
+    }
+
+    /// A theme written before detailed syntax roles still drives descendants in the editor component.
+    #[test]
+    fn old_and_sparse_themes_inherit_syntax_colors() -> Result<()> {
+        let palette = parse(
+            "syntax_constant = '#aabbcc'\nsyntax_float = '#010203'\n[components.editor]\nsyntax_function = '#ff9911'\n",
+            Some(&DEFAULTS[0]),
+        )?;
+        let rgb = |kind| {
+            palette.resolved(
+                Some(ThemeComponent::Editor),
+                role_index(syntax_color(kind)).unwrap(),
+            )
+        };
+        assert_eq!(rgb(SyntaxKind::Number), 0xaabbcc);
+        assert_eq!(rgb(SyntaxKind::Float), 0x010203);
+        assert_eq!(rgb(SyntaxKind::Method), 0xff9911);
         Ok(())
     }
 

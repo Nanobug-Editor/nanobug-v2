@@ -64,6 +64,7 @@ Copy-Item plugins/sdk/examples/nanobug-plugin.toml,plugins/sdk/examples/detect.j
 - `hover` 由项目授权的原生语言服务处理。`PluginEvent::Hover.offset` 指定当前文档中的 UTF-8 字节位置，宿主将语言服务器返回的签名、类型和文档转为有长度上限的 Markdown，放入 `Output.hover`。服务端标为纯文本的内容按字面显示。
 - Rust 模块可以声明 `rust_analyzer = true` 和 `document_extensions = ["rs"]`，将已声明的补全、诊断、定义跳转和符号详情交给宿主管理的 rust-analyzer。项目授权执行后，宿主同步已打开的 Rust 缓冲区，并仅显示与当前文档修订匹配的实时诊断。普通 WASM 事件仍可提供语法和基础补全。
 - 通用语言模块可声明宿主支持的 `language_server`。补全、诊断、定义跳转和符号详情继续由 `provides` 声明。宿主在项目授权后启动对应语言服务器，并把未保存的文档通过 LSP 同步。提供者可用普通 WASM 回调实现基础补全和语法诊断。
+- 语言插件可在用于展示的查询前加 `language::HIGHLIGHT_QUERY_PREFIX`，让运行时合并内置语法捕获，并用 `DocumentFeatures::from_captures(&snapshot.text, captures)` 保留高亮、折叠和大纲。例子包括 `@function.method`、`@variable.parameter` 和 `@string.escape`。精确的子范围可嵌在字符串或注释内。直接构造结果时使用 `Highlight::new(range, kind)`，并可通过 `modifiers` 叠加只读、静态或已弃用标记。
 - `QuerySyntax` 在公共解析进程中对当前正文执行 Tree-sitter 查询，返回捕获范围和语法错误。查询和旧的 `ParseDocument` 共用文档语法树。使用 `await_service = true` 及一条服务请求，`ServiceResult` 的输出将完成原调用，受原调用的截止时间和文档版本约束。
 - `ReadProjectAncestors` 使用相同的等待方式，从当前文档目录向上读取指定文件，边界为打开的项目根，要求 `read_project`。返回按距离排序的项目相对路径和 UTF-8 正文。
 - `format` 提供者收到 `Format` 后，可以用 `Output.edits` 返回文本修改，或用 `Output.format_error` 报告失败。保存到新路径时，事件的可选 `path` 字段会提供目标，但编辑范围仍以当前缓冲区为准。

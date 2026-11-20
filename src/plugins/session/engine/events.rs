@@ -30,6 +30,7 @@ pub(super) enum ResultEvent {
     CredentialAccess(credential_control::AccessResult),
     Service(Key, u64, ServiceResult),
     Syntax(Key, u64, Version, ServiceResult),
+    BuiltinSyntax(builtin_syntax::Stamp, Option<super::super::DocumentSyntax>),
     LanguageService(language::Pending, Result<serde_json::Value, String>),
     Analyzer(Key, u64, tools::rust_analyzer::Event),
     Tool(Key, u64, ServiceResult),
@@ -205,6 +206,7 @@ impl Engine {
                 }
                 self.event(ResultEvent::Service(key, generation, result));
             }
+            ResultEvent::BuiltinSyntax(stamp, data) => self.finish_builtin_syntax(stamp, data),
             ResultEvent::LanguageService(pending, result) => {
                 self.language_service_finished(pending, result);
             }

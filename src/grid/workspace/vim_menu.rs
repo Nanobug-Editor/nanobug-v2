@@ -102,6 +102,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.settings.is_some() {
+            cx.stop_propagation();
+            return;
+        }
         if self.vim_menu.is_some() {
             self.close_vim_menu(window, cx);
             cx.stop_propagation();

@@ -11,10 +11,7 @@ use crate::{
     },
     ui::{
         icons::Icon,
-        theme::{
-            CURRENT, GOLD, MUTED, PREEDIT, TEXT, ThemeComponent, WARNING_TEXT, syntax_color,
-            syntax_highlight_groups,
-        },
+        theme::{CURRENT, GOLD, MUTED, PREEDIT, TEXT, ThemeComponent, WARNING_TEXT, syntax_color},
     },
 };
 use nanobug::vim::InputMappings;
@@ -26,12 +23,12 @@ const MARKDOWN_SOURCE_RIGHT_PADDING: usize = 1;
 const MIN_LINE_NUMBER_COLUMNS: usize = 2;
 
 /// Find the syntax role at document byte `offset` from sorted `highlights`.
-fn syntax_kind(highlights: &[Highlight], offset: usize) -> Option<SyntaxKind> {
+fn syntax_span(highlights: &[Highlight], offset: usize) -> Option<Highlight> {
     let index = highlights.partition_point(|span| span.range.end <= offset);
     highlights
         .get(index)
         .filter(|span| span.range.start <= offset)
-        .map(|span| span.kind)
+        .copied()
 }
 
 /// Right-facing fold marker with a tight crop at the arrow tip.
@@ -212,6 +209,15 @@ impl EditorWindow {
         text.keep_whole_graphemes(body.x..body.x + body.w);
         let highlights = buffer.highlights();
         let markdown = buffer.markdown_highlights();
+        let [native, semantic] = buffer.syntax_layers.each_ref().map(|layer| {
+            layer
+                .as_ref()
+                .filter(|d| {
+                    d.version == (vim.doc.opening, vim.doc.revision)
+                        && vim.doc.path.as_ref() == Some(&d.path)
+                })
+                .map_or(&[][..], |d| d.highlights.as_slice())
+        });
         let base = CellPaint::new(TEXT, 0, false);
         let normal = (!active)
             .then(|| mappings.highlight_override("NormalNC"))
@@ -220,26 +226,26 @@ impl EditorWindow {
             .map_or(base, |style| base.with_highlight(style));
         let search = mappings.highlight_override("Search");
         let visual = mappings.highlight_override("Visual");
-        let syntax = [
-            SyntaxKind::Keyword,
-            SyntaxKind::Type,
-            SyntaxKind::Function,
-            SyntaxKind::String,
-            SyntaxKind::Constant,
-            SyntaxKind::Comment,
-            SyntaxKind::Attribute,
-        ]
-        .map(|kind| {
-            syntax_highlight_groups(kind)
-                .iter()
-                .find_map(|group| mappings.highlight_override(group))
-        });
+        let syntax = mappings.syntax_styles();
         let source_styles = |offset, tint| {
             let mut paint = normal;
             if tint != 0 {
                 paint.background = tint;
             }
-            let (kind, fallback) = if let Some(kind) = syntax_kind(highlights, offset) {
+            let lexical = syntax_span(highlights, offset).or_else(|| syntax_span(native, offset));
+            let semantic = syntax_span(semantic, offset);
+            let (kind, fallback) = if let Some(kind) = semantic
+                .map(|mut s| {
+                    if let Some(finer) = lexical
+                        && std::iter::successors(finer.kind.parent(), |k| k.parent())
+                            .any(|k| k == s.kind)
+                    {
+                        s.kind = finer.kind;
+                    }
+                    s
+                })
+                .or(lexical)
+            {
                 (Some(kind), None)
             } else if let Some(color) = color_at(offset) {
                 (None, Some(color))
@@ -247,15 +253,26 @@ impl EditorWindow {
                 (
                     markdown
                         .as_deref()
-                        .and_then(|spans| syntax_kind(spans, offset)),
+                        .and_then(|spans| syntax_span(spans, offset)),
                     None,
                 )
             };
-            if let Some(kind) = kind {
+            if let Some(span) = kind {
+                let kind = span.kind;
                 if let Some(style) = syntax[kind as usize] {
                     paint = paint.with_highlight(style);
                 } else {
                     paint.foreground = syntax_color(kind);
+                }
+                for (bit, modifier) in nanobug_plugin_sdk::language::SyntaxModifiers::FLAGS {
+                    if span.modifiers.0 & bit != 0 {
+                        let style = syntax[modifier as usize].unwrap_or_else(|| {
+                            let mut s = nanobug::vim::HighlightStyle::default();
+                            s.attributes.strikethrough = modifier == SyntaxKind::Deprecated;
+                            s
+                        });
+                        paint = paint.with_highlight(style);
+                    }
                 }
             } else if let Some(color) = fallback {
                 paint.foreground = color;

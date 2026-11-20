@@ -51,6 +51,7 @@ fn main() -> io::Result<()> {
         input.read_exact(&mut body)?;
         let body = String::from_utf8_lossy(&body);
         if body.contains(r#""method":"initialize""#) {
+            fs::write("last-initialize.json", body.as_bytes())?;
             let reply = r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"textDocumentSync":1,"completionProvider":{}}}}"#;
             write!(output, "Content-Length: {}\r\n\r\n{reply}", reply.len())?;
             output.flush()?;

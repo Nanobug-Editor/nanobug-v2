@@ -1,7 +1,7 @@
 //! Host-owned state, input layout and drawing for plugin-provided windows.
 
 pub(in crate::grid) mod canvas;
-pub(in crate::grid) mod field;
+use crate::grid::text_field as field;
 pub(in crate::grid) mod native_field;
 mod view;
 

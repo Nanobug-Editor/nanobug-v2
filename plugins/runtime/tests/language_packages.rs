@@ -400,7 +400,7 @@ fn exercise(
         document_filetype: None,
         event: PluginEvent::Open,
         settings: Default::default(),
-        draft: String::new(),
+        draft: Default::default(),
         viewport: None,
         canvas_sync: None,
         open_documents: Vec::new(),
@@ -457,6 +457,23 @@ fn exercise(
         .document_features
         .unwrap_or_else(|| panic!("{id}: no document features"));
     assert!(!features.highlights.is_empty(), "{id}: no highlights");
+    use nanobug_plugin_sdk::language::SyntaxKind::*;
+    let (token, role) = match id {
+        "html" | "angular" | "vue" | "jsx-tsx" => ("<p>", Tag),
+        "svelte" | "astro" => ("<Item>", Component),
+        "css" => ("font-family", CssProperty),
+        "csharp" | "java" | "php" | "kotlin" => ("Item", Class),
+        "go" | "javascript" | "typescript" | "python" => ("return", Return),
+        "ruby" => ("title", Method),
+        _ => ("title", SqlColumn),
+    };
+    let offset = fixture.text.find(token).unwrap() + usize::from(token.starts_with('<'));
+    let actual = features
+        .highlights
+        .iter()
+        .find(|s| s.range.start <= offset && offset < s.range.end)
+        .map(|s| s.kind);
+    assert_eq!(actual, Some(role), "{id}: wrong role for {token}");
     assert!(!features.symbols.is_empty(), "{id}: no outline");
     assert!(!features.folds.is_empty(), "{id}: no folds");
     assert!(

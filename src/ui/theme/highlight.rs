@@ -4,19 +4,18 @@ use super::{Style, ThemeComponent, palette, syntax_color};
 use nanobug::vim::{HighlightStyle, InputMappings};
 use nanobug_plugin_sdk::language::SyntaxKind;
 
-/// Return the Ex groups applicable to an SDK `kind` in order of specificity.
-pub(crate) fn syntax_highlight_groups(kind: SyntaxKind) -> &'static [&'static str] {
-    use SyntaxKind::*;
-    match kind {
-        Keyword => &["@keyword", "Keyword", "Statement"],
-        Type => &["@type", "Type"],
-        Function => &["@function", "Function", "Identifier"],
-        String => &["@string", "String", "Constant"],
-        Constant => &["@constant", "Constant"],
-        Comment => &["@comment", "Comment"],
-        Attribute => &["@attribute", "Attribute", "PreProc"],
-    }
-}
+/// Familiar Ex groups retain their historical role or inherit a more specific SDK group.
+const ALIASES: &[(&str, SyntaxKind)] = &[
+    ("Statement", SyntaxKind::Keyword),
+    ("Identifier", SyntaxKind::Function),
+    ("PreProc", SyntaxKind::Attribute),
+    ("StorageClass", SyntaxKind::Type),
+    ("Structure", SyntaxKind::Type),
+    ("Typedef", SyntaxKind::Type),
+    ("Include", SyntaxKind::Import),
+    ("Define", SyntaxKind::Directive),
+    ("PreCondit", SyntaxKind::Directive),
+];
 
 impl Style {
     /// Update the workspace's default named groups against this selected appearance.
@@ -88,45 +87,57 @@ impl Style {
             ("MatchParen", background(editor.foreground(palette::ACCENT))),
             ("Error", foreground(editor.foreground(palette::ERROR_TEXT))),
         ];
-        let syntax = [
-            SyntaxKind::String,
-            SyntaxKind::Constant,
-            SyntaxKind::Keyword,
-            SyntaxKind::Type,
-            SyntaxKind::Function,
-            SyntaxKind::Comment,
-            SyntaxKind::Attribute,
-        ]
-        .into_iter()
-        .flat_map(|kind| {
-            let style = foreground(editor.foreground(syntax_color(kind)));
-            syntax_highlight_groups(kind)
-                .iter()
-                .map(move |name| (*name, style))
-        });
-        let aliases = [
-            (
-                SyntaxKind::Constant,
-                &["Character", "Number", "Boolean", "Float"][..],
-            ),
-            (
-                SyntaxKind::Keyword,
-                &["Conditional", "Repeat", "Label", "Operator", "Exception"][..],
-            ),
-            (
-                SyntaxKind::Type,
-                &["StorageClass", "Structure", "Typedef"][..],
-            ),
-            (
-                SyntaxKind::Attribute,
-                &["Include", "Define", "Macro", "PreCondit"][..],
-            ),
-        ]
-        .into_iter()
-        .flat_map(|(kind, names)| {
-            let style = foreground(editor.foreground(syntax_color(kind)));
-            names.iter().map(move |name| (*name, style))
-        });
-        mappings.set_highlight_palette(base.into_iter().chain(syntax).chain(aliases));
+        let mut entries = base.to_vec();
+        let mut parents = Vec::new();
+        for &kind in SyntaxKind::ALL {
+            let mut style = foreground(editor.foreground(syntax_color(kind)));
+            if matches!(
+                kind,
+                SyntaxKind::Readonly | SyntaxKind::Static | SyntaxKind::Deprecated
+            ) {
+                style.foreground =
+                    palette::modifier_foreground(editor.light, editor.component, kind);
+                style.attributes.strikethrough = kind == SyntaxKind::Deprecated;
+            }
+            entries.extend([(kind.group(), style), (kind.capture_group(), style)]);
+            parents.push((kind.capture_group(), kind.group()));
+            if let Some(parent) = kind.parent() {
+                parents.push((kind.group(), parent.capture_group()));
+            }
+        }
+        for &(alias, kind) in ALIASES {
+            entries.push((alias, foreground(editor.foreground(syntax_color(kind)))));
+        }
+        // These legacy overrides were part of the original seven-role rendering contract.
+        parents.extend([
+            ("Keyword", "Statement"),
+            ("Function", "Identifier"),
+            ("Attribute", "PreProc"),
+            ("String", "@constant"),
+        ]);
+        mappings.set_highlight_palette(entries);
+        mappings.set_highlight_inheritance(parents);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn methods_inherit_styles_and_override_colors_independently() -> anyhow::Result<()> {
+        let mappings = InputMappings::default();
+        Style::default().update_ex_highlight_palette(&mappings);
+        let mut attributes = nanobug::vim::HighlightAttributes::default();
+        attributes.italic = true;
+        mappings.save_highlight_appearance("Function", attributes, Some(0x123456), None, None)?;
+        let method = || mappings.highlight_style("@function.method").unwrap();
+        assert_eq!(method().foreground, Some(0x123456));
+        assert!(method().attributes.italic);
+        mappings.save_highlight_appearance("Method", attributes, Some(0x789abc), None, None)?;
+        assert_eq!(method().foreground, Some(0x789abc));
+        mappings.save_highlight_appearance("Method", attributes, None, None, None)?;
+        assert_eq!(method().foreground, Some(0x123456));
+        assert_eq!(mappings.highlight_foreground("Method"), None);
+        Ok(())
     }
 }

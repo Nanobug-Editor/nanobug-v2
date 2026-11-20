@@ -106,6 +106,7 @@ impl Workspace {
 
     /// Update the workspace and active popup frames through `cx`.
     pub(super) fn refresh_panels(&mut self, cx: &mut Context<Self>) {
+        self.refresh_settings(cx);
         self.refresh_vim_menu(cx);
         if let Some((history, area)) = self.command_window.as_ref().zip(self.command_window_area())
         {
