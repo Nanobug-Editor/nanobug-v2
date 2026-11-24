@@ -2,10 +2,13 @@
 //! Concrete grid windows and their retained renderer live in `grid`.
 
 pub(crate) mod backdrop;
+pub(crate) mod components;
 pub(crate) mod file_icons;
+pub(crate) mod grid_geometry;
 pub(crate) mod icons;
 pub(crate) mod ime;
 pub(crate) mod keys;
+pub(crate) mod mnemonic;
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 pub(crate) mod native_atlas;
 pub(crate) mod text;

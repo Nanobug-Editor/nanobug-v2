@@ -5,6 +5,19 @@ use std::{borrow::Cow, cell::RefCell, collections::HashMap, iter::from_fn, sync:
 use unicode_script::{Script, UnicodeScript};
 use unicode_segmentation::UnicodeSegmentation;
 
+/// Presentation of a measured label without changing its grid advance.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LabelStyle {
+    /// Ordinary grid text.
+    Text,
+    /// Ordinary grid text and shadow at half opacity.
+    Dimmed,
+    /// Underlined keyboard key name.
+    Key,
+    /// Text glyph from the symbol face.
+    Symbol,
+}
+
 /// Fixed-point precision within a grid column, shared by painting and input.
 pub const UNITS_PER_COLUMN: usize = 4096;
 
@@ -91,7 +104,7 @@ impl TextSpacing {
         byte_start: usize,
         mut column: usize,
         tabstop: usize,
-    ) -> impl Iterator<Item = TextCell<'a>> {
+    ) -> impl Iterator<Item = TextCell<'a>> + Clone {
         let mut graphemes = fragment.grapheme_indices(true);
         let mut start = 0;
         from_fn(move || {
@@ -142,6 +155,31 @@ impl TextSpacing {
             }
         }
         Cow::Borrowed(line)
+    }
+
+    /// Fit the end of the first line into `columns`, marking a hidden prefix with `…`.
+    pub(crate) fn ellipsize_start<'a>(&self, text: &'a str, columns: usize) -> Cow<'a, str> {
+        if columns == 0 {
+            return Cow::Borrowed("");
+        }
+        let line = text.split(['\r', '\n']).next().unwrap_or_default();
+        let end = self.cells(line).last().map_or(0, |cell| cell.end);
+        let width = columns.saturating_mul(UNITS_PER_COLUMN);
+        if end <= width {
+            return Cow::Borrowed(line);
+        }
+
+        let first = end - (width - UNITS_PER_COLUMN);
+        let mut label = String::from("…");
+        for cell in self.cells(line).skip_while(|cell| cell.start < first) {
+            if cell.text == "\t" {
+                // Keep the tab's measured width when its original prefix is removed.
+                label.extend(std::iter::repeat_n(' ', cell.columns));
+            } else {
+                label.push_str(cell.text);
+            }
+        }
+        Cow::Owned(label)
     }
 
     /// Return the visual extent of `line` in whole grid columns for horizontal scrolling.
@@ -205,5 +243,20 @@ mod tests {
         assert_eq!(spacing.ellipsize("文档", 3), "文档");
         assert_eq!(spacing.ellipsize("文档", 2), "…");
         assert_eq!(spacing.ellipsize("readme.md", 0), "");
+    }
+
+    #[test]
+    fn leading_ellipsis_keeps_the_measured_filename_suffix() {
+        let spacing = TextSpacing::new(Arc::new(gpui::NoopTextSystem::new()), FontId(0), 16., 6.4);
+        assert_eq!(spacing.ellipsize_start("src/main.rs", 11), "src/main.rs");
+        assert_eq!(spacing.ellipsize_start("src/main.rs", 8), "…main.rs");
+        assert_eq!(
+            spacing.ellipsize_start("前缀/a\u{301}文件.rs", 8),
+            "…a\u{301}文件.rs"
+        );
+        assert_eq!(spacing.ellipsize_start("a长文", 2), "…");
+        assert_eq!(spacing.ellipsize_start("ab\tx", 4), "…  x");
+        assert_eq!(spacing.ellipsize_start("file", 1), "…");
+        assert_eq!(spacing.ellipsize_start("file", 0), "");
     }
 }
