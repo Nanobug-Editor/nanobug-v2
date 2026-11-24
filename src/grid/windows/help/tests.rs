@@ -147,12 +147,12 @@ fn help_tab_targets_follow_localized_title_widths() {
     assert_eq!(left.top(), area.pixels(metrics).top());
     assert_eq!(
         left.size.width,
-        px(spacing.columns(list.window_title()) as f32 * metrics.cw)
+        px((spacing.columns(list.window_title()) + 2) as f32 * metrics.cw)
     );
-    assert_eq!(right.left() - left.right(), px(3. * metrics.cw));
+    assert_eq!(right.left() - left.right(), px(metrics.cw));
     assert_eq!(
         right.size.width,
-        px(spacing.columns(i18n::text("help.global_title")) as f32 * metrics.cw)
+        px((spacing.columns(i18n::text("help.global_title")) + 2) as f32 * metrics.cw)
     );
     let close = area.corner_controls(false).unwrap().close.pixels(metrics);
     assert!(right.right() < close.left());

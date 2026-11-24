@@ -32,13 +32,17 @@ impl ManagerWindow {
         let count = std::mem::take(&mut self.count).max(1);
         let mut command = ManagerCommand::None;
         match key {
-            "k" | "up" => self.tree.selected = self.tree.selected.saturating_sub(count),
-            "j" | "down" => {
+            "k" | "up" | "j" | "down" => {
+                let delta = if matches!(key, "k" | "up") {
+                    -(count as isize)
+                } else {
+                    count as isize
+                };
                 self.tree.selected = self
                     .tree
-                    .selected
-                    .saturating_add(count)
-                    .min(self.tree.entries.len().saturating_sub(1))
+                    .visible
+                    .offset(self.tree.selected, delta)
+                    .unwrap_or(0);
             }
             "home" => self.tree.selected = 0,
             "g" if prefix == Some('g') => self.tree.selected = 0,

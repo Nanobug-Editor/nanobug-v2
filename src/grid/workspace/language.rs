@@ -95,7 +95,7 @@ impl Workspace {
     /// Return the picker's grid rectangle while it owns input.
     pub(super) fn language_picker_area(&self) -> Option<Rect> {
         self.language_selection
-            .map(|_| self.small_popup_area(PICKER_COLUMNS, PICKER_ROWS))
+            .map(|_| self.corner_dialog(PICKER_COLUMNS, PICKER_ROWS))
     }
 
     /// Return the selected choice's row-start caret in workspace grid coordinates.
@@ -111,30 +111,36 @@ impl Workspace {
 
     /// Retain the picker border and footer separately from the vertically inset choices through `cx`.
     pub(super) fn refresh_language_picker(&self, cx: &mut Context<Self>) {
-        let Some(selected) = self.language_selection else {
+        let (Some(selected), Some(area)) = (self.language_selection, self.language_picker_area())
+        else {
             return;
         };
         let current = i18n::locale();
         let spacing = &self.spacing;
-        let mut frame = Frame::new(PICKER_COLUMNS, PICKER_ROWS);
-        frame.border(i18n::text("language.title"), true, false, spacing);
-        frame.key_hints(PICKER_FOOTER_ROW, self.metrics.cw, spacing, picker_hints());
+        let mut frame = Frame::titled(area, i18n::text("language.title"), spacing);
+        frame.icon_key_hints(PICKER_FOOTER_ROW, self.metrics.cw, spacing, picker_hints());
         self.popup_panel
             .update(cx, |panel, cx| panel.set(frame, cx));
 
-        let mut choices = Frame::new(PICKER_COLUMNS, LANGUAGES.len());
+        let mut choices = Frame::new(area.w, LANGUAGES.len());
         for (row, (locale, key)) in LANGUAGES.into_iter().enumerate() {
             let color = if locale == selected {
-                choices.tint(row, 1, PICKER_COLUMNS - 1, SELECTION);
+                choices.tint(row, 1, area.w.saturating_sub(1), SELECTION);
                 ACCENT
             } else {
                 TEXT
             };
-            choices.label(row, 3..PICKER_COLUMNS - 4, i18n::text(key), color, spacing);
+            choices.label(
+                row,
+                3..area.w.saturating_sub(4),
+                i18n::text(key),
+                color,
+                spacing,
+            );
             if locale == current {
                 choices.styled_label(
                     row,
-                    PICKER_COLUMNS - 3..PICKER_COLUMNS - 1,
+                    area.w.saturating_sub(3)..area.w.saturating_sub(1),
                     "✓",
                     ACCENT,
                     spacing,
@@ -201,12 +207,8 @@ impl Workspace {
         let row = y - area.y;
         let column = x - area.x;
         if row == PICKER_FOOTER_ROW {
-            let [apply, close] = key_hint_slots(
-                PICKER_COLUMNS,
-                self.metrics.cw,
-                &self.spacing,
-                picker_hints(),
-            );
+            let [apply, close] =
+                key_hint_slots(area.w, self.metrics.cw, &self.spacing, picker_hints());
             if apply.contains(&column) {
                 self.finish_language_picker(self.language_selection, window, cx);
             } else if close.contains(&column) {

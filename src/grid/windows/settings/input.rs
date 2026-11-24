@@ -121,11 +121,16 @@ impl Settings {
                 .map_or(1, |menu| menu.rows.h);
             if let Some(Editor::List { cursor, .. }) = &mut self.editor {
                 match raw {
-                    "up" | "k" => *cursor = cursor.saturating_sub(1),
-                    "down" | "j" => *cursor = (*cursor + 1).min(count.saturating_sub(1)),
-                    "pageup" => *cursor = cursor.saturating_sub(step),
-                    "pagedown" => {
-                        *cursor = cursor.saturating_add(step).min(count.saturating_sub(1))
+                    "up" | "k" | "down" | "j" | "pageup" | "pagedown" => {
+                        let delta = match raw {
+                            "up" | "k" => -1,
+                            "down" | "j" => 1,
+                            "pageup" => -(step as isize),
+                            _ => step as isize,
+                        };
+                        *cursor = crate::ui::components::grid_list::GridList::moved(
+                            *cursor, delta, count,
+                        );
                     }
                     "home" => *cursor = 0,
                     "end" => *cursor = count.saturating_sub(1),
@@ -148,7 +153,7 @@ impl Settings {
         {
             return None;
         }
-        if let Some((button, _)) = buttons().find(|(_, mnemonic)| mnemonic.matches(raw)) {
+        if let Some(button) = buttons().key(raw) {
             return self.press(button);
         }
         self.reveal = true;
@@ -168,7 +173,7 @@ impl Settings {
             "home" => self.move_row(isize::MIN),
             "end" => self.move_row(isize::MAX),
             "left" | "h" if self.pane == Pane::Tree => {
-                if !self.expanded.remove(&self.tree_row)
+                if !self.set_expanded(self.tree_row, false)
                     && let Some(parent) = self.nodes.get(self.tree_row).and_then(|n| n.parent)
                 {
                     self.select_node(parent);
@@ -176,7 +181,7 @@ impl Settings {
             }
             "right" | "l" if self.pane == Pane::Tree => {
                 if self.nodes.get(self.tree_row).is_some_and(|n| n.branch) {
-                    if !self.expanded.insert(self.tree_row) {
+                    if !self.set_expanded(self.tree_row, true) {
                         self.move_row(1);
                     }
                 } else {
@@ -197,15 +202,8 @@ impl Settings {
 
     fn move_row(&mut self, delta: isize) {
         if self.pane == Pane::Tree {
-            let visible = self.visible_tree();
-            let current = visible
-                .iter()
-                .position(|&id| id == self.tree_row)
-                .unwrap_or(0);
-            let next = current
-                .saturating_add_signed(delta)
-                .min(visible.len().saturating_sub(1));
-            if let Some(&id) = visible.get(next) {
+            let current = self.visible.position(self.tree_row).unwrap_or(0);
+            if let Some(id) = self.visible.offset(current, delta) {
                 self.select_node(id);
             }
         } else {
@@ -231,9 +229,7 @@ impl Settings {
     fn activate_node(&mut self, id: usize) {
         self.select_node(id);
         if self.nodes.get(id).is_some_and(|node| node.branch) {
-            if !self.expanded.remove(&id) {
-                self.expanded.insert(id);
-            }
+            self.set_expanded(id, !self.expanded.contains(&id));
         } else {
             self.pane = Pane::Form;
         }
@@ -274,7 +270,7 @@ impl Settings {
                         .map(str::to_owned)
                         .unwrap_or_else(|| value.to_string())
                 };
-                let mut field = text_field::Field::default();
+                let mut field = GridTextField::default();
                 field.place(&text, 0, false);
                 field.place(&text, text.len(), true);
                 Some(Editor::Input { text, field })
@@ -402,7 +398,6 @@ impl Settings {
             && menu.contains(point, metrics)
         {
             if let Some(item) = menu.hit(point, metrics, self.selector_scroll.position())
-                && item < self.choices().len()
                 && let Some(Editor::List { cursor, .. }) = &mut self.editor
             {
                 *cursor = item;
@@ -410,23 +405,24 @@ impl Settings {
             }
             return None;
         }
-        if let Some((button, _)) = layout
-            .buttons
-            .iter()
-            .find(|(_, rect)| rect.contains(col, row))
-        {
-            return self.press(*button);
+        if let Some(button) = GridButtonRow::hit_at(&layout.buttons, col - area.x, row - area.y) {
+            return self.press(button);
         }
         if layout.tree.contains(col, row) {
             if !self.finish_editor() {
                 return None;
             }
-            let index = view::hit_row(point, layout.tree, metrics, &self.tree_scroll);
-            if let Some(&node) = self.visible_tree().get(index) {
+            if let Some(hit) = self.visible.hit(
+                layout.tree.pixels(metrics),
+                point,
+                metrics.lh,
+                self.tree_scroll.position(),
+            ) {
                 self.pane = Pane::Tree;
-                self.select_node(node);
-                if self.nodes[node].branch {
-                    self.activate_node(node);
+                if self.nodes[hit.id].branch {
+                    self.activate_node(hit.id);
+                } else {
+                    self.select_node(hit.id);
                 }
             }
             return None;
@@ -491,7 +487,7 @@ impl Settings {
         {
             (2, menu.rows.h, self.choices().len())
         } else if tree.contains(col, row) {
-            (0, tree.h, self.visible_tree().len())
+            (0, tree.h, self.visible.len())
         } else if body.contains(col, row) {
             (1, body.h, self.body_rows().len())
         } else {
@@ -518,11 +514,7 @@ impl Settings {
     /// Keep the focused row in view after navigation, advancing the selector within its own clip.
     pub(in crate::grid) fn advance(&mut self, area: Rect, now: f64) {
         let (tree, body) = view::pane_bounds(area);
-        let visible = self.visible_tree();
-        let tree_at = visible
-            .iter()
-            .position(|&id| id == self.tree_row)
-            .unwrap_or(0);
+        let tree_at = self.visible.position(self.tree_row).unwrap_or(0);
         let body_rows = self.body_rows();
         let form_at = body_rows
             .iter()
@@ -540,7 +532,7 @@ impl Settings {
             };
             scroll.track_rows(input, None, height, len, now);
         };
-        track(&mut self.tree_scroll, tree_at, tree.h, visible.len());
+        track(&mut self.tree_scroll, tree_at, tree.h, self.visible.len());
         track(&mut self.form_scroll, form_at, body.h, body_rows.len());
         if let Some(Editor::List { cursor, .. }) = self.editor {
             if let Some(menu) = self.selector_layout(body) {

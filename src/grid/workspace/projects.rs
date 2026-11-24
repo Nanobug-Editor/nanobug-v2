@@ -112,6 +112,8 @@ pub(super) struct Project {
     pub(super) editor: EditorWindow,
     /// Ordered file arguments, shared by every editor in this project.
     pub(super) arguments: ArgumentList,
+    /// Diagnostic snapshots used by Quickfix and the project panes' location lists.
+    pub(super) result_lists: super::quickfix::Lists,
     /// Uppercase marks shared by every editor in this project Session.
     pub(super) file_marks: nanobug::vim::FileMarks,
     /// Explorer state, present only when the tab represents a directory.
@@ -186,6 +188,7 @@ impl Project {
             previous_focus: None,
             editor,
             arguments: ArgumentList::default(),
+            result_lists: Default::default(),
             file_marks,
             hidden_pane: None,
             sidebar: 28,
@@ -284,6 +287,7 @@ impl Project {
         let original = self.active_editor_id();
         let pane = self.allocate_editor(editor);
         self.arguments.inherit_pane(original, pane);
+        self.result_lists.inherit(original, pane);
         self.pages.insert(next, self.isolated_page(pane));
         self.pages[next].layout.hidden_pane = None;
         self.active_page += usize::from(next <= self.active_page);
@@ -345,6 +349,7 @@ impl Project {
         for id in self.pages.remove(closed).splits.ids() {
             self.inactive_editors.remove(&id);
             self.arguments.forget_pane(id);
+            self.result_lists.forget(id);
         }
         self.active_page -= usize::from(self.active_page > closed);
         self.previous_page = previous
@@ -364,6 +369,7 @@ impl Project {
                 for id in page.splits.ids() {
                     self.inactive_editors.remove(&id);
                     self.arguments.forget_pane(id);
+                    self.result_lists.forget(id);
                 }
             }
         }
@@ -650,6 +656,7 @@ impl Project {
         self.pages[self.active_page].editor_zoomed = false;
         self.allocate_editor(editor);
         self.arguments.inherit_pane(old, id);
+        self.result_lists.inherit(old, id);
         self.install_editor(old);
         self.focus_pane(Focus::Editor);
         Ok(true)
@@ -665,6 +672,7 @@ impl Project {
         self.install_editor(closed);
         self.inactive_editors.remove(&closed);
         self.arguments.forget_pane(closed);
+        self.result_lists.forget(closed);
         true
     }
 
@@ -675,6 +683,7 @@ impl Project {
         for id in self.splits().ids().into_iter().filter(|&id| id != active) {
             self.inactive_editors.remove(&id);
             self.arguments.forget_pane(id);
+            self.result_lists.forget(id);
         }
         self.splits_mut().retain_active();
     }
@@ -1576,7 +1585,7 @@ impl Workspace {
         self.vim_menu = None;
         self.remove_recent_project = None;
         self.help.close();
-        self.popup_backdrop.release(window);
+        self.dialog_backdrop.release(window);
         self.prefix = None;
         self.hovered_controls = None;
         self.pane_resize = None;

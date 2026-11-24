@@ -160,7 +160,7 @@ struct WriteBatch {
 impl ProjectSnapshot {
     /// Capture every pane of `project`, including the live outer layout of the active page.
     fn capture(project: &Project) -> Self {
-        let pages = project
+        let pages: Vec<_> = project
             .pages
             .iter()
             .enumerate()
@@ -170,12 +170,21 @@ impl ProjectSnapshot {
                 } else {
                     page.layout
                 },
-                splits: page.splits.clone(),
+                splits: Self::persistent_splits(project, &page.splits),
             })
             .collect();
-        let editors = project
-            .editors()
-            .map(|(id, editor)| (id, editor.snapshot_for_project(&project.root)))
+        let editors = pages
+            .iter()
+            .flat_map(|page| page.splits.ids())
+            .map(|id| {
+                (
+                    id,
+                    project
+                        .editor_by_id(id)
+                        .unwrap()
+                        .snapshot_for_project(&project.root),
+                )
+            })
             .collect();
         Self {
             version: FORMAT_VERSION,
@@ -190,6 +199,33 @@ impl ProjectSnapshot {
             plugin_windows: project.plugin_windows.clone(),
             file_marks: project.file_marks.snapshot(),
         }
+    }
+
+    /// Exclude transient result windows while preserving the page and all source views.
+    fn persistent_splits(project: &Project, splits: &EditorSplits) -> EditorSplits {
+        let active = splits.active();
+        let mut saved = splits.clone();
+        let preferred = project
+            .editor_by_id(active)
+            .and_then(|editor| editor.buffer().list_owner().map(|(_, source)| source))
+            .unwrap_or(active);
+        for id in splits.ids() {
+            if project.editor_by_id(id).is_some_and(|editor| {
+                editor
+                    .buffers()
+                    .iter()
+                    .all(|buffer| buffer.list_owner().is_some())
+            }) {
+                saved.focus(id);
+                saved.close_active();
+            }
+        }
+        saved.focus(if saved.ids().contains(&active) {
+            active
+        } else {
+            preferred
+        });
+        saved
     }
 
     /// Rebuild a project rooted at `root` from disk, preserving valid panes when files are missing.

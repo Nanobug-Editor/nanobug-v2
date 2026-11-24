@@ -356,19 +356,8 @@ impl Workspace {
                 forward,
                 edge,
                 count,
-            } => {
-                let project = self.projects.active_mut();
-                if let Some(offset) = project
-                    .editor
-                    .buffer()
-                    .diagnostic_target(forward, edge, count)
-                {
-                    project.editor.jump_to(offset);
-                    project.status.clear();
-                } else {
-                    project.status = i18n::text("editor.no_diagnostics").into();
-                }
-            }
+                severity,
+            } => self.jump_diagnostic(forward, edge, count, severity, window, cx),
             Action::Save(name) => {
                 let path = name.map(|name| self.ex_current_dir().join(name));
                 self.save_with_plugins(path, false, window, cx);
@@ -438,6 +427,13 @@ impl Workspace {
             Action::PluginDiagnose => {
                 self.plugin_language(nanobug::plugins::package::Provider::Diagnose, window, cx)
             }
+            Action::Quickfix { location, command } => {
+                self.quickfix_command(location, command, window, cx)
+            }
+            Action::FilterList { location, filter } => {
+                self.apply_list_filter(location, filter, window, cx)
+            }
+            Action::Diagnostic(command) => self.diagnostic_command(command, window, cx),
             Action::PluginDefinition => {
                 self.plugin_language(nanobug::plugins::package::Provider::Definition, window, cx)
             }

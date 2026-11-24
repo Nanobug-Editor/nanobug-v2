@@ -278,7 +278,11 @@ impl Engine {
             },
             pending.reply,
             pending.deadline - now,
-            CallKind::Continued,
+            if pending.kind == CallKind::BackgroundDiagnose {
+                CallKind::BackgroundDiagnoseResult
+            } else {
+                CallKind::Continued
+            },
             None,
         ) && reply.is_none()
             && let Some(live) = self

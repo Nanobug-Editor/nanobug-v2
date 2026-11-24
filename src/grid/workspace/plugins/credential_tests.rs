@@ -169,14 +169,14 @@ secret=true
 
 fn open_prompt(workspace: &mut Workspace, namespace: &str) {
     workspace.plugins.open = true;
-    workspace.plugins.manager.prompt = Some(Input {
-        kind: Prompt::Credential {
+    workspace.plugins.manager.prompt = Some(Input::new(
+        Prompt::Credential {
             namespace: namespace.into(),
             slot: "login".into(),
             value: Zeroizing::new(String::with_capacity(2048)),
         },
-        value: String::new(),
-    });
+        String::new(),
+    ));
 }
 
 fn key(

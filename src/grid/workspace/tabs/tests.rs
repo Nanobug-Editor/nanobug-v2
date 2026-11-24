@@ -37,17 +37,14 @@ fn project_shortcuts_select_and_reorder_independently() {
 #[test]
 fn tab_range_accounts_for_hidden_counts_on_both_sides() {
     let widths = [9; 18];
-    assert_eq!(visible_tabs(&widths, 61, 0, 0), 0..4);
-    assert_eq!(visible_tabs(&widths, 62, 0, 4), 1..5);
-    assert_eq!(visible_tabs(&widths, 61, 1, 17), 14..18);
-    assert_eq!(visible_tabs(&[9, 100, 9], 60, 0, 1), 1..2);
-    assert_eq!(visible_tabs(&widths, 400, 14, 17), 0..18);
-    assert_eq!(hidden_columns(0), 0);
-    assert_eq!(hidden_columns(9), 3);
-    assert_eq!(hidden_columns(10), 4);
+    assert_eq!(project_tabs(&widths, 61, 0, 0).visible, 0..4);
+    assert_eq!(project_tabs(&widths, 62, 0, 4).visible, 1..5);
+    assert_eq!(project_tabs(&widths, 61, 1, 17).visible, 14..18);
+    assert_eq!(project_tabs(&[9, 100, 9], 60, 0, 1).visible, 1..2);
+    assert_eq!(project_tabs(&widths, 400, 14, 17).visible, 0..18);
 }
 
-/// Page hit rectangles follow right-aligned numbers and overflow, with room for project names.
+/// Page hits cover the blanks beside right-aligned numbers and leave the pipe between them free.
 #[test]
 fn pages_use_the_right_side_of_the_caption() {
     let spacing = TextSpacing::new(
@@ -58,18 +55,31 @@ fn pages_use_the_right_side_of_the_caption() {
     );
     let cols = 40;
     let mut frame = Frame::new(cols, 1);
-    assert!(pages::draw(&mut frame, cols, 1, 0, &spacing).is_empty());
+    let (project_cols, targets) = pages::draw(&mut frame, cols, 1, 0, &spacing);
+    assert_eq!(project_cols, cols);
+    assert!(targets.is_empty());
 
     let page_slots = |count, active| {
-        pages::draw(&mut Frame::new(cols, 1), cols, count, active, &spacing)
+        let (project_cols, targets) =
+            pages::draw(&mut Frame::new(cols, 1), cols, count, active, &spacing);
+        let ranges = targets
             .into_iter()
             .map(|(index, rect)| (index, rect.x..rect.x + rect.w))
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (project_cols, ranges)
     };
-    assert_eq!(page_slots(3, 1), [(0, 31..32), (1, 35..36), (2, 39..40)]);
-    let overflow = page_slots(90, 45);
+    let (project_cols, ranges) = page_slots(3, 1);
+    assert_eq!(project_cols, 29);
+    assert_eq!(ranges, [(0, 30..33), (1, 34..37), (2, 38..41)]);
+
+    let (_, overflow) = page_slots(90, 45);
     assert!(overflow[0].1.start >= cols / 2);
     assert!(overflow[0].0 < 45 && overflow.last().unwrap().0 > 45);
     assert!(overflow.iter().any(|(index, _)| *index == 45));
     assert_eq!(overflow.last().unwrap().1.end, cols);
+    assert!(
+        overflow
+            .windows(2)
+            .all(|pair| pair[0].1.end <= pair[1].1.start)
+    );
 }

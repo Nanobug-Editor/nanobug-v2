@@ -35,7 +35,9 @@ fn stacked_path_clearance_matches_side_by_side_outlines() {
             side.pixels(metrics).left() - upper.pixels(metrics).right() + px(cw) - stroke;
         assert!(f32::from(top - bottom - side_gap).abs() < 0.001);
         assert!(top - seam < seam - bottom);
-        assert!(lower_bottom > px(0.));
+        let body_bottom = lower.pixels(metrics).bottom() - px(lh);
+        let border_bottom = lower.pixels(metrics).bottom() - px(lh * 0.5) + lower_bottom;
+        assert!(border_bottom - body_bottom <= px(lh * 0.25));
         assert_eq!(
             pane_border_offsets(side, &panes, metrics),
             (px(0.), lower_bottom)
@@ -86,13 +88,15 @@ fn split_panes_fit_the_retained_grid() {
     }
 }
 
-/// Resizing matches the visible title gap above the pane to the outline gap below it.
+/// Resizing reserves a quarter row on each side before filling rows and sharing the remainder.
 #[test]
 fn footer_and_tabs_keep_centered_panes_across_window_heights() {
-    for (line_height, font_size) in [(12., 9.), (20., 15.), (22., 16.), (22.4, 16.5), (48., 36.)] {
-        for height in 480..=840 {
-            let height = height as f32;
-            let (rows, grid_origin_y, footer_top) = vertical_geometry(px(height), line_height);
+    // At a 20 px line height and 10 px font size, 517.5 px fits exactly 24 rows and two 5 px gaps.
+    for (line_height, font_size) in [(12., 9.), (20., 10.), (20., 15.), (22.4, 16.5), (48., 36.)] {
+        let heights = (480..=840).map(|height| height as f32);
+        for height in heights.chain([517.25, 517.5, 517.75]) {
+            let (rows, grid_origin_y, footer_top) =
+                vertical_geometry(px(height), line_height, font_size);
             let metrics = Metrics {
                 cw: 10.,
                 lh: line_height,
@@ -118,8 +122,16 @@ fn footer_and_tabs_keep_centered_panes_across_window_heights() {
                 (top_gap - bottom_gap).abs() < 0.001,
                 "height {height}, row height {line_height}: top gap {top_gap}, bottom gap {bottom_gap}"
             );
-            assert!(grid_gap + 0.001 >= PANE_GAP_Y);
-            assert!(grid_gap < PANE_GAP_Y + line_height * 0.5 + 0.001);
+            let min_gap = line_height * 0.25;
+            assert!(top_gap + 0.001 >= min_gap && bottom_gap + 0.001 >= min_gap);
+            assert!(
+                top_gap + bottom_gap - 2. * min_gap < line_height,
+                "height {height}, row height {line_height}: the gaps fit another row"
+            );
+            if (height, line_height, font_size) == (517.5, 20., 10.) {
+                assert_eq!(pane.h, 24);
+                assert!((top_gap - 5.).abs() < 0.001);
+            }
             let footer_bottom = f32::from(footer_top) + line_height;
             assert!(footer_bottom < height);
             assert!(

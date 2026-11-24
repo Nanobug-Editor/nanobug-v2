@@ -4,7 +4,10 @@ use super::{
     Workspace,
     rows::{Row, Target, row},
 };
-use crate::grid::{windows::editor::EditResult, workspace::layout::Focus};
+use crate::grid::{
+    windows::editor::{CompletionMenu, EditResult},
+    workspace::layout::Focus,
+};
 use gpui::{Context, KeyDownEvent, Task, Window};
 use nanobug::{
     document::Document,
@@ -34,6 +37,8 @@ type Candidates = Vec<(Completion, Vec<String>)>;
 
 /// A nonmodal completion request whose edits and selection belong to the active caret.
 pub(super) struct CompletionPopup {
+    /// Last painted viewport, shared by this popup's hit testing and animation.
+    scroll: std::cell::RefCell<nanobug::animation::scroll::GridScroll>,
     /// Validated replies for the exact document revision and insertion point.
     results: LanguageResults,
     /// Matching candidates rebased to the latest edit while its query is pending.
@@ -400,6 +405,61 @@ impl Workspace {
         })
     }
 
+    /// Hit testing reads the last sampled frame. Painting advances the popup's own spring.
+    pub(in crate::grid::workspace) fn position_completion_menu(
+        &self,
+        menu: &mut CompletionMenu,
+        count: usize,
+        selected: usize,
+        advance: bool,
+    ) {
+        if let Some(popup) = &self.plugins.completion {
+            if advance {
+                menu.advance(
+                    &mut popup.scroll.borrow_mut(),
+                    count,
+                    selected,
+                    self.scroll_epoch.elapsed().as_secs_f64(),
+                );
+            } else {
+                menu.position(popup.scroll.borrow().position());
+            }
+        }
+    }
+    pub(in crate::grid::workspace) fn completion_scrolling(&self) -> bool {
+        self.completion_target().is_some()
+            && self
+                .plugins
+                .completion
+                .as_ref()
+                .is_some_and(|popup| popup.scroll.borrow().is_active())
+    }
+
+    /// A wheel gesture inside the completion popover moves candidates and belongs to the popover at its ends.
+    pub(in crate::grid::workspace) fn wheel_completion_list(
+        &mut self,
+        event: &gpui::ScrollEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((menu, labels, selected)) = self.completion_menu(window) else {
+            return false;
+        };
+        if !menu.bounds().contains(&event.position) {
+            return false;
+        }
+        let count = labels.len();
+        let delta = self.take_wheel_rows(event).saturating_neg();
+        if delta != 0
+            && let Some(popup) = &mut self.plugins.completion
+        {
+            popup.selection =
+                crate::ui::components::grid_list::GridList::moved(selected, delta, count);
+            cx.notify();
+        }
+        true
+    }
+
     /// Cancel pending completion and remove visible candidates without changing editor mode.
     pub(in crate::grid::workspace) fn dismiss_completion(&mut self, cx: &mut Context<Self>) {
         self.plugins.completion_delay = None;
@@ -442,6 +502,7 @@ impl Workspace {
             })
             .collect();
         self.plugins.completion = Some(CompletionPopup {
+            scroll: Default::default(),
             results: LanguageResults {
                 scope,
                 opening: doc.opening,
@@ -762,10 +823,8 @@ impl Workspace {
                     .plugins
                     .view
                     .document_diagnostics
-                    .get(key)
-                    .filter(|live| {
-                        live.version == (opening, revision) && doc.path.as_ref() == Some(&live.path)
-                    })
+                    .get(&(key.clone(), opening))
+                    .filter(|live| live.version == (opening, revision) && doc.path == live.path)
                 else {
                     return true;
                 };
@@ -780,6 +839,7 @@ impl Workspace {
                 prior.results = results;
             } else {
                 prior = Some(CompletionPopup {
+                    scroll: Default::default(),
                     results,
                     retained: Vec::new(),
                     selection: 0,
@@ -1130,6 +1190,7 @@ mod tests {
         let mut doc = Document::new("Result<()>");
         doc.cursor = 2;
         let mut popup = CompletionPopup {
+            scroll: Default::default(),
             results: LanguageResults {
                 scope: 1,
                 opening: doc.opening,
@@ -1273,6 +1334,7 @@ mod tests {
             definitions: Vec::new(),
         };
         let warning = Diagnostic {
+            severity: nanobug_plugin_sdk::DiagnosticSeverity::Warning,
             start: 0,
             end: "前".len(),
             message: "Inspect this".into(),

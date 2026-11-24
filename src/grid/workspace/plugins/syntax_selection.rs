@@ -173,10 +173,14 @@ fn syntax_grammar(path: &Path) -> Option<&'static str> {
 #[cfg(all(test, windows))]
 mod tests {
     use super::super::native_editing_tests::{options, step, until, use_session};
-    use crate::grid::workspace::native_test;
+    use crate::{
+        grid::{render::Rect, windows::WindowFrame, workspace::native_test},
+        ui::theme::syntax_color,
+    };
     use anyhow::{Result, ensure};
     use gpui::{KeyDownEvent, Keystroke};
     use nanobug::plugins::session::Session;
+    use nanobug_plugin_sdk::language::SyntaxKind;
     use std::fs;
 
     /// Exercise native Vim key routing and the real bundled parser without a language plugin.
@@ -255,12 +259,16 @@ mod tests {
                     window,
                     "native configuration syntax without a plugin",
                     |workspace| {
-                        use nanobug_plugin_sdk::language::SyntaxKind;
-                        let Some((_, result)) = workspace.plugins.view.builtin_syntax.as_ref()
+                        let project = workspace.projects.active();
+                        let doc = &project.editor.vim().doc;
+                        let Some(result) = workspace
+                            .plugins
+                            .view
+                            .builtin_syntax
+                            .get(&(project.plugin_scope, doc.opening))
                         else {
                             return Ok(false);
                         };
-                        let doc = &workspace.projects.active().editor.vim().doc;
                         if Some(&result.path) != doc.path.as_ref()
                             || result.version != (doc.opening, doc.revision)
                         {
@@ -281,6 +289,120 @@ mod tests {
                             );
                         }
                         Ok(true)
+                    },
+                )
+                .await
+            },
+        )
+    }
+
+    /// Parse both visible Rust panes before revisiting the first, without a language plugin or LSP.
+    #[test]
+    #[ignore = "opens a native Windows workspace"]
+    fn native_builtin_syntax_colors_each_rust_split_without_plugin() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let profile = temp.path().join("profile");
+        let project = temp.path().join("project");
+        fs::create_dir(&project)?;
+        for name in ["first", "second"] {
+            fs::write(
+                project.join(format!("{name}.rs")),
+                format!("// {name} comment\nfn {name}() {{}}\n"),
+            )?;
+        }
+        let first = project.join("first.rs").canonicalize()?;
+        let second = project.join("second.rs").canonicalize()?;
+        let session = Session::start(options(&project, &profile)?).0;
+        native_test::run_async_visible(
+            project.clone(),
+            options(&project, &profile)?,
+            move |workspace| use_session(workspace, session),
+            async move |window, app| {
+                // The native pane needs its first layout before a split can fit.
+                app.background_executor()
+                    .timer(std::time::Duration::from_millis(60))
+                    .await;
+                let active = step(app, window, |workspace, native, cx| {
+                    // Both opens happen before polling for results. The first pane stays inactive.
+                    workspace.sync(native, cx);
+                    workspace.open(first.clone(), native, cx);
+                    workspace.open_editor_split(false, Some("second.rs".into()), native, cx);
+                    workspace.sync(native, cx);
+                    let project = workspace.projects.active();
+                    ensure!(project.page_editors().count() == 2, "{}", project.status);
+                    ensure!(project.editor.vim().doc.path.as_ref() == Some(&second));
+                    Ok(project.active_editor_id())
+                })?;
+                until(
+                    app,
+                    window,
+                    "lexical Rust colors in both panes",
+                    |workspace| {
+                        ensure!(workspace.plugins.view.installed.is_empty());
+                        ensure!(workspace.plugins.view.language_servers.is_empty());
+                        workspace.refresh_document_presentation();
+                        let project = workspace.projects.active();
+                        ensure!(project.active_editor_id() == active);
+                        ensure!(project.editor.vim().doc.path.as_ref() == Some(&second));
+                        let context = WindowFrame {
+                            area: Rect {
+                                w: 48,
+                                h: 8,
+                                ..Default::default()
+                            },
+                            selected: false,
+                            modal_open: false,
+                            controls_hovered: false,
+                            spacing: &workspace.spacing,
+                        };
+                        let mut ready = 0;
+                        for (_, editor) in project.page_editors() {
+                            let doc = &editor.vim().doc;
+                            ensure!(
+                                doc.path.as_ref() == Some(&first)
+                                    || doc.path.as_ref() == Some(&second)
+                            );
+                            let Some(parsed) = workspace
+                                .plugins
+                                .view
+                                .builtin_syntax
+                                .get(&(project.plugin_scope, doc.opening))
+                                .filter(|parsed| parsed.version == (doc.opening, doc.revision))
+                            else {
+                                return Ok(false);
+                            };
+                            for (token, kind) in
+                                [("comment", SyntaxKind::Comment), ("fn", SyntaxKind::Keyword)]
+                            {
+                                let offset = doc.text.find(token).expect("fixture token");
+                                ensure!(
+                                    parsed.highlights.iter().any(|span| {
+                                        span.kind == kind
+                                            && span.range.start <= offset
+                                            && offset < span.range.end
+                                    }),
+                                    "{:?} lacks {token} {kind:?}: {:?}",
+                                    doc.path,
+                                    parsed.highlights,
+                                );
+                            }
+                            let text = editor.content_frames(context, |_| None).1;
+                            let comment_column = doc.text.find("comment").expect("fixture comment");
+                            ensure!(
+                                text.cell_paint_at(0, comment_column).foreground
+                                    == syntax_color(SyntaxKind::Comment)
+                                    && text.cell_paint_at(1, 0).foreground
+                                        == syntax_color(SyntaxKind::Keyword),
+                                "Unexpected colors for {:?}, comment {:#x}/{:#x}, keyword {:#x}/{:#x}",
+                                doc.path,
+                                text.cell_paint_at(0, comment_column).foreground,
+                                syntax_color(SyntaxKind::Comment),
+                                text.cell_paint_at(1, 0).foreground,
+                                syntax_color(SyntaxKind::Keyword),
+                            );
+                            ready += 1;
+                        }
+                        Ok(ready == 2)
                     },
                 )
                 .await

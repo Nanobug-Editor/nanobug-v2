@@ -1,7 +1,7 @@
 //! Grid-to-pixel geometry shared by painting and pointer input.
 
 use super::BORDER_LABEL_INSET;
-use crate::ui::text::UNITS_PER_COLUMN;
+use crate::ui::{grid_geometry::Rect, text::UNITS_PER_COLUMN};
 use gpui::{Bounds, Pixels, Point, point, px, size};
 use std::ops::Range;
 
@@ -75,24 +75,7 @@ impl Metrics {
     }
 }
 
-/// Half-open panel rectangle in character cells.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub struct Rect {
-    /// First column.
-    pub x: usize,
-    /// First row.
-    pub y: usize,
-    /// Width in cells.
-    pub w: usize,
-    /// Height in cells.
-    pub h: usize,
-}
-
 impl Rect {
-    /// Whether cell `(x, y)` lies inside this rectangle.
-    pub fn contains(self, x: usize, y: usize) -> bool {
-        x >= self.x && y >= self.y && x < self.x + self.w && y < self.y + self.h
-    }
     /// Convert this rectangle to pixels using `metrics`.
     pub fn pixels(self, metrics: Metrics) -> Bounds<Pixels> {
         Bounds::new(

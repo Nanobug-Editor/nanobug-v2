@@ -4,7 +4,7 @@ mod highlight;
 use crate::Output;
 use nanobug_plugin_sdk::language::HIGHLIGHT_QUERY_PREFIX;
 use nanobug_plugin_sdk::{
-    Diagnostic, DocumentSnapshot, ErrorKind, Reply, Request,
+    Diagnostic, DiagnosticSeverity, DocumentSnapshot, ErrorKind, Reply, Request,
     language::{ByteRange, Capture, SyntaxQuery},
     receive,
 };
@@ -355,6 +355,7 @@ fn capture(
         .map(|node| Diagnostic {
             start: node.start_byte(),
             end: node.end_byte(),
+            severity: DiagnosticSeverity::Error,
             message: if node.is_missing() {
                 format!("Expected `{}`", node.kind())
             } else {

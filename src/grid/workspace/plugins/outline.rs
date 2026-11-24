@@ -7,6 +7,7 @@ use super::{
 use gpui::{Context, Window};
 use nanobug::i18n;
 use nanobug_plugin_sdk::language::Symbol;
+use std::collections::BTreeMap;
 
 /// Clickable outline bound to the version and provider that produced the displayed symbols.
 pub(super) struct Outline {
@@ -29,7 +30,7 @@ impl Outline {
 }
 
 impl Workspace {
-    /// Apply the latest eligible provider result to each buffer that already has or can receive one.
+    /// Apply language results to each current-page pane and repaint when a displayed buffer changes.
     pub(in crate::grid::workspace) fn refresh_document_presentation(&mut self) -> bool {
         let active_scope = self
             .projects
@@ -40,9 +41,25 @@ impl Workspace {
         for project in self.projects.iter_mut() {
             let scope = project.plugin_scope;
             let visible = Some(scope) == active_scope;
-            changed |= project.editor.sync_presentations(scope, view) && visible;
+            let focused = project.active_editor_id();
+            // Only an opening still owned by this buffer can lend its diagnostics to a peer view.
+            let mut by_buffer = BTreeMap::new();
+            for (_, doc, data) in super::diagnostics::current_results(project, view) {
+                by_buffer
+                    .entry(doc.buffer_number())
+                    .or_insert_with(Vec::new)
+                    .push(data.clone());
+            }
+            for id in project.splits().ids() {
+                if let Some(editor) = project.editor_by_id_mut(id) {
+                    changed |=
+                        editor.set_diagnostic_marks(self.plugins.diagnostic_marks) && visible;
+                    changed |= editor.sync_presentations(scope, view, id == focused, &by_buffer)
+                        && visible;
+                }
+            }
         }
-        changed
+        self.refresh_diagnostic_lists() || changed
     }
 
     /// Open a keyboard-selectable outline for the active document.

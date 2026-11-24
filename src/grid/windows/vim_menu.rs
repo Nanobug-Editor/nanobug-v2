@@ -1,5 +1,6 @@
 //! Draw and navigate one level of the editor's Vim menus.
 
+use crate::ui::components::grid_popup::GridPopup;
 use crate::{
     grid::render::{Frame, GridLayer, LabelStyle, Metrics, Panel, Rect},
     ui::{
@@ -95,12 +96,7 @@ impl VimMenu {
             .saturating_add(2 + usize::from(self.has_tips()))
             .min(viewport.h);
         let (x, y) = self.anchor;
-        Some(Rect {
-            x: x.clamp(viewport.x, viewport.x + viewport.w - w),
-            y: y.clamp(viewport.y, viewport.y + viewport.h - h),
-            w,
-            h,
-        })
+        Some(GridPopup::new(viewport).at(Rect { x, y, w, h }))
     }
 
     /// Whether this level needs a reserved row to display an entry's menu tip.
@@ -225,7 +221,12 @@ impl VimMenu {
     /// Compose the fixed menu frame and its visible scrolled area using measured `spacing`.
     pub(in crate::grid) fn refresh(&self, area: Rect, spacing: &TextSpacing, cx: &mut App) {
         let body = self.body(area);
-        let mut chrome = Frame::new(area.w, area.h);
+        let title = if self.path.is_empty() {
+            i18n::text("vim_menu.title").into()
+        } else {
+            self.path.join(" › ")
+        };
+        let mut chrome = Frame::titled(area, &title, spacing);
         chrome.set_theme_component(ThemeComponent::Editor);
         chrome.exclude_theme_background(Rect {
             x: 1,
@@ -233,12 +234,6 @@ impl VimMenu {
             w: body.w,
             h: body.h,
         });
-        let title = if self.path.is_empty() {
-            i18n::text("vim_menu.title").into()
-        } else {
-            self.path.join(" › ")
-        };
-        chrome.border(&title, true, false, spacing);
         chrome.styled_label(
             area.h - 1,
             3..area.w.saturating_sub(3),

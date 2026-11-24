@@ -2,6 +2,7 @@
 
 use super::Workspace;
 use crate::grid::render::{Metrics, Rect, solid_stroke_width};
+use crate::ui::components::grid_dialog::GridDialog;
 use gpui::{Bounds, Pixels, Point, Window, point, px};
 use std::ops::Range;
 
@@ -9,8 +10,13 @@ use std::ops::Range;
 const CORNER_HOVER_SLOP: f32 = 3.;
 /// Matching outer insets above the project tabs and below the status bar, in logical pixels.
 pub(super) const OUTER_INSET_Y: f32 = 5.;
-/// Minimum space from either workspace bar to the pane grid, in logical pixels.
-pub(super) const PANE_GAP_Y: f32 = 4.;
+/// Maximum caption drag area below the project tabs, in logical pixels.
+#[cfg(windows)]
+const CAPTION_EXTRA_Y: f32 = 4.;
+/// Minimum visible gap on each side of the pane grid, in grid rows.
+const MIN_PANE_OUTER_GAP_ROWS: f32 = 0.25;
+/// Clearance below the content viewport at the exterior bottom edge, in grid rows.
+const PANE_BOTTOM_INSET_ROWS: f32 = 0.25;
 /// The workspace's shared status and command row.
 pub(super) const FOOTER_ROWS: usize = 1;
 /// Space above and below the status badge fills within the row, in logical pixels.
@@ -164,7 +170,7 @@ impl Layout {
 
 /// Nonoverlapping text slots in the footer, shared with command caret measurement.
 pub(super) struct FooterSlots {
-    /// Mode, operation feedback, or command input.
+    /// Mode and file path, operation feedback, or command input.
     pub(super) left: Range<usize>,
     /// Encoding label, inset within its badge.
     pub(super) details: Range<usize>,
@@ -176,16 +182,27 @@ pub(super) struct FooterSlots {
     pub(super) position_tip: usize,
 }
 
-/// Fit whole pane rows of `line_height` within the window's `height`.
+/// Distance from the first pane row's start to the top of its centered title icon.
+fn pane_title_inset(line_height: f32, font_size: f32) -> f32 {
+    (line_height - font_size.min(line_height)) * 0.5
+}
+
+/// Reserve both outer gaps, then fit whole pane rows of `line_height` and share the remaining `height`.
+/// `font_size` determines the title height and bottom stroke width.
 /// Return the total row count and the window-local origins of the grid and footer.
-fn vertical_geometry(height: Pixels, line_height: f32) -> (usize, Pixels, Pixels) {
+fn vertical_geometry(height: Pixels, line_height: f32, font_size: f32) -> (usize, Pixels, Pixels) {
     let tab_bottom = OUTER_INSET_Y + line_height;
     let footer_top = f32::from(height) - OUTER_INSET_Y - line_height + FOOTER_BADGE_INSET_Y;
-    let span = footer_top + FOOTER_BADGE_INSET_Y - tab_bottom;
+    let badge_top = footer_top + FOOTER_BADGE_INSET_Y;
+    let title_inset = pane_title_inset(line_height, font_size);
+    let bottom_inset = line_height * (1. - PANE_BOTTOM_INSET_ROWS)
+        - f32::from(solid_stroke_width(font_size)) * 0.5;
+    let min_gap = line_height * MIN_PANE_OUTER_GAP_ROWS;
+    let available = badge_top - tab_bottom + title_inset + bottom_inset - 2. * min_gap;
     // Reserve room for the picker contents even during transient, undersized viewports.
-    let pane_rows = ((span - 2. * PANE_GAP_Y) / line_height).floor().max(6.) as usize;
-    let gap = ((span - pane_rows as f32 * line_height) * 0.5).max(PANE_GAP_Y);
-    let grid_origin_y = tab_bottom + gap - line_height;
+    let pane_rows = ((available / line_height).floor() as usize).max(6);
+    let gap = min_gap + (available - pane_rows as f32 * line_height).max(0.) * 0.5;
+    let grid_origin_y = tab_bottom + gap - title_inset - line_height;
     (
         1 + pane_rows + FOOTER_ROWS,
         px(grid_origin_y),
@@ -210,10 +227,7 @@ pub(super) fn pane_border_offsets(
     if area.w == 0 || area.h == 0 {
         return (px(0.), px(0.));
     }
-    // Mirror the upper edge of the centered title icon with the outer edge of the bottom stroke.
-    let title_height = px(metrics.font_size.min(metrics.lh));
-    let outer_bottom = (title_height - solid_stroke_width(metrics.font_size)) * 0.5;
-    let mut offsets = (px(0.), outer_bottom);
+    let mut offsets = (px(0.), px(metrics.lh * (PANE_BOTTOM_INSET_ROWS - 0.5)));
     let (top, bottom) = stacked_path_insets(metrics);
     let half_row = px(metrics.lh * 0.5);
     for neighbor in panes.iter().filter(|neighbor| {
@@ -251,10 +265,17 @@ impl Workspace {
             .collect()
     }
 
-    /// Bottom edge of the Windows caption strip, including the gap below the project tabs.
+    /// Bottom edge of the Windows caption strip, stopping at the first visible pane title.
     #[cfg(windows)]
     pub(super) fn native_caption_height(&self) -> Pixels {
-        self.tab_metrics().at(0., 1.).y + px(PANE_GAP_Y)
+        let tab_bottom = self.tab_metrics().at(0., 1.).y;
+        let limit = tab_bottom + px(CAPTION_EXTRA_Y);
+        if self.projects.active_project().is_none() {
+            return limit;
+        }
+        let title_top = self.metrics.at(0., 1.).y
+            + px(pane_title_inset(self.metrics.lh, self.metrics.font_size));
+        title_top.max(tab_bottom).min(limit)
     }
 
     /// Apply `window`'s layout and its shared pane origin for painting and input.
@@ -269,7 +290,8 @@ impl Workspace {
         let visible_cols = ((f32::from(size.width) - 2. * f32::from(self.metrics.origin.x))
             / self.metrics.cw)
             .floor() as usize;
-        let (rows, grid_origin_y, footer_top) = vertical_geometry(size.height, self.metrics.lh);
+        let (rows, grid_origin_y, footer_top) =
+            vertical_geometry(size.height, self.metrics.lh, self.metrics.font_size);
         let visible_rows =
             (f32::from(size.height - grid_origin_y) / self.metrics.lh).floor() as usize;
         let cols = visible_cols.max(60);
@@ -293,7 +315,10 @@ impl Workspace {
     pub(super) fn footer_slots(&self) -> FooterSlots {
         // Reserve one column each for the percent sign, separating space, and colon.
         let position_width = FOOTER_PROGRESS_DIGITS + FOOTER_LINE_DIGITS + FOOTER_COLUMN_DIGITS + 3;
-        let position_end = self.layout.cols.saturating_sub(FOOTER_POSITION_PADDING);
+        let position_end = self
+            .layout
+            .visible_cols
+            .saturating_sub(FOOTER_POSITION_PADDING);
         let position_start = position_end.saturating_sub(position_width);
         let position_tip = position_start.saturating_sub(FOOTER_POSITION_PADDING);
         let details_end = position_tip.saturating_sub(FOOTER_CHIP_PAD);
@@ -316,14 +341,14 @@ impl Workspace {
         self.help.layout(self.layout.cols, self.layout.rows)
     }
 
-    /// Place a `width` by `height` grid popup above the lower-right status line.
-    pub(super) fn small_popup_area(&self, width: usize, height: usize) -> Rect {
-        Rect {
-            x: self.layout.cols.saturating_sub(width + 1),
-            y: self.layout.rows.saturating_sub(height + FOOTER_ROWS + 1),
-            w: width,
-            h: height,
-        }
+    /// Place a `width` by `height` dialog above the lower-right status line.
+    pub(super) fn corner_dialog(&self, width: usize, height: usize) -> Rect {
+        GridDialog::new(Rect {
+            w: self.layout.cols.saturating_sub(1),
+            h: self.layout.rows.saturating_sub(FOOTER_ROWS + 1),
+            ..Rect::default()
+        })
+        .bottom_right(width, height)
     }
 
     /// Anchor the footer row to the window bottom, independently of the pane grid.
@@ -331,7 +356,7 @@ impl Workspace {
         let mut bounds = Rect {
             x: 0,
             y: 0,
-            w: self.layout.cols,
+            w: self.layout.visible_cols,
             h: FOOTER_ROWS,
         }
         .pixels(self.metrics);

@@ -1,10 +1,11 @@
 //! Fit and draw the settings frame, two independent smooth viewports, and value editors.
 
 use super::*;
+use crate::ui::components::grid_dialog::GridDialog;
 use crate::{
     grid::render::{Frame, GridLayer, LabelStyle, Metrics, OutlineStyle, Rect},
     ui::{
-        text::{TextSpacing, UNITS_PER_COLUMN},
+        text::TextSpacing,
         theme::{self, ACCENT, ACTIVE_FILE, CURRENT, ERROR_TEXT, GOLD, MUTED, SELECTION, TEXT},
     },
 };
@@ -15,7 +16,7 @@ use nanobug_plugin_sdk::language::SyntaxKind;
 pub(super) struct Layout {
     pub(super) tree: Rect,
     pub(super) body: Rect,
-    pub(super) buttons: Vec<(Button, Rect)>,
+    pub(super) buttons: Vec<ButtonSlot<Button>>,
 }
 
 /// Very small or unmeasured surfaces cannot fit both columns and the fixed action bar.
@@ -61,44 +62,21 @@ pub(super) fn pane_bounds(area: Rect) -> (Rect, Rect) {
 impl Layout {
     pub(super) fn new(area: Rect, spacing: &TextSpacing) -> Self {
         let (tree, body) = pane_bounds(area);
-        let mut slots = Vec::new();
-        let mut right = area.w.saturating_sub(2);
-        let mut y = area.h.saturating_sub(3);
-        let mut all: Vec<_> = buttons().collect();
-        if !fits_form(area) {
-            return Self {
-                tree,
-                body,
-                buttons: slots,
-            };
-        }
-        // When the window is narrow the actions wrap upward, preserving their reading order.
-        while let Some((button, mnemonic)) = all.pop() {
-            let width = mnemonic
-                .spans()
-                .iter()
-                .map(|(s, _)| spacing.columns(s))
-                .sum::<usize>();
-            if right < 1 + width {
-                y = y.saturating_sub(1);
-                right = area.w.saturating_sub(2);
-            }
-            let x = right.saturating_sub(width).max(1);
-            slots.push((
-                button,
-                Rect {
-                    x: area.x + x,
-                    y: area.y + y,
-                    w: right.saturating_sub(x),
-                    h: 1,
-                },
-            ));
-            right = x.saturating_sub(1);
-        }
+        let bottom = area.h.saturating_sub(2);
+        let buttons = if fits_form(area) {
+            buttons().trailing(
+                1..area.w.saturating_sub(2),
+                area.h.saturating_sub(footer_rows(area.w))..bottom,
+                1,
+                spacing,
+            )
+        } else {
+            Vec::new()
+        };
         Self {
             tree,
             body,
-            buttons: slots,
+            buttons,
         }
     }
 }
@@ -157,7 +135,13 @@ mod tests {
             for h in 0..24 {
                 let area = Rect { x: 19, y: 8, w, h };
                 let layout = Layout::new(area, &spacing);
-                for (_, slot) in &layout.buttons {
+                for button in &layout.buttons {
+                    let slot = Rect {
+                        x: area.x + button.columns.start,
+                        y: area.y + button.row,
+                        w: button.columns.len(),
+                        h: 1,
+                    };
                     assert!(area.contains(slot.x, slot.y) && slot.x + slot.w <= area.x + area.w);
                     assert!(slot.y >= layout.tree.y + layout.tree.h);
                 }
@@ -183,12 +167,10 @@ impl Settings {
     pub(in crate::grid) fn area(viewport: Rect) -> Rect {
         let mx = if viewport.w >= 76 { viewport.w / 18 } else { 0 };
         let my = if viewport.h >= 20 { viewport.h / 15 } else { 0 };
-        Rect {
-            x: viewport.x + mx,
-            y: viewport.y + my,
-            w: viewport.w.saturating_sub(2 * mx),
-            h: viewport.h.saturating_sub(2 * my),
-        }
+        GridDialog::new(viewport).centered(
+            viewport.w.saturating_sub(2 * mx),
+            viewport.h.saturating_sub(2 * my),
+        )
     }
 
     /// Logical form rows stay fixed while a selector covers part of their viewport.
@@ -247,9 +229,8 @@ impl Settings {
     /// Draw fixed chrome separately from the cropped, translated rows to keep text off the border.
     pub(in crate::grid) fn refresh(&self, area: Rect, spacing: &TextSpacing, cx: &mut App) {
         let layout = Layout::new(area, spacing);
-        let mut chrome = Frame::new(area.w, area.h);
+        let mut chrome = Frame::titled(area, i18n::text("settings.title"), spacing);
         chrome.hide_theme_background();
-        chrome.border(i18n::text("settings.title"), true, false, spacing);
         if !fits_form(area) {
             if area.h > 2 {
                 chrome.label(
@@ -313,8 +294,8 @@ impl Settings {
         let earliest = layout
             .buttons
             .iter()
-            .filter(|(_, r)| r.y == area.y + area.h.saturating_sub(3))
-            .map(|(_, r)| r.x - area.x)
+            .filter(|b| b.row == area.h.saturating_sub(3))
+            .map(|b| b.columns.start)
             .min()
             .unwrap_or(right);
         if pending > 0 {
@@ -326,23 +307,17 @@ impl Settings {
                 spacing,
             );
         }
-        for (button, rect) in &layout.buttons {
-            let mnemonic = Mnemonic::parse(i18n::text(button.key()));
-            let mut col = rect.x - area.x;
-            for (text, style) in mnemonic.spans() {
-                col = chrome.styled_label(
-                    rect.y - area.y,
-                    col..rect.x - area.x + rect.w,
-                    text,
-                    if matches!(button, Button::Confirm) {
-                        ACCENT
-                    } else {
-                        TEXT
-                    },
-                    spacing,
-                    style,
-                );
-            }
+        for button in &layout.buttons {
+            chrome.button(
+                button.row,
+                button,
+                if matches!(button.action, Button::Confirm) {
+                    ACCENT
+                } else {
+                    TEXT
+                },
+                spacing,
+            );
         }
         let hint = match &self.editor {
             Some(Editor::List { .. })
@@ -384,27 +359,14 @@ impl Settings {
         let height = bounds.h + 1;
         let mut frame = Frame::new(bounds.w, height);
         frame.hide_theme_background();
-        let visible = self.visible_tree();
-        for (y, &id) in visible
-            .iter()
-            .skip(self.tree_scroll.first_cell())
-            .take(height)
-            .enumerate()
+        for (y, row) in self
+            .visible
+            .visible_rows(self.tree_scroll.first_cell(), bounds.h)
         {
+            let id = row.id();
             let n = &self.nodes[id];
-            let depth = n.path.len().saturating_sub(1);
-            let x = 1 + depth * 2;
-            let mut child = id;
-            while let Some(parent) = self.nodes[child].parent {
-                let depth = self.nodes[parent].path.len() - 1;
-                let continues = self.nodes[child + 1..]
-                    .iter()
-                    .any(|node| node.parent == Some(parent));
-                if child == id || continues {
-                    frame.tree_guide(1 + depth * 2, y, continues, (child == id).then_some(x));
-                }
-                child = parent;
-            }
+            let x = row.control_column();
+            frame.tree_row_guides(y, &row, x.min(bounds.w));
             let active = id == self.tree_row;
             if active {
                 frame.tint(
@@ -519,20 +481,10 @@ impl Settings {
                         let text_layout =
                             field.layout(text, &self.composition, input_width(bounds.w), spacing);
                         frame.text(col, y, "[", ACCENT, 1);
-                        let l = col + 1;
-                        if !text_layout.selection.is_empty() {
-                            frame.tint(
-                                y,
-                                l + text_layout.selection.start / UNITS_PER_COLUMN,
-                                l + text_layout.selection.end.div_ceil(UNITS_PER_COLUMN),
-                                SELECTION,
-                            );
-                        }
-                        frame.label(
+                        frame.text_field(
                             y,
-                            l..bounds.w.saturating_sub(1),
-                            text_layout.text(),
-                            TEXT,
+                            col + 1..bounds.w.saturating_sub(1),
+                            &text_layout,
                             spacing,
                         );
                         frame.text(bounds.w.saturating_sub(1), y, "]", ACCENT, 1);
@@ -639,18 +591,6 @@ impl Settings {
             GridLayer::scrolled(&self.panels[1], tree, self.tree_scroll.fraction(), metrics),
             GridLayer::scrolled(&self.panels[2], body, self.form_scroll.fraction(), metrics),
         ]
-    }
-}
-
-impl Button {
-    fn key(self) -> &'static str {
-        match self {
-            Self::Cancel => "settings.cancel",
-            Self::Reset => "settings.reset",
-            Self::Restore => "settings.restore",
-            Self::Apply => "settings.apply",
-            Self::Confirm => "settings.confirm",
-        }
     }
 }
 

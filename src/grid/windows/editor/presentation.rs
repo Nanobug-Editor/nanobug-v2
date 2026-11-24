@@ -1,25 +1,50 @@
 //! Keep provider results and fold state with their retained editor buffers.
 use super::EditorWindow;
-use nanobug::plugins::session::{State, View};
+use nanobug::plugins::session::{DocumentDiagnostics, DocumentSyntax, State, View};
+use std::{collections::BTreeMap, sync::Arc};
+
 impl EditorWindow {
-    /// Refresh results for `scope` from `view`; report whether the displayed buffer changed.
-    pub(in crate::grid) fn sync_presentations(&mut self, scope: u64, view: &View) -> bool {
+    /// Apply syntax and the project's diagnostics grouped by shared buffer to this pane.
+    pub(in crate::grid) fn sync_presentations(
+        &mut self,
+        scope: u64,
+        view: &View,
+        focused: bool,
+        diagnostics: &BTreeMap<u64, Vec<Arc<DocumentDiagnostics>>>,
+    ) -> bool {
         let mut changed = false;
         let active_buffer = self.active;
         for (index, buffer) in self.buffers.iter_mut().enumerate() {
+            let active = index == active_buffer;
+            let incoming = diagnostics
+                .get(&buffer.vim.doc.buffer_number())
+                .cloned()
+                .unwrap_or_default();
+            changed |= buffer.set_diagnostics(incoming) && active;
             let doc = &buffer.vim.doc;
             let filetype = buffer.vim.filetype_override();
-            let diagnostics = view
-                .document_diagnostics
-                .iter()
-                .filter(|(key, data)| {
-                    key.instance.project == scope
-                        && data.version == (doc.opening, doc.revision)
-                        && doc.path.as_ref() == Some(&data.path)
-                        && view.modules.get(*key) == Some(&State::Ready)
-                })
-                .map(|(_, data)| data.clone())
-                .collect();
+            let matches = |data: &DocumentSyntax| {
+                data.version == (doc.opening, doc.revision) && doc.path.as_ref() == Some(&data.path)
+            };
+            let grammar = nanobug::plugins::session::builtin_syntax_grammar(
+                doc.path.as_deref(),
+                filetype.as_deref(),
+            );
+            let native = view
+                .builtin_syntax
+                .get(&(scope, doc.opening))
+                .filter(|data| data.grammar == grammar && matches(data))
+                .cloned()
+                .or_else(|| {
+                    buffer.syntax_layers[0]
+                        .as_ref()
+                        .filter(|data| data.grammar == grammar && matches(data))
+                        .cloned()
+                });
+            changed |= replace_syntax(&mut buffer.syntax_layers[0], native) && active;
+            if !focused {
+                continue;
+            }
             let provider = view
                 .document_presentations
                 .iter()
@@ -42,7 +67,6 @@ impl EditorWindow {
                     })
                 })
                 .map(|(key, data)| (key.clone(), data.clone()));
-            let active = index == active_buffer;
             let keep_folds = provider.is_none()
                 && buffer
                     .presentation_owner()
@@ -63,41 +87,12 @@ impl EditorWindow {
                                     })
                             })
                     });
-            let matches = |data: &nanobug::plugins::session::DocumentSyntax| {
-                data.version == (doc.opening, doc.revision) && doc.path.as_ref() == Some(&data.path)
-            };
-            let grammar = nanobug::plugins::session::builtin_syntax_grammar(
-                doc.path.as_deref(),
-                filetype.as_deref(),
-            );
-            let native = view
-                .builtin_syntax
-                .as_ref()
-                .filter(|(id, data)| *id == scope && data.grammar == grammar && matches(data))
-                .map(|(_, data)| data.clone())
-                .or_else(|| {
-                    buffer.syntax_layers[0]
-                        .as_ref()
-                        .filter(|data| data.grammar == grammar && matches(data))
-                        .cloned()
-                });
             let semantic = view
                 .semantic_syntax
                 .iter()
                 .find(|(key, data)| key.instance.project == scope && matches(data))
                 .map(|(_, data)| data.clone());
-            for (slot, next) in buffer.syntax_layers.iter_mut().zip([native, semantic]) {
-                if !matches!((&*slot, &next), (None, None))
-                    && !slot
-                        .as_ref()
-                        .zip(next.as_ref())
-                        .is_some_and(|(a, b)| std::sync::Arc::ptr_eq(a, b))
-                {
-                    *slot = next;
-                    changed |= active;
-                }
-            }
-            changed |= buffer.set_diagnostics(diagnostics) && active;
+            changed |= replace_syntax(&mut buffer.syntax_layers[1], semantic) && active;
             if keep_folds {
                 buffer.retain_highlights();
             } else {
@@ -106,4 +101,21 @@ impl EditorWindow {
         }
         changed
     }
+}
+
+/// Replace a lexical or semantic layer only when its published allocation changes.
+fn replace_syntax(
+    slot: &mut Option<Arc<DocumentSyntax>>,
+    next: Option<Arc<DocumentSyntax>>,
+) -> bool {
+    if matches!((&*slot, &next), (None, None))
+        || slot
+            .as_ref()
+            .zip(next.as_ref())
+            .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+    {
+        return false;
+    }
+    *slot = next;
+    true
 }

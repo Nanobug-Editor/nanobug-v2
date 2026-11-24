@@ -15,7 +15,7 @@ use crate::plugins::{
     tools::rust_analyzer::{self, Analyzer, Event, ProjectSettings, Request, Server},
 };
 use nanobug_plugin_sdk::{
-    Diagnostic, DocumentSnapshot, Edit, Output, Permission, PluginEvent,
+    Diagnostic, DiagnosticSeverity, DocumentSnapshot, Edit, Output, Permission, PluginEvent,
     language::{Completion, Definition},
 };
 use serde_json::Value;
@@ -42,6 +42,7 @@ pub(super) struct Binding {
     documents: Vec<Arc<DocumentSnapshot>>,
     /// Language identifiers sent for the explicitly typed document overlays.
     languages: BTreeMap<u64, &'static str>,
+    saves: BTreeMap<u64, u64>,
     diagnostics: BTreeMap<u64, Arc<DocumentDiagnostics>>,
     semantics: BTreeMap<u64, Arc<DocumentSyntax>>,
     calls: BTreeMap<u64, Call>,
@@ -173,6 +174,7 @@ impl Engine {
                         phase,
                         documents: Vec::new(),
                         languages: BTreeMap::new(),
+                        saves: BTreeMap::new(),
                         diagnostics: BTreeMap::new(),
                         semantics: BTreeMap::new(),
                         calls: BTreeMap::new(),
@@ -180,10 +182,23 @@ impl Engine {
                     }
                 }
             };
-            if !same_documents(&binding.documents, &documents) || binding.languages != languages {
+            let saves: BTreeMap<_, _> = documents
+                .iter()
+                .filter_map(|doc| {
+                    Some((
+                        doc.opening,
+                        *self.document_saves.get(&(project.id, doc.opening))?,
+                    ))
+                })
+                .collect();
+            if !same_documents(&binding.documents, &documents)
+                || binding.languages != languages
+                || binding.saves != saves
+            {
                 if let Some(server) = &binding.server {
-                    server.sync_with_languages(documents.clone(), languages.clone());
+                    server.sync_with_languages(documents.clone(), languages.clone(), saves.clone());
                 }
+                binding.saves = saves;
                 binding.semantics.retain(|opening, entry| {
                     binding.languages.get(opening) == languages.get(opening)
                         && documents.iter().any(|doc| {
@@ -195,7 +210,7 @@ impl Engine {
                         && documents.iter().any(|doc| {
                             doc.opening == *opening
                                 && version(doc) == entry.version
-                                && doc.path.as_ref() == Some(&entry.path)
+                                && doc.path == entry.path
                         })
                 });
                 binding.documents = documents;
@@ -233,13 +248,8 @@ impl Engine {
             }) {
                 semantic.insert(key.clone(), Arc::clone(layer));
             }
-            if let Some(diagnostic) = project.document.as_ref().and_then(|document| {
-                binding.diagnostics.get(&document.opening).filter(|entry| {
-                    entry.version == version(document)
-                        && document.path.as_ref() == Some(&entry.path)
-                })
-            }) {
-                visible.insert(key.clone(), Arc::clone(diagnostic));
+            for (opening, data) in &binding.diagnostics {
+                visible.insert((key.clone(), *opening), Arc::clone(data));
             }
             if let Some(error) = &binding.error {
                 errors.insert(key.clone(), error.clone());
@@ -546,7 +556,7 @@ impl Engine {
                         snapshot.opening,
                         Arc::new(DocumentDiagnostics {
                             version: version(&snapshot),
-                            path: path.clone(),
+                            path: Some(path.clone()),
                             diagnostics: diagnostics(&snapshot.text, &items),
                         }),
                     );
@@ -701,15 +711,17 @@ fn definitions(result: &Value) -> Vec<Definition> {
     definitions
 }
 
-/// Keep bounded warnings and errors with text ranges in the current snapshot.
+/// Convert server warnings and errors from UTF-16 positions to byte ranges in `text`.
 fn diagnostics(text: &str, items: &[Value]) -> Vec<Diagnostic> {
     items
         .iter()
         .take(512)
         .filter_map(|item| {
-            if item["severity"].as_u64().is_some_and(|level| level > 2) {
-                return None;
-            }
+            let severity = match item["severity"].as_u64() {
+                None | Some(1) => DiagnosticSeverity::Error,
+                Some(2) => DiagnosticSeverity::Warning,
+                _ => return None,
+            };
             let (start, end) = range(text, &item["range"])?;
             let message = item["message"]
                 .as_str()?
@@ -721,6 +733,7 @@ fn diagnostics(text: &str, items: &[Value]) -> Vec<Diagnostic> {
                 start,
                 end,
                 message,
+                severity,
             })
         })
         .take(200)
@@ -731,6 +744,33 @@ fn diagnostics(text: &str, items: &[Value]) -> Vec<Diagnostic> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A UTF-16 surrogate pair before a diagnostic shifts its UTF-8 byte range on screen.
+    #[test]
+    fn diagnostics_keep_severity_and_utf8_ranges_across_lines() {
+        let text = "前🌱x\r\n错处";
+        let range = json!({
+            "start": {"line": 0, "character": 3},
+            "end": {"line": 1, "character": 1}
+        });
+        let items = diagnostics(
+            text,
+            &[
+                json!({"range": range, "severity": 2, "message": "warning"}),
+                json!({"range": range, "severity": 1, "message": "error"}),
+                json!({"range": range, "message": "unspecified"}),
+            ],
+        );
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].severity, DiagnosticSeverity::Warning);
+        assert_eq!(items[1].severity, DiagnosticSeverity::Error);
+        assert_eq!(items[2].severity, DiagnosticSeverity::Error);
+        assert!(
+            items
+                .iter()
+                .all(|item| &text[item.start..item.end] == "x\r\n错")
+        );
+    }
 
     /// A server may send unfiltered symbols before the visible prefix match.
     #[test]

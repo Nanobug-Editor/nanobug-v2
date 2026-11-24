@@ -22,6 +22,31 @@ use windows_sys::Win32::{
 /// Give the delayed hint time to open and publish its updated frame.
 const HINT_SETTLE: Duration = Duration::from_millis(220);
 
+/// Wait for the scheduled UI callback to publish the hint, including during a native resize.
+async fn wait_for_hint(
+    handle: gpui::WindowHandle<Workspace>,
+    app: &mut gpui::AsyncApp,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        let visible = app.update(|app| {
+            handle
+                .read(app)
+                .map(|workspace| workspace.sequence_hint_area().is_some())
+        })?;
+        if visible {
+            return Ok(());
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "native workspace did not publish the delayed hint"
+        );
+        app.background_executor()
+            .timer(Duration::from_millis(12))
+            .await;
+    }
+}
+
 /// Route `key` through `workspace` as a discrete press in its native `window`.
 fn press(
     workspace: &mut Workspace,
@@ -206,7 +231,7 @@ fn native_markdown_leader_scopes_the_view_to_the_focused_editor() -> Result<()> 
     )
 }
 
-/// Showing the hint leaves the visible editor text at its original pixel positions.
+/// Showing Leader preserves the visible text and aligns the two bottom strokes at fractional DPI.
 #[test]
 #[ignore = "requires the Windows DirectWrite and DirectX renderer"]
 fn native_leader_hint_keeps_visible_editor_rows_in_place() -> Result<()> {
@@ -259,7 +284,7 @@ fn native_leader_hint_keeps_visible_editor_rows_in_place() -> Result<()> {
                 })
             })??;
             app.background_executor().timer(HINT_SETTLE).await;
-            let (scale, left, right, top, bottom) = app.update(|app| {
+            let (scale, start, end, hint_bounds) = app.update(|app| {
                 handle.update(app, |workspace, window, _| -> Result<_> {
                     ensure!(window.scale_factor() == dpi as f32 / 96.);
                     let hint = workspace.sequence_hint_area().context("leader hint")?;
@@ -269,7 +294,7 @@ fn native_leader_hint_keeps_visible_editor_rows_in_place() -> Result<()> {
                     ensure!(right > left + 4, "hint leaves too little text visible");
                     let start = metrics.at(left as f32, hint.y as f32 + 1.);
                     let end = metrics.at(right as f32, (hint.y + hint.h - 1) as f32);
-                    Ok((window.scale_factor(), start.x, end.x, start.y, end.y))
+                    Ok((window.scale_factor(), start, end, hint.pixels(metrics)))
                 })
             })??;
             let after = app.update_window(handle.into(), |_, window, cx| {
@@ -277,8 +302,12 @@ fn native_leader_hint_keeps_visible_editor_rows_in_place() -> Result<()> {
                 window.render_to_image()
             })??;
             let device = |value| (f32::from(value) * scale).round() as u32;
-            let (left, right, top, bottom) =
-                (device(left), device(right), device(top), device(bottom));
+            let (left, right, top, bottom) = (
+                device(start.x),
+                device(end.x),
+                device(start.y),
+                device(end.y),
+            );
             let background = before.get_pixel(left, top);
             let mut text_pixels = 0;
             let mut changed_pixels = 0;
@@ -296,6 +325,19 @@ fn native_leader_hint_keeps_visible_editor_rows_in_place() -> Result<()> {
             ensure!(
                 changed_pixels == 0,
                 "{changed_pixels} pixels changed to the left of the visible hint at scale {scale}"
+            );
+            let x = device(hint_bounds.center().x);
+            let stroke_rows = |frame: &image::RgbaImage| {
+                let background = frame.get_pixel(x, bottom);
+                (bottom..device(hint_bounds.bottom()))
+                    .filter(|&y| frame.get_pixel(x, y) != background)
+                    .collect::<Vec<_>>()
+            };
+            let pane_stroke = stroke_rows(&before);
+            let hint_stroke = stroke_rows(&after);
+            ensure!(
+                !pane_stroke.is_empty() && pane_stroke == hint_stroke,
+                "bottom stroke rows differ at scale {scale}: pane {pane_stroke:?}, hint {hint_stroke:?}"
             );
             Ok(())
         },
@@ -360,7 +402,7 @@ fn native_key_sequences_update_the_workspace_hint() -> Result<()> {
                     press_hidden(workspace, "g", window, cx)
                 })
             })??;
-            app.background_executor().timer(HINT_SETTLE).await;
+            wait_for_hint(handle, app).await?;
             let vim_hint = app.update(|app| {
                 handle.update(app, |workspace, window, cx| -> Result<_> {
                     let vim_hint = workspace
@@ -423,7 +465,7 @@ fn native_key_sequences_update_the_workspace_hint() -> Result<()> {
                     Ok(vim_hint)
                 })
             })??;
-            app.background_executor().timer(HINT_SETTLE).await;
+            wait_for_hint(handle, app).await?;
             app.update(|app| {
                 handle.update(app, |workspace, window, cx| -> Result<()> {
                     let leader_hint = workspace.sequence_hint_area().context("leader hint")?;
@@ -452,6 +494,10 @@ fn native_key_sequences_update_the_workspace_hint() -> Result<()> {
                     ensure!(workspace.projects.active().page_count() == 2);
                     ensure!(workspace.projects.active().active_page() == 1);
                     ensure!(workspace.active_sequence_hint().is_none());
+                    // The preceding edits belong to the original tabpage. Dirty this new page
+                    // before closing it so the key sequence actually opens its confirmation.
+                    press(workspace, "o", window, cx)?;
+                    press(workspace, "escape", window, cx)?;
                     for closing_draft in [true, false] {
                         for key in ["space", "tab", "d"] {
                             press(workspace, key, window, cx)?;
@@ -523,7 +569,7 @@ fn native_key_sequences_update_the_workspace_hint() -> Result<()> {
                     press_hidden(workspace, "z", window, cx)
                 })
             })??;
-            app.background_executor().timer(HINT_SETTLE).await;
+            wait_for_hint(handle, app).await?;
             app.update(|app| {
                 handle.update(app, |workspace, window, cx| -> Result<()> {
                     let hint = workspace
@@ -535,7 +581,7 @@ fn native_key_sequences_update_the_workspace_hint() -> Result<()> {
                     press_hidden(workspace, "g", window, cx)
                 })
             })??;
-            app.background_executor().timer(HINT_SETTLE).await;
+            wait_for_hint(handle, app).await?;
             app.update(|app| {
                 handle.update(app, |workspace, window, cx| -> Result<()> {
                     let hint = workspace
@@ -550,7 +596,7 @@ fn native_key_sequences_update_the_workspace_hint() -> Result<()> {
                     press_hidden(workspace, "d", window, cx)
                 })
             })??;
-            app.background_executor().timer(HINT_SETTLE).await;
+            wait_for_hint(handle, app).await?;
             app.update(|app| {
                 handle.update(app, |workspace, window, cx| -> Result<()> {
                     let hint = workspace.sequence_hint_area().context("operator hint")?;

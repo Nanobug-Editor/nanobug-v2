@@ -234,6 +234,25 @@ fn native_rust_plugin_installs_and_edits_current_rust_buffer() -> Result<()> {
                 let doc = &mut editor.buffer_mut().vim.doc;
                 let at = doc.text.find("todo!()").unwrap() + "todo!(".len();
                 doc.replace(at..at + 1, "", true);
+                workspace.sync(native, cx);
+                Ok(())
+            })?;
+            until(app, window, "automatic Rust syntax error", |workspace| {
+                let doc = &workspace.projects.active().editor.vim().doc;
+                Ok(workspace
+                    .plugins
+                    .view
+                    .guest_diagnostics
+                    .values()
+                    .any(|data| {
+                        data.version == (doc.opening, doc.revision)
+                            && data.diagnostics.iter().any(|item| {
+                                item.severity == nanobug_plugin_sdk::DiagnosticSeverity::Error
+                            })
+                    }))
+            })
+            .await?;
+            step(app, window, |workspace, native, cx| {
                 command(workspace, ":diagnose", native, cx);
                 Ok(())
             })?;

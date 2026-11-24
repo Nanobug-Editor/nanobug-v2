@@ -39,6 +39,7 @@ mod pointer;
 #[cfg(feature = "plugin-probe")]
 mod probe;
 mod projects;
+mod quickfix;
 mod recent_projects;
 mod recovery;
 mod session_export;
@@ -55,13 +56,14 @@ mod window_keys;
 mod window_modifiers;
 
 use crate::grid::{
-    render::{Cursor, Metrics, Panel, PopupBackdrop, Rect},
+    render::{Cursor, Metrics, Panel, Rect},
     windows::{
         editor::MarkdownCache,
         help::HelpWindow,
         start::{RemoveProject, StartPage},
     },
 };
+use crate::ui::components::grid_dialog::DialogBackdrop;
 
 use self::{
     editor_close::{CloseTarget, EditorClose},
@@ -92,6 +94,8 @@ pub(crate) struct Workspace {
     recent_projects: RecentProjects,
     /// Retained frame for the selected start page.
     start_panel: Entity<Panel>,
+    /// Clipped project rows and directory preview in the recent-project picker.
+    start_bodies: [Entity<Panel>; 2],
     /// Directory scan shown by the active project picker.
     start_preview: Option<StartPreview>,
     /// Transient command or search history editor.
@@ -152,7 +156,7 @@ pub(crate) struct Workspace {
     /// Resume a native close after outstanding settings rollbacks finish.
     close_after_settings: bool,
     /// Shared blurred workspace image for the shortcut and plugin popups.
-    popup_backdrop: PopupBackdrop,
+    dialog_backdrop: DialogBackdrop,
     /// Pending decisions for closing a pane, project or the native window.
     editor_close: Option<EditorClose>,
     /// Explicit discard requested by an Ex close, pending plugin close preparation.
@@ -196,10 +200,14 @@ pub(crate) struct Workspace {
     spacing: TextSpacing,
     /// Cell layout for the current native window.
     layout: Layout,
-    /// Cached manager, editor and footer views, in draw order.
-    panels: [Entity<Panel>; 3],
-    /// Independently clipped file rows, line numbers and text, in draw order.
-    bodies: [Entity<Panel>; 3],
+    /// Fixed Explorer border, title and project root.
+    manager_chrome: Entity<Panel>,
+    /// Clipped and scrolling Explorer rows.
+    manager_body: Entity<Panel>,
+    /// Fixed border, line numbers and text for the active editor.
+    editor_panels: frames::EditorPanels,
+    /// Workspace status and command line below the panes.
+    footer_panel: Entity<Panel>,
     /// Retained render layers and preview caches for the other visible editors.
     inactive_editor_panels: Vec<frames::EditorPanePanels>,
     /// UI-thread text and image layout for the last rendered Markdown document.
@@ -355,6 +363,9 @@ impl Workspace {
             tabs: TabBar::new(metrics, cx),
             recent_projects,
             start_panel: cx.new(|_| Panel::new(StartPage::content_metrics(metrics))),
+            start_bodies: std::array::from_fn(|_| {
+                cx.new(|_| Panel::new(StartPage::content_metrics(metrics)))
+            }),
             start_preview: None,
             command_window: None,
             vim_menu: None,
@@ -390,7 +401,7 @@ impl Workspace {
             settings_catalog_started: false,
             settings_writing: false,
             close_after_settings: false,
-            popup_backdrop: PopupBackdrop::default(),
+            dialog_backdrop: DialogBackdrop::default(),
             editor_close: None,
             forced_editor_close: None,
             language_selection: None,
@@ -413,16 +424,10 @@ impl Workspace {
             glyphs,
             spacing,
             layout: Layout::default(),
-            panels: [
-                cx.new(|_| Panel::new(metrics)),
-                cx.new(|_| Panel::new(metrics)),
-                cx.new(|_| Panel::new(metrics)),
-            ],
-            bodies: [
-                cx.new(|_| Panel::new(metrics)),
-                cx.new(|_| Panel::new(metrics)),
-                cx.new(|_| Panel::new(metrics)),
-            ],
+            manager_chrome: cx.new(|_| Panel::new(metrics)),
+            manager_body: cx.new(|_| Panel::new(metrics)),
+            editor_panels: frames::EditorPanels::new(metrics, cx),
+            footer_panel: cx.new(|_| Panel::new(metrics)),
             inactive_editor_panels: Vec::new(),
             markdown_cache: MarkdownCache::default(),
             markdown_pointer: pointer::MarkdownPointer::default(),

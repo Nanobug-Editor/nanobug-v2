@@ -101,7 +101,7 @@ enum WindowCommand {
     Tab(i32),
     /// Open the file under the cursor in a separate editor-only tab.
     OpenFile { line: bool },
-    /// Show the current buffer's diagnostic at the caret.
+    /// Show the current buffer's diagnostics for the entire caret line.
     Diagnostic,
     /// Wait for a second subcommand key.
     TabPrefix,
@@ -836,16 +836,7 @@ impl Workspace {
                 self.open_window_file_tab(line, window, cx)
             }
             WindowCommand::Diagnostic if focus == Focus::Editor => {
-                let message = project
-                    .editor
-                    .buffer()
-                    .caret_diagnostic()
-                    .unwrap_or_else(|| i18n::text("editor.no_diagnostics"))
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .to_owned();
-                self.set_status(message);
+                self.show_line_diagnostics(window, cx);
                 return;
             }
             WindowCommand::Cancel => return,

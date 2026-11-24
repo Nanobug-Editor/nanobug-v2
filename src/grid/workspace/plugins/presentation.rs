@@ -1,6 +1,8 @@
 //! Workspace adapter for presentation.
 
 use super::*;
+use crate::grid::{render::GridLayer, workspace::view::layer_element};
+use crate::ui::components::grid_list::GridList;
 
 impl Workspace {
     /// The plugin manager and grid surface share one retained panel.
@@ -20,22 +22,12 @@ impl Workspace {
             .then(|| self.plugin_manager_area())
     }
 
-    /// Center secondary dialogs and fit the main plugin list inside the visible grid.
+    /// Use the same capped bounds for the plugin list, details and secondary dialogs.
     pub(in crate::grid::workspace) fn plugin_manager_area(&self) -> Rect {
-        if self.plugin_manager_view().uses_plugin_list_layout() {
-            return ListLayout::area(
-                self.layout.visible_cols,
-                self.layout.visible_rows.min(self.layout.rows),
-            );
-        }
-        let width = self.layout.cols.saturating_sub(4).min(94);
-        let height = self.layout.rows.saturating_sub(3).clamp(MIN_HEIGHT, 25);
-        Rect {
-            x: self.layout.cols.saturating_sub(width) / 2,
-            y: self.layout.rows.saturating_sub(height) / 2,
-            w: width,
-            h: height,
-        }
+        ManagerWindow::area(
+            self.layout.visible_cols,
+            self.layout.visible_rows.min(self.layout.rows),
+        )
     }
 
     /// Return the retained plugin panel, its grid bounds and the caret clip for the active input.
@@ -114,7 +106,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if self.plugins.open {
-            return Some(self.plugin_manager_element(self.plugin_manager_area(), cx));
+            return Some(self.plugin_manager_element(self.plugin_manager_area(), window, cx));
         }
         let area = self.plugin_surface_area()?;
         if self.update_plugin_viewport(area, window, cx) {
@@ -178,11 +170,31 @@ impl Workspace {
     pub(in crate::grid::workspace) fn plugin_manager_element(
         &self,
         area: Rect,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let frame = self.plugin_manager_view().manager_frame(area);
+        let (frame, body) = self.plugin_manager_view().manager_frame(area);
+        let body = body.and_then(|(entries, body)| {
+            let panel = &self.plugins.list_panel;
+            panel.update(cx, |panel, cx| panel.set(body, cx));
+            let viewport = Rect {
+                x: area.x + entries.x,
+                y: area.y + entries.y,
+                ..entries
+            };
+            layer_element(
+                GridLayer::scrolled(
+                    panel,
+                    viewport,
+                    self.plugins.manager.list_scroll.fraction(),
+                    self.metrics,
+                ),
+                window,
+            )
+        });
         let panel = self.plugins.panel.clone();
         panel.update(cx, |panel, cx| panel.set(frame, cx));
+        let bounds = area.pixels(self.metrics);
         let manager = &self.plugins.manager;
         let description = if self.plugin_manager_view().uses_plugin_list_layout() {
             let layout = self.plugin_manager_view().plugin_list_layout(area);
@@ -215,8 +227,86 @@ impl Workspace {
             .top_0()
             .size_full()
             .children(outline)
-            .child(panel.cached(positioned(area.pixels(self.metrics))))
+            // The panel receives its frame during this render. Paint it in this pass, with its
+            // own row cache, so tab changes cannot reuse the previous frame's GPUI scene.
+            .child(
+                div()
+                    .absolute()
+                    .left(bounds.origin.x)
+                    .top(bounds.origin.y)
+                    .w(bounds.size.width)
+                    .h(bounds.size.height)
+                    .child(panel),
+            )
+            .children(body)
             .into_any_element()
+    }
+
+    /// Restore the page's stored offset, then follow selection in the shared animation clock.
+    pub(in crate::grid::workspace) fn advance_plugin_list(&mut self) {
+        if !self.plugins.open {
+            return;
+        }
+        let area = self.plugin_manager_area();
+        let view = self.plugin_manager_view();
+        let height = view.entries_area(area).h;
+        let count = view.plugin_row_count(area);
+        let now = self.scroll_epoch.elapsed().as_secs_f64();
+        let manager = &mut self.plugins.manager;
+        if manager.offset != manager.list_scroll.target() {
+            manager.list_scroll.follow(
+                manager.offset as f32,
+                count.saturating_sub(height),
+                false,
+                now,
+            );
+        }
+        GridList::follow(
+            &mut manager.list_scroll,
+            count,
+            height,
+            manager.selection,
+            now,
+        );
+        manager.offset = manager.list_scroll.target();
+    }
+    pub(in crate::grid::workspace) fn plugin_list_scrolling(&self) -> bool {
+        self.plugins.open && self.plugins.manager.list_scroll.is_active()
+    }
+
+    /// Consume the plugin dialog's wheel, revealing the selected entry within its own viewport.
+    pub(in crate::grid::workspace) fn wheel_plugin_list(
+        &mut self,
+        event: &gpui::ScrollEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.plugins.open {
+            return false;
+        }
+        let area = self.plugin_manager_area();
+        let view = self.plugin_manager_view();
+        let entries = view.entries_area(area);
+        let (x, y) = self.metrics.cell(event.position);
+        let manager = &self.plugins.manager;
+        if area.contains(x, y)
+            && entries.contains(x - area.x, y - area.y)
+            && !manager.help
+            && manager.prompt.is_none()
+            && manager.confirm_remove.is_none()
+            && self.plugins.view.review.is_none()
+            && !self.plugins.file_busy
+            && !self.plugins.credential_waiting
+        {
+            let count = view.plugin_row_count(area);
+            let delta = self.take_wheel_rows(event).saturating_neg();
+            if delta != 0 {
+                self.plugins.manager.selection =
+                    GridList::moved(self.plugins.manager.selection, delta, count);
+                self.plugin_refresh(window, cx);
+            }
+        }
+        true
     }
 
     /// Adapt operation results to the manager window without exposing workspace state to it.

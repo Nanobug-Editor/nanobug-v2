@@ -81,6 +81,129 @@ fn native_expression_register_restores_input_and_commits_chinese() -> Result<()>
     )
 }
 
+/// Switch among the recent-project filter, command keys and file picker through the native input handler.
+#[test]
+#[ignore = "requires the Windows DirectWrite and DirectX renderer"]
+fn native_project_and_file_filters_restore_chinese_input_after_list_commands() -> Result<()> {
+    use crate::grid::windows::{file_picker::PromptKind, start::ProjectPicker};
+
+    let temp = tempfile::tempdir()?;
+    let project = temp.path().join("项目甲");
+    let other = temp.path().join("项目乙");
+    fs::create_dir(&project)?;
+    fs::create_dir(&other)?;
+    let options = Options::take(
+        &mut vec![
+            "--no-plugins".into(),
+            "--plugin-profile".into(),
+            temp.path().join("profile").into_os_string(),
+        ],
+        temp.path(),
+    )?;
+    native_test::run_async_visible(
+        project.clone(),
+        options,
+        |_| {},
+        async move |handle, app| {
+            let _keep_temp = temp;
+            app.update(|app| {
+                handle.update(app, |ws, window, cx| -> Result<()> {
+                    ws.open_start_tab(window, cx);
+                    let roots = [project, other];
+                    ws.projects.start_mut().unwrap().picker =
+                        Some(Box::new(ProjectPicker::new(&roots)));
+                    ws.sync(window, cx);
+                    ensure!(ws.accepts_text_input(window, cx));
+                    ws.replace_and_mark_text_in_range(None, "xiang", Some(5..5), window, cx);
+                    ensure!(ws.marked_text_range(window, cx) == Some(0..5));
+                    ws.replace_text_in_range(None, "项目", window, cx);
+                    press(ws, "escape", window, cx)?;
+                    ensure!(!ws.accepts_text_input(window, cx));
+                    press(ws, "j", window, cx)?;
+                    ensure!(
+                        ws.projects
+                            .start()
+                            .unwrap()
+                            .picker
+                            .as_ref()
+                            .unwrap()
+                            .selected_root()
+                            == Some(roots[1].as_path())
+                    );
+                    press(ws, "/", window, cx)?;
+                    press(ws, "ctrl-a", window, cx)?;
+                    ws.replace_text_in_range(None, "甲", window, cx);
+                    ensure!(
+                        ws.projects
+                            .start()
+                            .unwrap()
+                            .picker
+                            .as_ref()
+                            .unwrap()
+                            .selected_root()
+                            == Some(roots[0].as_path())
+                    );
+                    ws.open_file_picker(window, cx);
+                    Ok(())
+                })
+            })??;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            loop {
+                if app.update(|app| {
+                    handle
+                        .read(app)
+                        .is_ok_and(|ws| ws.file_picker.as_ref().is_some_and(|s| !s.state.busy))
+                }) {
+                    break;
+                }
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "file picker listing timed out"
+                );
+                app.background_executor()
+                    .timer(std::time::Duration::from_millis(20))
+                    .await;
+            }
+            app.update(|app| {
+                handle.update(app, |ws, window, cx| -> Result<()> {
+                    press(ws, "f", window, cx)?;
+                    ensure!(ws.accepts_text_input(window, cx));
+                    ws.replace_and_mark_text_in_range(None, "mu", Some(2..2), window, cx);
+                    ws.replace_text_in_range(None, "目录", window, cx);
+                    press(ws, "enter", window, cx)?;
+                    ensure!(!ws.accepts_text_input(window, cx));
+                    ensure!(ws.file_picker.as_ref().unwrap().state.filter == "目录");
+                    press(ws, "/", window, cx)?;
+                    ensure!(matches!(
+                        ws.file_picker
+                            .as_ref()
+                            .unwrap()
+                            .state
+                            .prompt
+                            .as_ref()
+                            .map(|p| &p.kind),
+                        Some(PromptKind::Search)
+                    ));
+                    ws.replace_and_mark_text_in_range(None, "wen", Some(3..3), window, cx);
+                    ws.replace_text_in_range(None, "文", window, cx);
+                    ensure!(
+                        ws.file_picker
+                            .as_ref()
+                            .unwrap()
+                            .state
+                            .prompt
+                            .as_ref()
+                            .unwrap()
+                            .value
+                            == "文"
+                    );
+                    Ok(())
+                })
+            })?
+        },
+    )
+}
+
 /// The command-line history runs edited rows in the original editor and owns native preedit.
 #[test]
 #[ignore = "requires the Windows DirectWrite and DirectX renderer"]

@@ -87,9 +87,9 @@ fn native_middle_click_closes_the_hit_grid_title() -> anyhow::Result<()> {
             app.update(|app| {
                 handle.update(app, |workspace, window, cx| {
                     let picker = workspace.file_picker_layout().area;
-                    let title = |workspace: &Workspace, area: Rect| {
+                    let title_padding = |workspace: &Workspace, area: Rect| {
                         workspace.metrics.at(
-                            area.x as f32 + area.border_title_columns(None).start as f32 + 0.5,
+                            area.x as f32 + area.border_title_columns(None).start as f32 - 0.5,
                             area.y as f32 + 0.5,
                         )
                     };
@@ -120,10 +120,10 @@ fn native_middle_click_closes_the_hit_grid_title() -> anyhow::Result<()> {
                     middle(workspace, last.center(), window, cx);
                     ensure!(!workspace.help.is_open() && workspace.file_picker.is_some());
 
-                    middle(workspace, title(workspace, picker), window, cx);
+                    middle(workspace, title_padding(workspace, picker), window, cx);
                     ensure!(workspace.file_picker.is_none());
                     let explorer = workspace.layout.tree;
-                    middle(workspace, title(workspace, explorer), window, cx);
+                    middle(workspace, title_padding(workspace, explorer), window, cx);
                     ensure!(workspace.projects.active().hidden_pane == Some(Focus::Manager));
                     Ok(())
                 })?

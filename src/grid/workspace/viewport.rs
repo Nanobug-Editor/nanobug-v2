@@ -263,6 +263,13 @@ impl Workspace {
         if self.file_picker.is_some() {
             return self.advance_file_preview([inputs[1], inputs[2]], cx);
         }
+        if self.plugins.open {
+            self.advance_plugin_list();
+        }
+        if self.projects.start().is_some() {
+            self.advance_start_lists();
+            return true;
+        }
         let area = self.active_editor_area();
         let Some(project) = self.projects.active_project_mut() else {
             return false;
@@ -469,7 +476,7 @@ impl Workspace {
         let viewport = match space {
             CursorSpace::Manager => self.projects.active().manager.as_ref().map(|manager| {
                 (
-                    &self.bodies[0],
+                    &self.manager_body,
                     ManagerWindow::body(self.layout.tree),
                     manager.scroll(),
                     manager.tree().entries.len(),
@@ -481,7 +488,7 @@ impl Workspace {
                 let area = editor.text_area(self.active_editor_area());
                 Some(if let Some(terminal) = editor.terminal() {
                     (
-                        &self.bodies[2],
+                        &self.editor_panels.text,
                         area,
                         terminal.scroll(),
                         terminal.line_count(),
@@ -489,7 +496,7 @@ impl Workspace {
                     )
                 } else {
                     (
-                        &self.bodies[2],
+                        &self.editor_panels.text,
                         area,
                         &editor.buffer().scroll,
                         editor.vim().line_count(),
@@ -855,6 +862,10 @@ impl Workspace {
                 let buffer = editor.buffer();
                 buffer.scroll.is_active() || buffer.columns.is_active()
             })
+        } else if self.plugins.open {
+            self.plugin_list_scrolling()
+        } else if let Some(picker) = self.projects.start().and_then(|page| page.picker.as_ref()) {
+            picker.scrolling()
         } else if let Some(project) = self.projects.active_project() {
             let buffer = project.editor.buffer();
             project
@@ -874,7 +885,11 @@ impl Workspace {
         } else {
             false
         };
-        if self.scroll_scheduled || !(active || self.definition_hover_scroll_active()) {
+        if self.scroll_scheduled
+            || !(active
+                || (self.completion_scrolling() && self.completion_menu(window).is_some())
+                || self.definition_hover_scroll_active())
+        {
             return;
         }
         self.scroll_scheduled = true;

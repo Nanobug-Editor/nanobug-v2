@@ -1,6 +1,7 @@
 //! Exercise retained plugin fields, character buttons and images in a native workspace.
 
-use super::{Input, ListLayout, Prompt, Workspace};
+use super::{Input, Prompt, Workspace};
+use crate::grid::windows::plugin_manager::layout::ListLayout;
 use crate::grid::workspace::native_test;
 use anyhow::{Context as _, Result, ensure};
 use gpui::{
@@ -92,7 +93,7 @@ fn editor_appearance_changes_reach_the_same_grid_and_canvas() -> Result<()> {
                 ensure!(AppearanceSettings::load(saved)? == workspace.appearance);
                 ensure!(style(cx).light && style(cx).font == GridFont::MapleMono);
                 ensure!(workspace.metrics.font_size == 22.5 && workspace.metrics != before.0);
-                ensure!(workspace.bodies[2].read(cx).metrics() == workspace.metrics);
+                ensure!(workspace.editor_panels.text.read(cx).metrics() == workspace.metrics);
                 ensure!(workspace.plugin_panel().read(cx).metrics() == workspace.metrics);
                 ensure!(window.scale_factor() == before.4);
                 ensure!(workspace.plugins.surface.draft == before.1);
@@ -244,7 +245,7 @@ fn plugin_field_reflows_after_native_dpi_notification() -> Result<()> {
                         ensure!((logical * scale - (logical * scale).round()).abs() < 0.001);
                     }
                     ensure!(metrics != before.0 && metrics.font_size == before.0.font_size);
-                    ensure!(workspace.bodies[2].read(cx).metrics() == metrics);
+                    ensure!(workspace.editor_panels.text.read(cx).metrics() == metrics);
                     ensure!(workspace.plugin_panel().read(cx).metrics() == metrics);
                     ensure!(workspace.accepts_native_text());
                     ensure!(workspace.projects.active().editor.vim().doc.text == before.1);
@@ -674,7 +675,9 @@ fn verify_search_buttons(
             .prompt
             .as_ref()
             .context("Filter prompt")?;
-        let slot = &layout.prompt(&input.kind, &workspace.spacing).buttons[button];
+        let slot = &layout
+            .prompt(&input.kind, &workspace.spacing)
+            .button_columns()[button];
         click_manager(
             workspace,
             (slot.start + slot.len() / 2, layout.footer.y),
@@ -685,12 +688,17 @@ fn verify_search_buttons(
         ensure!(workspace.plugins.manager.search == result && !workspace.accepts_native_text());
     }
 
-    // Switch tabs with the mouse before checking that slash opens the input on the same footer.
+    // Switch tabs through their blank cells before reopening the footer input.
     let tabs = layout.tabs(&workspace.plugins.manager, &workspace.spacing);
-    ensure!(tabs.iter().all(|slot| !slot.is_empty()));
-    click_manager(workspace, (tabs[2].start, layout.list.y), 1, window, cx)?;
+    ensure!(tabs.visible().count() == 3);
+    let zip = tabs.hit_columns(2);
+    click_manager(workspace, (zip.end - 1, layout.list.y), 1, window, cx)?;
     ensure!(workspace.plugins.manager.page == super::Page::Zip && !workspace.accepts_native_text());
-    click_manager(workspace, (tabs[0].start, layout.list.y), 1, window, cx)?;
+    let installed = tabs.hit_columns(0);
+    let divider = installed.end;
+    click_manager(workspace, (divider, layout.list.y), 1, window, cx)?;
+    ensure!(workspace.plugins.manager.page == super::Page::Zip);
+    click_manager(workspace, (installed.start, layout.list.y), 1, window, cx)?;
     ensure!(workspace.plugins.manager.page == super::Page::Installed);
     press(workspace, "/", window, cx)?;
     ensure!(workspace.accepts_native_text());
@@ -893,6 +901,115 @@ fn click_manager(
     Ok(())
 }
 
+/// Scroll to the last completion, reverse at its boundary and click the visible top candidate.
+#[test]
+#[ignore = "requires the Windows native renderer"]
+fn native_completion_wheel_and_click_share_the_visible_rows() -> Result<()> {
+    use crate::grid::workspace::layout::Focus;
+    use gpui::{ScrollDelta, ScrollEvent};
+    let temp = tempfile::tempdir()?;
+    let project = temp.path().join("project");
+    fs::create_dir(&project)?;
+    let options = session::Options::take(
+        &mut vec![
+            "--no-plugins".into(),
+            "--plugin-profile".into(),
+            temp.path().join("profile").into_os_string(),
+        ],
+        temp.path(),
+    )?;
+    native_test::run_async_visible(
+        project,
+        options,
+        |ws| ws.projects.active_mut().focus_pane(Focus::Editor),
+        async move |handle, app| {
+            let _keep_temp = temp;
+            app.update(|app| {
+                handle.update(app, |ws, window, cx| -> Result<()> {
+                    ws.sync(window, cx);
+                    press(ws, "i", window, cx)?;
+                    ws.show_insert_candidates(
+                        0,
+                        (0..30).map(|i| format!("item{i}")).collect(),
+                        false,
+                        cx,
+                    );
+                    let (menu, _, _) = ws
+                        .completion_menu(window)
+                        .context("visible completion list")?;
+                    let position = menu.bounds().center();
+                    for (delta, expected) in [(-64., 29), (-1., 29), (2., 27)] {
+                        ws.scroll(
+                            &ScrollEvent {
+                                position,
+                                delta: ScrollDelta::Lines(point(0., delta)),
+                                ..Default::default()
+                            },
+                            window,
+                            cx,
+                        );
+                        ensure!(
+                            ws.completion_items().context("wheel dismissed popup")?.1 == expected
+                        );
+                    }
+                    ensure!(ws.projects.active().editor.buffer().scroll.target() == 0);
+                    Ok(())
+                })
+            })??;
+            let deadline = std::time::Instant::now() + Duration::from_secs(6);
+            loop {
+                let top = app.update(|app| {
+                    handle.update(app, |ws, window, _| {
+                        let (menu, ..) = ws.completion_menu(window)?;
+                        let bounds = menu.bounds();
+                        menu.hit(point(bounds.center().x, bounds.top() + px(1.)), ws.metrics)
+                    })
+                })?;
+                if top.is_some_and(|index| index > 0) {
+                    break;
+                }
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "completion viewport did not scroll"
+                );
+                app.background_executor()
+                    .timer(Duration::from_millis(12))
+                    .await;
+            }
+            app.update(|app| {
+                handle.update(app, |ws, window, cx| -> Result<()> {
+                    let (menu, labels, _) = ws.completion_menu(window).context("scrolled popup")?;
+                    let bounds = menu.bounds();
+                    let position = point(bounds.center().x, bounds.top() + px(1.));
+                    let index = menu.hit(position, ws.metrics).context("painted top row")?;
+                    let expected = labels[index].to_owned();
+                    ws.mouse_down(
+                        &MouseDownEvent {
+                            button: MouseButton::Left,
+                            position,
+                            click_count: 1,
+                            ..Default::default()
+                        },
+                        window,
+                        cx,
+                    );
+                    ensure!(ws.completion_items().is_none());
+                    ensure!(
+                        ws.projects
+                            .active()
+                            .editor
+                            .vim()
+                            .doc
+                            .text
+                            .starts_with(&expected)
+                    );
+                    Ok(())
+                })
+            })?
+        },
+    )
+}
+
 /// Verify that the list can scroll and open the row that the cursor and mouse show as selected.
 #[test]
 #[ignore = "requires the Windows native renderer"]
@@ -917,12 +1034,21 @@ fn plugin_list_uses_the_same_rows_for_render_caret_and_clicks() -> Result<()> {
                 ensure!(workspace.plugin_caret() == Some((x, y, 1., insert, visible)));
                 let first = workspace
                     .plugin_manager_view()
-                    .plugin_visible_rows(list.entries.h, 30)
+                    .plugin_list(list.entries.h, 30)
+                    .range()
                     .start;
                 click_manager(workspace, (list.entries.x, list.entries.y), 2, window, cx)?;
                 let record = &workspace.plugins.view.installed[first];
                 let namespace = record.release.manifest.identity().namespace();
                 ensure!(workspace.plugins.manager.detail.as_deref() == Some(namespace.as_str()));
+                ensure!(workspace.plugin_manager_area() == area);
+                let overview_end = 2 + workspace
+                    .spacing
+                    .columns(i18n::text("plugin_manager.overview"));
+                click_manager(workspace, (overview_end + 2, 2), 1, window, cx)?;
+                ensure!(workspace.plugins.manager.detail_page == super::Detail::Modules);
+                click_manager(workspace, (overview_end, 2), 1, window, cx)?;
+                ensure!(workspace.plugins.manager.detail_page == super::Detail::Overview);
                 press(workspace, "q", window, cx)?;
                 ensure!(
                     workspace.plugins.manager.detail.is_none()
@@ -934,10 +1060,14 @@ fn plugin_list_uses_the_same_rows_for_render_caret_and_clicks() -> Result<()> {
                     (56, 13, false),
                     (92, 25, true),
                     (142, 40, false),
+                    (240, 90, true),
                 ] {
-                    let area = ListLayout::area(cols, rows);
+                    let area = super::ManagerWindow::area(cols, rows);
                     let list = ListLayout::new(area, has_feedback);
                     ensure!(area.x + area.w <= cols && area.y + area.h <= rows);
+                    ensure!(area.w <= 112 && area.h <= 32);
+                    ensure!((cols - area.w).abs_diff(2 * area.x) <= 1);
+                    ensure!((rows - area.h).abs_diff(2 * area.y) <= 1);
                     let filter = list.prompt(
                         &Prompt::Search {
                             original: String::new(),
@@ -947,12 +1077,13 @@ fn plugin_list_uses_the_same_rows_for_render_caret_and_clicks() -> Result<()> {
                         &workspace.spacing,
                     );
                     ensure!(list.entries.h > 0 && !filter.input.is_empty());
-                    ensure!(filter.input.end < filter.buttons[0].start);
-                    ensure!(filter.buttons[1].end == list.footer.x + list.footer.w);
+                    ensure!(filter.input.end < filter.button_columns()[0].start);
+                    ensure!(filter.button_columns()[1].end == list.footer.x + list.footer.w);
                     ensure!(
                         list.tabs(&workspace.plugins.manager, &workspace.spacing)
-                            .iter()
-                            .all(|tab| !tab.is_empty())
+                            .visible()
+                            .count()
+                            == 3
                     );
                     ensure!(list.list.y + list.list.h == list.description.y);
                     if list.description.h > 0 {
@@ -974,6 +1105,81 @@ fn plugin_list_uses_the_same_rows_for_render_caret_and_clicks() -> Result<()> {
     })
 }
 
+/// Read the title strip from the first frame drawn after each numeric shortcut.
+#[test]
+#[ignore = "requires the Windows native renderer"]
+fn plugin_tabs_repaint_on_the_first_keypress() -> Result<()> {
+    run_workspace(async |handle, cx| {
+        let list_row = cx.update(|app| {
+            handle.update(app, |workspace, window, cx| -> Result<_> {
+                workspace.plugins.view = Arc::new(manager_list_view()?);
+                workspace.plugins.open = true;
+                workspace.sync(window, cx);
+                let area = workspace.plugin_manager_area();
+                Ok(workspace
+                    .plugin_manager_view()
+                    .plugin_list_layout(area)
+                    .list
+                    .y)
+            })
+        })??;
+
+        let capture = |app: &mut App, row| -> Result<image::RgbaImage> {
+            let (bounds, scale) = handle.update(app, |workspace, window, _| {
+                let mut area = workspace.plugin_manager_area();
+                area.y += row;
+                area.h = 1;
+                (area.pixels(workspace.metrics), window.scale_factor())
+            })?;
+            app.update_window(handle.into(), |_, window, app| {
+                window.draw(app).clear(app);
+                let image = window.render_to_image()?;
+                let to_pixel = |value: Pixels| (f32::from(value) * scale).round() as u32;
+                Ok(image::imageops::crop_imm(
+                    &image,
+                    to_pixel(bounds.left()),
+                    to_pixel(bounds.top()),
+                    to_pixel(bounds.size.width),
+                    to_pixel(bounds.size.height),
+                )
+                .to_image())
+            })?
+        };
+
+        for (row, keys) in [(list_row, &["3", "2", "1"][..]), (2, &["2", "3", "4", "1"])] {
+            if row == 2 {
+                cx.update(|app| {
+                    handle.update(app, |workspace, window, cx| {
+                        press(workspace, "enter", window, cx)?;
+                        ensure!(workspace.plugins.manager.detail.is_some());
+                        Ok::<_, anyhow::Error>(())
+                    })
+                })??;
+            }
+            let mut before = cx.update(|app| capture(app, row))?;
+            for &binding in keys {
+                cx.update(|app| {
+                    handle.update(app, |workspace, window, cx| {
+                        press(workspace, binding, window, cx)
+                    })
+                })??;
+                let after = cx.update(|app| capture(app, row))?;
+                ensure!(
+                    before.pixels().zip(after.pixels()).any(|(before, after)| {
+                        before.0[..3]
+                            .iter()
+                            .zip(&after.0[..3])
+                            .any(|(left, right)| left.abs_diff(*right) > 30)
+                    }),
+                    "first press of {binding} did not repaint tabs on row {row}"
+                );
+                before = after;
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Use the workspace's middle button route with live caption positions after each close.
 fn verify_manager_title_closes(
     workspace: &mut Workspace,
@@ -990,10 +1196,10 @@ fn verify_manager_title_closes(
         let area = workspace.plugin_manager_area();
         let layout = workspace.plugin_manager_view().plugin_list_layout(area);
         let tabs = layout.tabs(&workspace.plugins.manager, &workspace.spacing);
-        let caption = &tabs[page as usize];
-        ensure!(!caption.is_empty());
+        let hit = tabs.hit_columns(page as usize);
+        ensure!(!hit.is_empty());
         let position = workspace.metrics.at(
-            (area.x + caption.start) as f32 + 0.5,
+            (area.x + hit.end - 1) as f32 + 0.5,
             (area.y + layout.list.y) as f32 + 0.5,
         );
         workspace.middle_mouse_down(
@@ -1010,7 +1216,10 @@ fn verify_manager_title_closes(
         if let Some(next) = next {
             ensure!(workspace.plugins.manager.page == next);
             let tabs = layout.tabs(&workspace.plugins.manager, &workspace.spacing);
-            ensure!(tabs[page as usize].is_empty() && !tabs[next as usize].is_empty());
+            ensure!(
+                tabs.hit_columns(page as usize).is_empty()
+                    && !tabs.hit_columns(next as usize).is_empty()
+            );
         }
     }
     Ok(())
@@ -1059,14 +1268,39 @@ async fn capture_plugin_manager(
 ) -> Result<()> {
     fs::create_dir_all(evidence)?;
     let _locale = RestoreLocale(i18n::locale());
-    for (locale, name, width, height, filtering) in [
-        (Locale::English, "manager-en.png", 1120., 680., false),
+    for (locale, name, width, height, filtering, detail) in [
+        (Locale::English, "manager-en.png", 1120., 680., false, false),
         (
             Locale::SimplifiedChinese,
             "manager-zh.png",
             1120.,
             680.,
             false,
+            false,
+        ),
+        (
+            Locale::SimplifiedChinese,
+            "manager-detail-zh.png",
+            1120.,
+            680.,
+            false,
+            true,
+        ),
+        (
+            Locale::SimplifiedChinese,
+            "manager-capped-zh.png",
+            1600.,
+            1000.,
+            false,
+            false,
+        ),
+        (
+            Locale::SimplifiedChinese,
+            "manager-detail-capped-zh.png",
+            1600.,
+            1000.,
+            false,
+            true,
         ),
         (
             Locale::SimplifiedChinese,
@@ -1074,12 +1308,22 @@ async fn capture_plugin_manager(
             1120.,
             680.,
             true,
+            false,
         ),
         (
             Locale::SimplifiedChinese,
             "manager-compact-zh.png",
             360.,
             300.,
+            true,
+            false,
+        ),
+        (
+            Locale::SimplifiedChinese,
+            "manager-detail-compact-zh.png",
+            360.,
+            300.,
+            false,
             true,
         ),
     ] {
@@ -1095,7 +1339,16 @@ async fn capture_plugin_manager(
             handle.update(cx, |workspace, window, cx| -> Result<()> {
                 i18n::set_locale(locale);
                 workspace.plugins.manager.selection = 0;
+                workspace.plugins.manager.detail = None;
+                workspace.plugins.manager.prompt = None;
+                workspace.plugins.manager.search.clear();
                 workspace.sync(window, cx);
+                let area = workspace.plugin_manager_area();
+                if detail {
+                    press(workspace, "enter", window, cx)?;
+                    ensure!(workspace.plugins.manager.detail.is_some());
+                    ensure!(workspace.plugin_manager_area() == area);
+                }
                 if filtering && workspace.plugins.manager.prompt.is_none() {
                     press(workspace, "/", window, cx)?;
                     ensure!(workspace.plugin_commit("Rust", window, cx));
@@ -1119,18 +1372,24 @@ async fn capture_plugin_manager(
             Ok(())
         })?;
     }
+    cx.update(|cx| {
+        handle.update(cx, |workspace, window, cx| {
+            workspace.plugins.manager.detail = None;
+            workspace.sync(window, cx);
+        })
+    })?;
     Ok(())
 }
 
 fn search(workspace: &mut Workspace) {
-    workspace.plugins.manager.prompt = Some(Input {
-        kind: Prompt::Search {
+    workspace.plugins.manager.prompt = Some(Input::new(
+        Prompt::Search {
             original: "previous".into(),
             selection: 0,
             offset: 0,
         },
-        value: "编辑器".into(),
-    });
+        "编辑器".into(),
+    ));
     workspace.plugins.manager.live_search();
 }
 

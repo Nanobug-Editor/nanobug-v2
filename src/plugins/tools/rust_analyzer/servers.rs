@@ -5,10 +5,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{path::Path, process::Command};
 
+#[cfg(windows)]
+mod windows;
+
 /// Build Rust's handshake with the effective project-relative `exclusions`.
 fn rust_analyzer_options(exclusions: &[String]) -> Value {
     let mut options = json!({
-        "checkOnSave": false,
+        "checkOnSave": true,
         "diagnostics": {"enable": true},
         "completion": {"autoimport": {"enable": false}, "postfix": {"enable": false}},
     });
@@ -107,6 +110,10 @@ impl Server {
     /// Resolve a supported executable and its fixed arguments for project `root`.
     pub(super) fn command(self, root: &Path) -> Result<Command> {
         use super::super::language::{executable, npm_entry};
+        #[cfg(windows)]
+        if self == Self::RustAnalyzer {
+            return windows::rust_analyzer_command(root);
+        }
         if self == Self::Vue {
             return Self::Typescript.command(root);
         }

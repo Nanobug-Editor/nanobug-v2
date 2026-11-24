@@ -200,15 +200,23 @@ impl Workspace {
             .installed
             .iter()
             .any(|record| record.enabled && record.grants.contains(&Permission::ReadDocument));
+        let mut saves = nanobug::plugins::session::DocumentSaves::new();
         let projects = self
             .projects
             .ordered()
             .map(|project| {
                 let id = project.plugin_scope;
-                let doc = &project.editor.vim().doc;
+                // Browsing diagnostic results keeps language analysis attached to their source.
+                let source = project
+                    .editor_by_id(project.result_source_pane())
+                    .unwrap_or(&project.editor);
+                let doc = &source.vim().doc;
+                if doc.save_generation() != 0 {
+                    saves.insert((id, doc.opening), doc.save_generation());
+                }
                 let native = nanobug::plugins::session::builtin_syntax_grammar(
                     doc.path.as_deref(),
-                    project.editor.vim().filetype_override().as_deref(),
+                    source.vim().filetype_override().as_deref(),
                 )
                 .is_some();
                 let document =
@@ -228,19 +236,26 @@ impl Workspace {
                     });
                 let mut remaining = 512 * 1024;
                 let open_documents = if document_readers {
+                    // Give visible split buffers the first slots in the bounded overlay set.
+                    // Two panes viewing one shared buffer must send only one overlay for its URI.
+                    let mut seen = std::collections::BTreeSet::from([doc.buffer_number()]);
                     project
-                        .editor
-                        .buffers()
-                        .iter()
+                        .page_editors()
+                        .map(|(_, editor)| editor.buffer())
+                        .chain(source.buffers())
                         .filter_map(|buffer| {
                             let other = &buffer.vim.doc;
-                            if other.opening == doc.opening
+                            if buffer.list_owner().is_some()
+                                || !seen.insert(other.buffer_number())
                                 || other.text.len() > 120 * 1024
                                 || other.text.len() > remaining
                             {
                                 return None;
                             }
                             remaining -= other.text.len();
+                            if other.save_generation() != 0 {
+                                saves.insert((id, other.opening), other.save_generation());
+                            }
                             let snapshot = self
                                 .plugins
                                 .open_snapshots
@@ -264,19 +279,54 @@ impl Workspace {
                 }
             })
             .collect::<Vec<_>>();
+        let visible_syntax = self
+            .projects
+            .active_project()
+            .filter(|project| !project.editor_zoomed())
+            .into_iter()
+            .flat_map(|project| {
+                let scope = project.plugin_scope;
+                let focused = project.active_editor_id();
+                project
+                    .page_editors()
+                    .filter(move |(pane, _)| *pane != focused)
+                    .map(move |(_, editor)| (scope, editor.vim()))
+            })
+            .filter_map(|(scope, vim)| {
+                use nanobug::plugins::session::builtin_syntax_grammar;
+                let doc = &vim.doc;
+                if doc.text.len() > nanobug_plugin_sdk::document_wire::MAX_DOCUMENT_BYTES {
+                    return None;
+                }
+                builtin_syntax_grammar(doc.path.as_deref(), vim.filetype_override().as_deref())?;
+                let snapshot = self
+                    .plugins
+                    .open_snapshots
+                    .entry((scope, doc.opening))
+                    .or_insert_with(|| Arc::new(snapshot_from(doc)));
+                if snapshot.revision != doc.revision || snapshot.path != doc.path {
+                    *snapshot = Arc::new(snapshot_from(doc));
+                }
+                Some(Arc::clone(snapshot))
+            })
+            .collect::<Vec<_>>();
         self.plugins.snapshots.retain(|id, _| {
             projects
                 .iter()
                 .any(|project| project.id == *id && project.document.is_some())
         });
         self.plugins.open_snapshots.retain(|(id, opening), _| {
-            projects.iter().any(|project| {
-                project.id == *id
-                    && project
-                        .open_documents
-                        .iter()
-                        .any(|snapshot| snapshot.opening == *opening)
-            })
+            (Some(*id) == active
+                && visible_syntax
+                    .iter()
+                    .any(|snapshot| snapshot.opening == *opening))
+                || projects.iter().any(|project| {
+                    project.id == *id
+                        && project
+                            .open_documents
+                            .iter()
+                            .any(|snapshot| snapshot.opening == *opening)
+                })
         });
         let dialects = self
             .projects
@@ -290,16 +340,21 @@ impl Workspace {
             .projects
             .ordered()
             .flat_map(|project| {
-                project.editor.buffers().iter().filter_map(|buffer| {
-                    let filetype = buffer.vim.filetype_override()?;
-                    Some(((project.plugin_scope, buffer.vim.doc.opening), filetype))
-                })
+                project
+                    .editors()
+                    .flat_map(|(_, editor)| editor.buffers())
+                    .filter_map(|buffer| {
+                        let filetype = buffer.vim.filetype_override()?;
+                        Some(((project.plugin_scope, buffer.vim.doc.opening), filetype))
+                    })
             })
             .collect();
         if self.plugins.active != active
             || self.plugins.projects != projects
             || self.plugins.sql_dialects != dialects
             || self.plugins.document_filetypes != filetypes
+            || self.plugins.document_saves != saves
+            || self.plugins.visible_syntax != visible_syntax
         {
             if self
                 .plugins
@@ -315,15 +370,19 @@ impl Workspace {
             self.plugins.projects = projects;
             self.plugins.sql_dialects = dialects;
             self.plugins.document_filetypes = filetypes;
+            self.plugins.document_saves = saves;
+            self.plugins.visible_syntax = visible_syntax;
             self.plugins
                 .session
                 .as_ref()
                 .expect("plugin session")
-                .projects_with_languages(
+                .sync_documents(
                     active,
                     self.plugins.projects.clone(),
                     self.plugins.sql_dialects.clone(),
                     self.plugins.document_filetypes.clone(),
+                    self.plugins.visible_syntax.clone(),
+                    self.plugins.document_saves.clone(),
                 );
         }
         self.reattach_project_surface();

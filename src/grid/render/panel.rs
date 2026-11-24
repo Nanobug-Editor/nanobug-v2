@@ -97,8 +97,8 @@ struct Decoration {
 }
 
 impl Decoration {
-    /// Convert the highlight group into one underline and an independent strike.
-    fn from_paint(paint: CellPaint) -> Self {
+    /// Resolve a cell's underline, strike and overline using this panel's theme.
+    fn from_paint(paint: CellPaint, style: Style) -> Self {
         let attributes = paint.attributes;
         let underline = [
             (attributes.undercurl, Underline::Curl),
@@ -113,7 +113,7 @@ impl Decoration {
             underline,
             strike: attributes.strikethrough,
             overline: attributes.overline,
-            special: paint.special,
+            special: paint.special.map(|color| style.foreground(color)),
         }
     }
 }
@@ -324,6 +324,22 @@ pub struct Panel {
 }
 
 impl Panel {
+    /// Inspect the text actually retained for each label on a row in native rendering tests.
+    #[cfg(all(test, windows))]
+    pub(in crate::grid) fn row_labels(&self, row: usize) -> Vec<String> {
+        self.data.borrow().frame.labels[row]
+            .iter()
+            .map(|label| {
+                label
+                    .text
+                    .cells
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect()
+            })
+            .collect()
+    }
+
     /// Create an empty panel using shared `metrics`; the root paints the material once.
     pub fn new(metrics: Metrics) -> Self {
         Self {
@@ -337,7 +353,7 @@ impl Panel {
         }
     }
 
-    /// Test the painted border title within the panel's grid area.
+    /// Test the border title and its adjacent padding within the panel's grid area.
     pub(in crate::grid) fn title_at(
         &self,
         area: Rect,
@@ -728,7 +744,7 @@ impl PanelData {
                 text.push_str(&cells[col].text);
                 col += width;
             }
-            let decoration = Decoration::from_paint(paint);
+            let decoration = Decoration::from_paint(paint, style);
             if opacity == 0.
                 || text.trim().is_empty()
                     && !decoration.strike

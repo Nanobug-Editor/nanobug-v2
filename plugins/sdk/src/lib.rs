@@ -446,9 +446,30 @@ impl std::fmt::Debug for ServiceResult {
 /// A diagnostic in the supplied document snapshot's UTF-8 coordinate space.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Diagnostic {
+    /// First byte in the reported span.
     pub start: usize,
+    /// Exclusive end byte, equal to `start` for a diagnostic at an insertion point.
     pub end: usize,
+    /// Explanation shown to the user.
     pub message: String,
+    /// Older language plugins omit this field when forwarding parser errors.
+    #[serde(default)]
+    pub severity: DiagnosticSeverity,
+}
+
+/// Severity reported by a language plugin or its language server.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticSeverity {
+    /// A language or tool error at the reported range.
+    #[default]
+    Error,
+    /// A potential problem worth reviewing.
+    Warning,
+    /// An informational observation.
+    Information,
+    /// A lower-priority editing suggestion.
+    Hint,
 }
 
 /// High-level character grid view. Input text remains host-owned between frames.
@@ -672,5 +693,24 @@ pub fn receive_counted<T: DeserializeOwned>(
         if delimiter.is_some() {
             return Ok(Some((serde_json::from_slice(&data)?, data.len() + 1)));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Old WASM language modules forward parser errors without a severity field.
+    #[test]
+    fn diagnostic_severity_survives_new_and_legacy_plugin_output() {
+        let legacy = json!({"start": 1, "end": 2, "message": "expected name"});
+        let mut diagnostic: Diagnostic = serde_json::from_value(legacy).unwrap();
+        assert_eq!(diagnostic.severity, DiagnosticSeverity::Error);
+        diagnostic.severity = DiagnosticSeverity::Warning;
+        let encoded = serde_json::to_value(diagnostic).unwrap();
+        assert_eq!(encoded["severity"], "warning");
+        let decoded: Diagnostic = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.severity, DiagnosticSeverity::Warning);
     }
 }

@@ -4,10 +4,7 @@ use super::{Operation, PickerSession, Workspace};
 use crate::{
     grid::{
         FilePreviewProvider, PluginPreview, PreviewHighlighter, PreviewShortcut,
-        render::{
-            Frame, GridLayer, LabelStyle, MessageLevel, Metrics, Panel, SHORTCUT_SEPARATOR,
-            shortcut_hint,
-        },
+        render::{Frame, GridLayer, MessageLevel, Metrics, Panel},
         windows::{
             WindowFrame,
             editor::EditorWindow,
@@ -16,6 +13,7 @@ use crate::{
         workspace::viewport::CursorSpace,
     },
     ui::{
+        components::grid_key_hints::GridKeyHints,
         keys::normal_character,
         text::{TextSpacing, UNITS_PER_COLUMN},
         theme::{MUTED, TEXT, ThemeComponent},
@@ -188,13 +186,17 @@ impl FocusedFile {
 }
 
 /// Return the area in `width` columns reserved for preview command input.
-fn command_slot(width: usize, spacing: &TextSpacing) -> (Range<usize>, String) {
-    let apply = shortcut_hint(i18n::text("picker.hint_apply"), "Enter");
-    let cancel = shortcut_hint(i18n::text("picker.hint_cancel"), "Esc");
-    let hints = format!("{apply}{SHORTCUT_SEPARATOR}{cancel}");
+fn command_slot(width: usize, spacing: &TextSpacing) -> (Range<usize>, GridKeyHints) {
     let end = width.saturating_sub(1);
-    let right = spacing.columns(&hints);
-    (1..end.saturating_sub(right + 2).max(1), hints)
+    let hints = GridKeyHints::fit(
+        end.saturating_sub(3),
+        [
+            (i18n::text("picker.hint_apply"), "Enter"),
+            (i18n::text("picker.hint_cancel"), "Esc"),
+        ],
+        spacing,
+    );
+    (1..end.saturating_sub(hints.width + 2).max(1), hints)
 }
 
 impl PickerSession {
@@ -202,25 +204,8 @@ impl PickerSession {
     pub(super) fn footer_frame(&self, width: usize, spacing: &TextSpacing) -> Frame {
         let mut frame = Frame::new(width, 1);
         frame.set_theme_component(ThemeComponent::Footer);
-        let mut column = 1;
-        let mut push = |action: &str, key: &str| {
-            let label = shortcut_hint(action, key);
-            let separator = if column > 1 { SHORTCUT_SEPARATOR } else { "" };
-            let end = column + separator.len() + spacing.columns(&label);
-            if end >= width {
-                return false;
-            }
-            column = frame.styled_label(
-                0,
-                column..end,
-                separator,
-                MUTED,
-                spacing,
-                LabelStyle::Dimmed,
-            );
-            column = frame.styled_label(0, column..end, &label, TEXT, spacing, LabelStyle::Dimmed);
-            true
-        };
+        let mut hints = GridKeyHints::new(width.saturating_sub(2));
+        let mut push = |action: &str, key: &str| hints.push(action, key, spacing);
         let shortcuts: &[(&str, &str)] = if let Some(file) = &self.focused {
             match &file.content {
                 FileContent::Text { editor, .. }
@@ -232,14 +217,7 @@ impl PickerSession {
                         .ellipsize(&editor.command_text(), slot.len())
                         .into_owned();
                     frame.label(0, slot, &command, TEXT, spacing);
-                    frame.styled_label(
-                        0,
-                        hints_start..width.saturating_sub(1),
-                        &hints,
-                        MUTED,
-                        spacing,
-                        LabelStyle::Dimmed,
-                    );
+                    frame.key_hints(0, hints_start, &hints, (MUTED, MUTED), spacing);
                     return frame;
                 }
                 FileContent::Text { editor, .. } => {
@@ -269,6 +247,7 @@ impl PickerSession {
                             break;
                         }
                     }
+                    frame.key_hints(0, 1, &hints, (TEXT, MUTED), spacing);
                     return frame;
                 }
                 FileContent::Unavailable(_) => {
@@ -329,6 +308,7 @@ impl PickerSession {
                 break;
             }
         }
+        frame.key_hints(0, 1, &hints, (TEXT, MUTED), spacing);
         frame
     }
 }
@@ -637,6 +617,9 @@ impl Workspace {
             | Action::PluginComplete
             | Action::InsertCandidates { .. }
             | Action::PluginDiagnose
+            | Action::Quickfix { .. }
+            | Action::FilterList { .. }
+            | Action::Diagnostic(_)
             | Action::PluginDefinition
             | Action::PluginHover
             | Action::PluginOutline

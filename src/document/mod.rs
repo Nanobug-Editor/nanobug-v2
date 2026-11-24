@@ -99,6 +99,8 @@ pub struct DocumentContent {
     saved: Arc<String>,
     /// A revision known to match `saved` without comparing the text again.
     saved_revision: Option<u64>,
+    /// Number of successful writes, including saves that did not change the text revision.
+    save_generation: u64,
     /// Preserve CRLF when a CRLF file is saved.
     crlf: bool,
     /// Preserve an existing UTF-8 BOM.
@@ -140,6 +142,7 @@ impl Document {
             last_replacement: None,
             saved: Arc::new(text.into()),
             saved_revision: Some(0),
+            save_generation: 0,
             crlf: false,
             bom: false,
             disk_version: None,
@@ -210,6 +213,11 @@ impl Document {
         self.text != *self.saved || self.content.recovery_requires_write()
     }
 
+    /// Observe successful buffer writes independently of edits, undo and failed save attempts.
+    pub fn save_generation(&self) -> u64 {
+        self.save_generation
+    }
+
     /// Mark cached language results stale in every view while preserving text, undo and save state.
     pub fn invalidate_language_dependents(&mut self) {
         self.refresh_shared();
@@ -238,6 +246,14 @@ impl Document {
         self.saved_revision = Some(self.revision);
         self.history.set_recovery_file(None);
         self.publish_content();
+    }
+
+    /// Refresh a generated listing in place, preserving its buffer identity and clean state.
+    pub fn refresh_listing(&mut self, text: &str) {
+        if self.text != text {
+            self.replace(0..self.text.len(), text, false);
+            self.acknowledge_scratch_edit();
+        }
     }
 
     /// Build a fresh document from the last loaded or saved text, retaining its path and encoding.
@@ -354,7 +370,9 @@ impl Document {
     /// Swap contents while retaining the stable Ex number and its tracked file positions.
     fn replace_file_contents(&mut self, fresh: Self) {
         let revision = self.revision + 1;
+        let save_generation = self.save_generation;
         self.content = fresh.content;
+        self.save_generation = save_generation;
         self.revision = revision;
         self.saved_revision = Some(revision);
         self.folds = fresh.folds;
@@ -681,6 +699,7 @@ impl Document {
         self.saved = Arc::new(self.text.clone());
         self.saved_revision = Some(self.revision);
         self.history.mark_saved();
+        self.save_generation += 1;
         self.disk_version = Some(written);
         (self.crlf, self.bom) = self.content.file_format();
         if path_changed {

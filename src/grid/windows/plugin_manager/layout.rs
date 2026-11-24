@@ -1,18 +1,19 @@
-//! Geometry and rendering shared by the three top-level plugin pages.
+//! Shared dialog bounds and the three-section plugin list layout.
 
 use super::{ManagerView, ManagerWindow, Page, Prompt};
-use crate::grid::text_field as field;
+use crate::ui::components::grid_confirm::{ButtonAlign, ConfirmButton, GridConfirm};
+use crate::ui::components::grid_dialog::GridDialog;
+use crate::ui::components::grid_tab_bar::TitleTabs;
+use crate::ui::components::{grid_key_hints::GridKeyHints, grid_text_field::FieldLayout};
 use crate::{
-    grid::render::{
-        Frame, LabelStyle, PromptRow, Rect, SEARCH_ICON, SHORTCUT_SEPARATOR, shortcut_hint,
-    },
+    grid::render::{Frame, PromptRow, Rect, SEARCH_ICON},
     ui::{
         text::{TextSpacing, UNITS_PER_COLUMN},
         theme::{ACCENT, GOLD, MUTED, SELECTION, TEXT},
     },
 };
 use nanobug::i18n;
-use std::{borrow::Cow, ops::Range};
+use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Labels appear in the same order as the numeric page shortcuts.
@@ -21,8 +22,10 @@ const LIST_TABS: [&str; 3] = [
     "plugin_manager.marketplace",
     "plugin_manager.local_zip",
 ];
-/// Normal list width at the default font size, in character cells.
+/// Maximum outer width shared by the plugin browser and its detail dialogs, in cells.
 const MAX_WIDTH: usize = 112;
+/// Maximum outer height shared by the plugin browser and its detail dialogs, in rows.
+const MAX_HEIGHT: usize = 32;
 /// Room for two description rows and the top and bottom edges of their outline.
 const DESCRIPTION_HEIGHT: usize = 4;
 /// List commands in display order, with the filter and exit keys first for narrow windows.
@@ -57,21 +60,23 @@ pub(in crate::grid) struct ListLayout {
     show_columns: bool,
 }
 
-impl ListLayout {
-    /// Fit the window between workspace chrome in the available `cols` by `rows`.
+impl ManagerWindow {
+    /// Center every plugin dialog in the visible `cols` by `rows`, fitting its capped size.
     pub(in crate::grid) fn area(cols: usize, rows: usize) -> Rect {
         let horizontal_inset = if cols < 48 { 2 } else { 4 };
         let w = cols.saturating_sub(horizontal_inset).min(MAX_WIDTH);
         let reserved_rows = if rows >= 16 { 3 } else { 1 };
-        let h = rows.saturating_sub(reserved_rows);
-        Rect {
-            x: (cols - w) / 2,
-            y: 1,
-            w,
-            h,
-        }
+        let h = rows.saturating_sub(reserved_rows).min(MAX_HEIGHT);
+        GridDialog::new(Rect {
+            w: cols,
+            h: rows,
+            ..Rect::default()
+        })
+        .centered(w, h)
     }
+}
 
+impl ListLayout {
     /// Partition the outer `area`, giving `has_feedback` a row inside the list when it fits.
     pub(in crate::grid) fn new(area: Rect, has_feedback: bool) -> Self {
         let section = |y, h| Rect {
@@ -149,40 +154,28 @@ impl ListLayout {
         )
     }
 
-    /// Return the visible tab slots, measured with the same `spacing` as their labels.
+    /// Measure visible source titles and their adjacent click targets using `spacing`.
     pub(in crate::grid) fn tabs(
         &self,
         manager: &ManagerWindow,
         spacing: &TextSpacing,
-    ) -> [Range<usize>; 3] {
+    ) -> TitleTabs<3> {
         let local = self.list.border_title_columns(None);
+        let compact = local.len() < 32;
         let columns = self.list.x + local.start..self.list.x + local.end;
-        let mut left = columns.start;
-        let separator = spacing.columns(self.tab_separator());
-        self.tab_labels(manager, spacing).map(|text| {
-            if text.is_empty() {
-                return left..left;
-            }
-            let right = (left + spacing.columns(text)).min(columns.end);
-            let slot = left..right;
-            left = (right + separator).min(columns.end);
-            slot
-        })
-    }
-
-    /// Tighten the separators at high zoom so all three numeric shortcuts stay visible.
-    fn tab_separator(&self) -> &'static str {
-        if self.list.border_title_columns(None).len() < 32 {
-            "|"
-        } else {
-            " | "
-        }
+        let labels = self.tab_labels(manager, spacing, columns.len(), compact);
+        TitleTabs::new(columns, labels, compact, spacing)
     }
 
     /// Use short tab captions when the localized full set would not fit the title rule.
-    fn tab_labels(&self, manager: &ManagerWindow, spacing: &TextSpacing) -> [&'static str; 3] {
-        let width = self.list.border_title_columns(None).len();
-        let separator = spacing.columns(self.tab_separator());
+    fn tab_labels(
+        &self,
+        manager: &ManagerWindow,
+        spacing: &TextSpacing,
+        width: usize,
+        compact: bool,
+    ) -> [&'static str; 3] {
+        let separator = if compact { 1 } else { 3 };
         let installed = i18n::text(LIST_TABS[0]);
         let visible = |labels: [&'static str; 3]| {
             std::array::from_fn(|index| {
@@ -241,67 +234,26 @@ impl ManagerView<'_> {
             })
     }
 
-    /// Fit the committed prompt and IME preedit together. The returned column is in spacing units.
-    pub(in crate::grid) fn plugin_list_prompt(&self, columns: usize) -> (Cow<'_, str>, usize) {
+    /// Use the same clipped preedit and selection for the footer frame and its native caret.
+    pub(in crate::grid) fn plugin_list_prompt(&self, columns: usize) -> FieldLayout<'_> {
         let input = self.manager.prompt.as_ref().expect("active list prompt");
-        let composition = &self.composition;
-        let (text, caret) = if composition.is_empty() {
-            (Cow::Borrowed(input.value.as_str()), input.value.len())
-        } else {
-            let marked_prefix = composition
-                .text_for_range(0..composition.selection.end, &mut None)
-                .map_or(0, |prefix| prefix.len());
-            let text = format!("{}{}", input.value, composition.text);
-            let caret = field::grapheme_at_or_after(&text, input.value.len() + marked_prefix);
-            (Cow::Owned(text), caret)
-        };
-        let available = columns.saturating_sub(1) * UNITS_PER_COLUMN;
-        let (start, units) = field::visible_left(&text, caret, 0, available, self.spacing);
-        let suffix = match text {
-            Cow::Borrowed(text) => Cow::Borrowed(&text[start..]),
-            Cow::Owned(mut text) => {
-                text.replace_range(..start, "");
-                Cow::Owned(text)
-            }
-        };
-        (suffix, units)
+        input
+            .field
+            .layout(&input.value, &self.composition, columns, self.spacing)
     }
 
     /// Draw the package list, selected description and footer on `frame` using `layout`.
-    pub(in crate::grid) fn draw_plugin_list(&self, frame: &mut Frame, layout: &ListLayout) {
+    pub(in crate::grid) fn draw_plugin_list(
+        &self,
+        frame: &mut Frame,
+        layout: &ListLayout,
+    ) -> Frame {
         let manager = &self.manager;
         let spacing = self.spacing;
         let tabs = layout.tabs(manager, spacing);
-        let labels = layout.tab_labels(manager, spacing);
-        frame.section_border(layout.list, MUTED, |frame, _| {
-            let mut end = None;
-            for (index, (label, slot)) in labels.into_iter().zip(tabs.iter()).enumerate() {
-                if slot.is_empty() {
-                    continue;
-                }
-                if let Some(previous) = end {
-                    frame.label(
-                        layout.list.y,
-                        previous..slot.start,
-                        layout.tab_separator(),
-                        MUTED,
-                        spacing,
-                    );
-                }
-                frame.label(
-                    layout.list.y,
-                    slot.clone(),
-                    label,
-                    if index == manager.page as usize {
-                        ACCENT
-                    } else {
-                        MUTED
-                    },
-                    spacing,
-                );
-                end = Some(slot.end);
-            }
-            end.unwrap_or(layout.list.x)
+        frame.section_border(layout.list, ACCENT, |frame, columns| {
+            self.draw_tabs(frame, layout.list.y, tabs, manager.page as usize)
+                .unwrap_or(columns.start)
         });
 
         let header = layout.list.y + 1;
@@ -330,40 +282,42 @@ impl ManagerView<'_> {
 
         let rows = self.rows();
         let selected = manager.selection.min(rows.len().saturating_sub(1));
-        let first = self.plugin_visible_rows(layout.entries.h, rows.len()).start;
-        for (offset, row) in rows.iter().skip(first).take(layout.entries.h).enumerate() {
-            let y = layout.entries.y + offset;
+        let visible = self.plugin_list(layout.entries.h, rows.len()).range();
+        let first = visible.start;
+        let mut body = Frame::viewport(layout.entries.w, layout.entries.h + 1, first);
+        body.hide_theme_background();
+        let local = |columns: &Range<usize>| {
+            columns.start.saturating_sub(layout.entries.x)
+                ..columns.end.saturating_sub(layout.entries.x)
+        };
+        for (offset, row) in rows[visible].iter().enumerate() {
+            let y = offset;
             let color = if first + offset == selected {
-                frame.tint(
-                    y,
-                    layout.entries.x,
-                    layout.entries.x + layout.entries.w,
-                    SELECTION,
-                );
+                body.tint(y, 0, layout.entries.w, SELECTION);
                 ACCENT
             } else {
                 TEXT
             };
             let name_end = if let Some(package) = &row.package {
                 let version = spacing.ellipsize(&package.version, layout.version.len());
-                frame.label(y, layout.version.clone(), &version, color, spacing);
+                body.label(y, local(&layout.version), &version, color, spacing);
                 let status = format!(
                     "{}{}",
                     package.status,
                     if package.update_available { " ↑" } else { "" }
                 );
-                frame.label(y, layout.status.clone(), &status, color, spacing);
+                body.label(y, local(&layout.status), &status, color, spacing);
                 layout.name.end
             } else {
                 right
             };
             let name = spacing.ellipsize(&row.label, name_end.saturating_sub(left));
-            frame.label(y, left..name_end, &name, color, spacing);
+            body.label(y, local(&(left..name_end)), &name, color, spacing);
         }
         if rows.is_empty() && layout.entries.h > 0 {
-            frame.label(
-                layout.entries.y,
-                left..right,
+            body.label(
+                0,
+                local(&(left..right)),
                 i18n::text("plugin_manager.empty"),
                 MUTED,
                 spacing,
@@ -398,6 +352,7 @@ impl ManagerView<'_> {
         }
 
         self.draw_plugin_footer(frame, layout);
+        body
     }
 
     /// Draw the active input or complete shortcut hints in `layout`'s footer on `frame`.
@@ -409,7 +364,7 @@ impl ManagerView<'_> {
         let spacing = self.spacing;
         if let Some(input) = &self.manager.prompt {
             let slots = layout.prompt(&input.kind, spacing);
-            let (text, _) = self.plugin_list_prompt(slots.input.len());
+            let text = self.plugin_list_prompt(slots.input.len());
             let placeholder = match input.kind {
                 Prompt::Development => "plugin_manager.build_output_path",
                 _ => {
@@ -417,67 +372,47 @@ impl ManagerView<'_> {
                     "plugin_manager.filter"
                 }
             };
-            let (text, color) = if input.value.is_empty() && self.composition.is_empty() {
-                (i18n::text(placeholder), MUTED)
+            if input.value.is_empty() && self.composition.is_empty() {
+                frame.label(
+                    footer.y,
+                    slots.input.clone(),
+                    i18n::text(placeholder),
+                    MUTED,
+                    spacing,
+                );
             } else {
-                (text.as_ref(), TEXT)
-            };
-            frame.label(footer.y, slots.input.clone(), text, color, spacing);
+                frame.text_field(footer.y, slots.input.clone(), &text, spacing);
+            }
             slots.draw_buttons(frame, footer.y, spacing);
             return;
         }
 
-        let mut text = String::new();
-        let mut remaining = footer.w;
         let visible_bindings = Page::ALL
             .into_iter()
             .zip(["1", "2", "3"])
             .filter_map(|(page, key)| self.manager.list_tab_open(page).then_some(key))
             .collect::<Vec<_>>()
             .join("/");
-        for &(action, key) in SHORTCUTS {
-            let key = if action == "plugin_manager.hint_tabs" {
-                &visible_bindings
-            } else {
-                key
-            };
-            let hint = shortcut_hint(i18n::text(action), key);
-            let separator = if text.is_empty() {
-                ""
-            } else {
-                SHORTCUT_SEPARATOR
-            };
-            let columns = spacing.columns(separator) + spacing.columns(&hint);
-            if columns > remaining {
-                break;
-            }
-            text.push_str(separator);
-            text.push_str(&hint);
-            remaining -= columns;
-        }
-        frame.styled_label(
-            footer.y,
-            footer.x..footer.x + footer.w,
-            &text,
-            TEXT,
+        let hints = GridKeyHints::fit(
+            footer.w,
+            SHORTCUTS.iter().map(|&(action, key)| {
+                let key = if action == "plugin_manager.hint_tabs" {
+                    visible_bindings.as_str()
+                } else {
+                    key
+                };
+                (i18n::text(action), key)
+            }),
             spacing,
-            LabelStyle::Dimmed,
         );
+        frame.key_hints(footer.y, footer.x, &hints, (TEXT, TEXT), spacing);
     }
 }
 
 /// First item row in a secondary dialog, below its scope, tabs, and feedback.
 pub(in crate::grid) const LIST_START: usize = 4;
-/// Minimum grid height for the secondary dialogs' content and footer.
-pub(in crate::grid) const MIN_HEIGHT: usize = 13;
 /// Columns reserved for Enter and Esc in secondary dialogs.
 pub(in crate::grid) const SEARCH_BUTTONS: usize = 23;
-
-pub(in crate::grid) fn list_offset(offset: usize, selected: usize, capacity: usize) -> usize {
-    offset
-        .min(selected)
-        .max((selected + 1).saturating_sub(capacity))
-}
 
 /// Place secondary dialog entries below the tabs and above the two-line description.
 pub(in crate::grid) fn secondary_list_entries(area: Rect) -> Rect {
@@ -500,16 +435,20 @@ pub(in crate::grid) fn secondary_description(area: Rect) -> Rect {
 }
 
 /// Locate the Enter and Esc buttons from the prompt's reserved left edge.
-pub(in crate::grid) fn prompt_button_columns(left: usize) -> [Range<usize>; 2] {
-    [left..left + 9, left + 11..left + 18]
+pub(in crate::grid) fn prompt_buttons(
+    left: usize,
+    spacing: &TextSpacing,
+) -> Vec<ConfirmButton<bool>> {
+    GridConfirm::enter_escape().slots(left..left + 18, ButtonAlign::Start, 2, spacing)
 }
 
-/// Resolve a click at `column` to its visible button. `true` means cancel.
-pub(in crate::grid) fn prompt_button_at(left: usize, column: usize) -> Option<bool> {
-    prompt_button_columns(left)
-        .iter()
-        .position(|slot| slot.contains(&column))
-        .map(|button| button == 1)
+/// Resolve local `column` in the row measured from `left` with `spacing`. True cancels.
+pub(in crate::grid) fn prompt_button_at(
+    left: usize,
+    column: usize,
+    spacing: &TextSpacing,
+) -> Option<bool> {
+    GridConfirm::hit(&prompt_buttons(left, spacing), column).map(|accept| !accept)
 }
 
 pub(in crate::grid) fn tail(text: &str, columns: usize) -> String {

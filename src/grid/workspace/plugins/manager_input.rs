@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::grid::windows::plugin_manager::ListTabClose;
+use crate::ui::components::grid_confirm::GridConfirm;
 use gpui::{Pixels, Point};
 
 impl Workspace {
@@ -16,7 +17,7 @@ impl Workspace {
         if !self.plugins.open {
             self.plugins.manager.reset_list_tabs();
         }
-        self.popup_backdrop.invalidate();
+        self.dialog_backdrop.invalidate();
         self.plugins.open = true;
         self.clear_canvas_focus();
         self.end_plugin_field_drag();
@@ -51,16 +52,11 @@ impl Workspace {
         let view = self.plugin_manager_view();
         let page = if view.uses_plugin_list_layout() {
             let (x, row) = self.metrics.cell(position);
-            let layout = view.plugin_list_layout(area);
-            if area.contains(x, row) && row - area.y == layout.list.y {
-                layout
-                    .tabs(&self.plugins.manager, &self.spacing)
-                    .iter()
-                    .position(|columns| columns.contains(&(x - area.x)))
-                    .map(|index| Page::ALL[index])
-            } else {
-                outer_title.then_some(self.plugins.manager.page)
-            }
+            area.contains(x, row)
+                .then(|| view.tab_at(area, (x - area.x, row - area.y)))
+                .flatten()
+                .map(|index| Page::ALL[index])
+                .or_else(|| outer_title.then_some(self.plugins.manager.page))
         } else {
             None
         };
@@ -132,7 +128,7 @@ impl Workspace {
             &["zip"],
             |workspace, path, window, cx| {
                 workspace.plugins.open = true;
-                workspace.popup_backdrop.invalidate();
+                workspace.dialog_backdrop.invalidate();
                 if let Some(path) = path {
                     workspace.plugins.send(Action::InspectChosenZip(path));
                 }
@@ -176,8 +172,10 @@ impl Workspace {
                 }),
             );
         }
+        self.advance_plugin_list();
         self.sync_text_input(window, cx);
         self.update_cursor(window, cx);
+        self.schedule_scroll(window, cx);
         cx.notify();
     }
 
@@ -269,6 +267,15 @@ impl Workspace {
                 if changed {
                     self.plugins.request_draft();
                 }
+            } else if self.plugins.open
+                && self.plugins.composition.is_empty()
+                && let Some(input) = &mut self.plugins.manager.prompt
+                && matches!(input.kind, Prompt::Search { .. } | Prompt::Development)
+                && let Some(changed) = input.field.edit(&mut input.value, key)
+            {
+                if changed {
+                    self.plugins.manager.live_search();
+                }
             } else if raw == "backspace" && self.plugins.composition.is_empty() && self.plugins.open
             {
                 if let Some(input) = &mut self.plugins.manager.prompt {
@@ -326,23 +333,21 @@ impl Workspace {
             if matches!(raw, "escape" | "q") || printable == "?" {
                 self.plugins.manager.help = false;
             }
-        } else if let Some(review) = &self.plugins.view.review {
-            let token = review.token;
-            match raw {
-                "enter" if !event.is_held => self.advance_install_review(token, true, true),
-                "right" if !event.is_held => self.advance_install_review(token, true, false),
-                "left" if !event.is_held => self.advance_install_review(token, false, false),
-                "escape" | "q" => {
-                    self.plugins.send(Action::CancelInstall);
+        } else if self.plugins.view.review.is_some()
+            || self.plugins.manager.confirm_remove.is_some()
+        {
+            let choice = GridConfirm::enter_escape()
+                .key(raw)
+                .or_else(|| (raw == "q").then_some(false));
+            if let Some(accept) = choice {
+                if !accept || !event.is_held {
+                    self.choose_plugin_confirmation(accept);
                 }
-                _ => {}
-            }
-        } else if let Some(namespace) = &self.plugins.manager.confirm_remove {
-            if raw == "enter" && !event.is_held {
-                self.plugins.send(Action::Uninstall(namespace.clone()));
-                self.plugins.manager.confirm_remove = None;
-            } else if matches!(raw, "escape" | "q") {
-                self.plugins.manager.confirm_remove = None;
+            } else if let Some(review) = &self.plugins.view.review
+                && !event.is_held
+                && matches!(raw, "left" | "right")
+            {
+                self.advance_install_review(review.token, raw == "right", false);
             }
         } else {
             let count = self
@@ -357,17 +362,18 @@ impl Workspace {
                 {
                     self.plugins.manager.open_search()
                 }
-                ("up", _) | (_, "k") => {
+                ("up", _) | (_, "k") | ("down", _) | (_, "j") => {
+                    let delta = if completion_key == "up" || printable == "k" {
+                        -1
+                    } else {
+                        1
+                    };
                     self.plugins.manager.selection =
-                        self.plugins.manager.selection.saturating_sub(1)
-                }
-                ("down", _) | (_, "j") => {
-                    self.plugins.manager.selection = self
-                        .plugins
-                        .manager
-                        .selection
-                        .saturating_add(1)
-                        .min(count.saturating_sub(1))
+                        crate::ui::components::grid_list::GridList::moved(
+                            self.plugins.manager.selection,
+                            delta,
+                            count,
+                        );
                 }
                 ("home", _) => self.plugins.manager.selection = 0,
                 ("end", _) => self.plugins.manager.selection = count.saturating_sub(1),
@@ -399,13 +405,23 @@ impl Workspace {
                 text.chars()
                     .filter(|&ch| !ch.is_control() || multiline && matches!(ch, '\t' | '\n'))
             };
-            let (value, limit) = match &mut input.kind {
-                Prompt::Credential { value, .. } => (&mut **value, 2048),
-                _ => (&mut input.value, 64 * 1024),
+            let accepted = match &mut input.kind {
+                Prompt::Search { .. } | Prompt::Development => input
+                    .field
+                    .insert(&mut input.value, &clean().collect::<String>()),
+                kind => {
+                    let (value, limit) = match kind {
+                        Prompt::Credential { value, .. } => (&mut **value, 2048),
+                        _ => (&mut input.value, 64 * 1024),
+                    };
+                    let fits = value.len() + clean().map(char::len_utf8).sum::<usize>() <= limit;
+                    if fits {
+                        value.extend(clean());
+                    }
+                    fits
+                }
             };
-            if value.len() + clean().map(char::len_utf8).sum::<usize>() <= limit {
-                value.extend(clean());
-            } else {
+            if !accepted {
                 self.plugins.manager.feedback =
                     Some("Input is too long. The text was kept unchanged.".into());
             }
@@ -450,9 +466,7 @@ impl Workspace {
             }
             let area = self.plugin_manager_area();
             if area.contains(x, y) && event.button == gpui::MouseButton::Left {
-                let x = x - area.x;
-                let row = y - area.y;
-                self.plugin_manager_click(area, (x, row), event.click_count > 1, window, cx);
+                self.plugin_manager_click(area, event, window, cx);
             }
             self.plugin_refresh(window, cx);
             return true;
@@ -502,79 +516,94 @@ impl Workspace {
         false
     }
 
+    /// Apply the same visible install or removal choice for keyboard and pointer activation.
+    fn choose_plugin_confirmation(&mut self, accept: bool) {
+        if let Some(review) = &self.plugins.view.review {
+            if accept {
+                self.advance_install_review(review.token, true, true);
+            } else {
+                self.plugins.send(Action::CancelInstall);
+            }
+        } else if let Some(namespace) = self.plugins.manager.confirm_remove.take()
+            && accept
+        {
+            self.plugins.send(Action::Uninstall(namespace));
+        }
+    }
+
     /// Dispatch a panel-relative click. A prompt or confirmation owns the mouse until it closes.
     pub(in crate::grid::workspace) fn plugin_manager_click(
         &mut self,
         area: Rect,
-        (x, row): (usize, usize),
-        activate: bool,
+        event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let p = event.position - area.pixels(self.metrics).origin;
+        let visual_y = f32::from(p.y) / self.metrics.lh;
+        let visual_x = f32::from(p.x) / self.metrics.cw;
+        let (x, row) = (visual_x.floor() as usize, visual_y.floor() as usize);
         if self.plugins.manager.help {
             return;
         }
-        let review = self.plugins.view.review.as_ref().map(|review| review.token);
-        let removal = self.plugins.manager.confirm_remove.as_ref();
-        if review.is_some() || removal.is_some() {
-            if row == area.h - 2
-                && let Some(cancel) = prompt_button_at(area.w.saturating_sub(SEARCH_BUTTONS + 2), x)
+        if self.plugins.view.review.is_some() || self.plugins.manager.confirm_remove.is_some() {
+            if row == area.h.saturating_sub(2)
+                && let Some(cancel) =
+                    prompt_button_at(area.w.saturating_sub(SEARCH_BUTTONS + 2), x, &self.spacing)
             {
-                if let Some(token) = review {
-                    if cancel {
-                        self.plugins.send(Action::CancelInstall);
-                    } else {
-                        self.advance_install_review(token, true, true);
-                    }
-                } else if let Some(namespace) = self.plugins.manager.confirm_remove.take()
-                    && !cancel
-                {
-                    self.plugins.send(Action::Uninstall(namespace));
-                }
+                self.choose_plugin_confirmation(!cancel);
             }
             return;
         }
 
-        let layout = self
-            .plugin_manager_view()
+        let view = self.plugin_manager_view();
+        let layout = view
             .uses_plugin_list_layout()
-            .then(|| self.plugin_manager_view().plugin_list_layout(area));
+            .then(|| view.plugin_list_layout(area));
         if let Some(input) = &self.plugins.manager.prompt {
             let cancel = match &layout {
                 Some(layout) if layout.footer.contains(x, row) => {
                     layout.prompt(&input.kind, &self.spacing).cancel_at(x)
                 }
-                None if row == 1 => prompt_button_at(area.w.saturating_sub(SEARCH_BUTTONS + 2), x),
+                None if row == 1 => {
+                    prompt_button_at(area.w.saturating_sub(SEARCH_BUTTONS + 2), x, &self.spacing)
+                }
                 _ => None,
             };
             if let Some(cancel) = cancel {
                 self.finish_plugin_prompt(cancel, window, cx);
+            } else if let Some(layout) = layout
+                && layout.footer.contains(x, row)
+                && self.plugins.composition.is_empty()
+            {
+                let slot = layout.prompt(&input.kind, &self.spacing).input;
+                if slot.contains(&x) {
+                    let byte = input
+                        .field
+                        .layout(
+                            &input.value,
+                            &self.plugins.composition,
+                            slot.len(),
+                            &self.spacing,
+                        )
+                        .byte_at(visual_x - slot.start as f32, &self.spacing);
+                    let input = self.plugins.manager.prompt.as_mut().unwrap();
+                    input.field.place(&input.value, byte, event.modifiers.shift);
+                    self.plugin_refresh(window, cx);
+                }
             }
             return;
         }
-        let entries = if let Some(layout) = layout {
-            if row == layout.list.y {
-                if let Some(tab) = layout
-                    .tabs(&self.plugins.manager, &self.spacing)
-                    .iter()
-                    .position(|slot| slot.contains(&x))
-                {
-                    self.plugin_tab(tab as u8);
-                }
-                return;
-            }
-            layout.entries
-        } else {
-            secondary_list_entries(area)
-        };
+        if let Some(tab) = view.tab_at(area, (x, row)) {
+            self.plugin_tab(tab as u8);
+            return;
+        }
+        let entries = layout.map_or_else(|| secondary_list_entries(area), |layout| layout.entries);
         if entries.contains(x, row) {
-            let visible = self
-                .plugin_manager_view()
-                .plugin_visible_rows(entries.h, self.plugin_manager_view().plugin_row_count(area));
-            let index = visible.start + row - entries.y;
-            if visible.contains(&index) {
+            let list = view.plugin_list(entries.h, view.plugin_row_count(area));
+            if let Some(index) = list.hit(visual_y - entries.y as f32) {
                 self.plugins.manager.selection = index;
-                if activate {
+                if event.click_count > 1 {
                     self.plugin_activate(window, cx);
                 }
             }
@@ -673,10 +702,7 @@ impl Workspace {
             }
             Target::Zip => self.choose_plugin_zip(window, cx),
             Target::Development => {
-                self.plugins.manager.prompt = Some(Input {
-                    kind: Prompt::Development,
-                    value: String::new(),
-                });
+                self.plugins.manager.prompt = Some(Input::new(Prompt::Development, String::new()));
             }
             Target::Action(action) => {
                 if let Action::ResolveConfig(scope, revision, _) = action {
@@ -776,10 +802,7 @@ impl Workspace {
             Target::Prompt(input) => self.plugins.manager.prompt = Some(input),
             Target::RetryDraftClose => self.advance_plugin_close(window, cx),
             Target::ExportDraft => {
-                self.plugins.manager.prompt = Some(Input {
-                    kind: Prompt::ExportDraft,
-                    value: String::new(),
-                })
+                self.plugins.manager.prompt = Some(Input::new(Prompt::ExportDraft, String::new()))
             }
             Target::DiscardDraftClose => {
                 let scope = self

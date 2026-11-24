@@ -60,6 +60,8 @@ Copy-Item plugins/sdk/examples/nanobug-plugin.toml,plugins/sdk/examples/detect.j
 - 模块可以声明 `provides = ["document", "complete", "diagnose"]`，并用 `document_extensions = ["rs"]` 限定语言入口。JS 的 `host.documentPath()` 依赖文件名，正文修改时可以复用规则结果。
 - `document` 提供者收到 `Open` 和 `DocumentChanged`，返回 `Output.document_features`。高亮使用主题角色，折叠返回 UTF-8 范围，大纲返回名称和跳转字节。宿主按文档打开代次、修订和运行代次检查结果。声明该能力需要 `read_document`。
 - `Output.completion_items` 可以提供标签和单个替换范围，范围需包含请求的光标位置。原有 `Output.completions` 仍按字符串插入。
+- 声明 `diagnose` 的模块在打开文件或停止输入片刻后，会收到后台 `PluginEvent::Diagnose`。通过 `Output.diagnostics` 返回当前快照的全部诊断，空数组会清除该模块的标记。同一模块的语言服务器为当前版本发布诊断后，编辑器使用服务器的结果。
+- 每条诊断的 `start` 和 `end` 是左闭右开的 UTF-8 字节偏移，两者相等表示插入位置。`severity` 支持 `"warning"`（橙黄色波浪线）、`"error"`（红色波浪线）、`"information"` 和 `"hint"`。旧插件省略该字段时按错误处理。
 - `definition` 由项目授权的原生语言服务处理。宿主用 `Output.definitions` 传递目标文件及从零开始的行号和 UTF-16 列号。
 - `hover` 由项目授权的原生语言服务处理。`PluginEvent::Hover.offset` 指定当前文档中的 UTF-8 字节位置，宿主将语言服务器返回的签名、类型和文档转为有长度上限的 Markdown，放入 `Output.hover`。服务端标为纯文本的内容按字面显示。
 - Rust 模块可以声明 `rust_analyzer = true` 和 `document_extensions = ["rs"]`，将已声明的补全、诊断、定义跳转和符号详情交给宿主管理的 rust-analyzer。项目授权执行后，宿主同步已打开的 Rust 缓冲区，并仅显示与当前文档修订匹配的实时诊断。普通 WASM 事件仍可提供语法和基础补全。

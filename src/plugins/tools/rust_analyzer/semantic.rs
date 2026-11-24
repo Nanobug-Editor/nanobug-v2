@@ -28,11 +28,29 @@ pub(super) const TYPES: &[&str] = &[
     "label",
 ];
 pub(super) const MODIFIERS: &[&str] = &["readonly", "static", "deprecated", "defaultLibrary"];
+/// Rust tokens inside documentation, attributes or macro expansions may use another scope.
+pub(super) const RUST_CONTEXT: &[&str] = &[
+    "documentation",
+    "injected",
+    "attribute",
+    "macro",
+    "procMacro",
+];
+const NON_CODE_CONTEXT: u8 = 16;
+const HIGHLIGHT_TOKEN_LIMIT: usize = 8192;
+
+/// Color spans and unresolved module members produced by the same semantic reply.
+#[derive(Default)]
+struct Decoded {
+    spans: Vec<Highlight>,
+    members: Vec<Value>,
+}
 
 /// Pretranslated server legend and bounded full-document requests.
 #[derive(Default)]
 pub(super) struct Tokens {
     kinds: Vec<Option<SyntaxKind>>,
+    unresolved: Option<usize>,
     modifiers: Vec<u8>,
     requests: BTreeMap<String, DiagnosticRequest>,
     serial: u64,
@@ -47,6 +65,7 @@ impl Tokens {
         let Some(types) = provider["legend"]["tokenTypes"].as_array() else {
             return;
         };
+        self.unresolved = types.iter().position(|tag| tag == "unresolvedReference");
         self.kinds = types
             .iter()
             .map(|v| {
@@ -91,12 +110,14 @@ impl Tokens {
                 Some("static") => 2,
                 Some("deprecated") => 4,
                 Some("defaultLibrary") => 8,
+                Some(tag) if RUST_CONTEXT.contains(&tag) => NON_CODE_CONTEXT,
                 _ => 0,
             })
             .collect();
     }
 
-    fn decode(&self, text: &str, data: &[Value]) -> Option<Vec<Highlight>> {
+    /// Decode byte ranges for painting and retain UTF-16 positions for Rust diagnostic reports.
+    fn decode(&self, text: &str, data: &[Value], rust_ready: bool) -> Option<Decoded> {
         if !data.len().is_multiple_of(5) {
             return None;
         }
@@ -104,10 +125,17 @@ impl Tokens {
         let mut base = 0usize;
         let mut line = lines.next().unwrap_or("");
         let (mut column, mut cursor_column, mut cursor) = (0usize, 0usize, 0usize);
-        let mut spans = Vec::new();
-        for token in data.chunks_exact(5).take(8192) {
+        let mut result = Decoded::default();
+        let mut line_number = 0usize;
+        let mut module_path = member_diagnostics::ModulePath::default();
+        for (ordinal, token) in data.chunks_exact(5).enumerate() {
+            // Keep painting bounded while checking module references throughout a large file.
+            if ordinal >= HIGHLIGHT_TOKEN_LIMIT && (!rust_ready || result.members.len() >= 200) {
+                break;
+            }
             let unsigned = |i: usize| usize::try_from(token[i].as_u64()?).ok();
             let delta = unsigned(0)?;
+            line_number = line_number.checked_add(delta)?;
             for _ in 0..delta {
                 base = base.checked_add(line.len())?;
                 line = lines.next()?;
@@ -135,9 +163,9 @@ impl Tokens {
             };
             let start = advance(column)?;
             let finish = advance(end)?;
-            let Some(mut kind) = self.kinds.get(unsigned(3)?).copied().flatten() else {
-                continue;
-            };
+            let index = unsigned(3)?;
+            let kind = self.kinds.get(index).copied().flatten();
+            let range = ByteRange { start, end: finish };
             let bits = unsigned(4)?;
             let flags = self
                 .modifiers
@@ -145,6 +173,23 @@ impl Tokens {
                 .enumerate()
                 .filter(|(bit, _)| bits & (1usize << bit) != 0)
                 .fold(0, |flags, (_, flag)| flags | flag);
+            if rust_ready
+                && result.members.len() < 200
+                && let Some(module) = module_path.qualifier(text, range, kind)
+                && Some(index) == self.unresolved
+                && flags & NON_CODE_CONTEXT == 0
+                && start < finish
+            {
+                let name = &text[start..finish];
+                result.members.push(json!({
+                    "range": {"start": {"line": line_number, "character": column}, "end": {"line": line_number, "character": end}},
+                    "severity": 1, "source": "nanobug", "code": "unresolved-module-member",
+                    "message": format!("Cannot find `{name:.200}` in module `{module:.200}`"),
+                }));
+            }
+            let Some(mut kind) = kind else {
+                continue;
+            };
             if flags & 8 != 0 {
                 kind = match kind {
                     SyntaxKind::Type => SyntaxKind::BuiltinType,
@@ -152,15 +197,15 @@ impl Tokens {
                     _ => kind,
                 };
             }
-            if start < finish {
-                spans.push(Highlight {
-                    range: ByteRange { start, end: finish },
+            if ordinal < HIGHLIGHT_TOKEN_LIMIT && start < finish {
+                result.spans.push(Highlight {
+                    range,
                     kind,
                     modifiers: SyntaxModifiers(flags & 7),
                 });
             }
         }
-        Some(spans)
+        Some(result)
     }
 }
 
@@ -191,6 +236,7 @@ impl Client {
         let due: Vec<_> = self
             .documents
             .iter_mut()
+            .filter(|(uri, _)| !self.semantic.requests.values().any(|r| &r.uri == *uri))
             .filter_map(|(uri, open)| {
                 if open.semantic_at? > now {
                     return None;
@@ -228,27 +274,32 @@ impl Client {
         };
         let Some(open) = self
             .documents
-            .get(&r.uri)
+            .get_mut(&r.uri)
             .filter(|o| o.version == r.version && r.deadline > Instant::now())
         else {
             return;
         };
-        let spans = match value {
-            Some(Value::Null) => Vec::new(),
+        let rust_ready =
+            open.rust_diagnostics.is_some() && self.rust_quiescent && open.semantic_at.is_none();
+        let decoded = match value {
+            Some(Value::Null) => Decoded::default(),
             Some(value) => {
-                let Some(spans) = value["data"]
+                let Some(decoded) = value["data"]
                     .as_array()
-                    .and_then(|data| self.semantic.decode(&open.snapshot.text, data))
+                    .and_then(|data| self.semantic.decode(&open.snapshot.text, data, rust_ready))
                 else {
                     return;
                 };
-                spans
+                decoded
             }
             None => return,
         };
+        if rust_ready && let Some(rust) = &mut open.rust_diagnostics {
+            rust.update_members(decoded.members, &open.snapshot, event);
+        }
         event(Event::Semantic {
             snapshot: open.snapshot.clone(),
-            spans,
+            spans: decoded.spans,
         });
     }
 }
@@ -302,16 +353,54 @@ mod tests {
         t.configure(&json!({"full":true,"legend":{"tokenTypes":["method","variable"],"tokenModifiers":["deprecated","static"]}}));
         let data = json!([0, 3, 4, 0, 3, 1, 0, 1, 1, 0]);
         let h = t
-            .decode("😀.save()\r\nx", data.as_array().unwrap())
-            .unwrap();
+            .decode("😀.save()\r\nx", data.as_array().unwrap(), false)
+            .unwrap()
+            .spans;
         assert_eq!(
             (h[0].range, h[0].kind, h[0].modifiers.0),
             (ByteRange { start: 5, end: 9 }, SyntaxKind::Method, 6)
         );
         assert_eq!((h[1].range.start, h[1].range.end), (13, 14));
         assert!(
-            t.decode("😀", json!([0, 1, 1, 0, 0]).as_array().unwrap())
+            t.decode("😀", json!([0, 1, 1, 0, 0]).as_array().unwrap(), false)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn module_diagnostics_extend_past_the_color_limit_and_skip_injected_text() {
+        let mut tokens = Tokens::default();
+        tokens.configure(&json!({"full":true,"legend":{
+            "tokenTypes":["variable","namespace","unresolvedReference"],
+            "tokenModifiers":["injected"]
+        }}));
+        let mut data = Vec::new();
+        for i in 0..HIGHLIGHT_TOKEN_LIMIT {
+            data.extend([0, if i == 0 { 0 } else { 2 }, 1, 0, 0].map(Value::from));
+        }
+        // Only the first unresolved reference belongs to the surrounding Rust source.
+        for token in [
+            [0, 2, 3, 1, 0],
+            [0, 5, 2, 2, 0],
+            [0, 4, 3, 1, 1],
+            [0, 5, 2, 2, 1],
+        ] {
+            data.extend(token.map(Value::from));
+        }
+        let text = "x ".repeat(HIGHLIGHT_TOKEN_LIMIT) + "app::rn; app::xx";
+        let decoded = tokens.decode(&text, &data, true).unwrap();
+        assert_eq!(decoded.spans.len(), HIGHLIGHT_TOKEN_LIMIT);
+        assert_eq!(decoded.members.len(), 1);
+        let item = &decoded.members[0];
+        let start = offset_at(&text, &item["range"]["start"]).unwrap();
+        let end = offset_at(&text, &item["range"]["end"]).unwrap();
+        assert_eq!(&text[start..end], "rn");
+        assert!(
+            tokens
+                .decode(&text, &data, false)
+                .unwrap()
+                .members
+                .is_empty()
         );
     }
 }

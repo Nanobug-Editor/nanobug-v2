@@ -6,6 +6,7 @@ use crate::grid::windows::plugin_surface::{SurfaceWindow, canvas};
 mod credential_tests;
 #[cfg(all(test, windows))]
 mod cursor_tests;
+mod diagnostics;
 mod edits;
 mod ex_languages;
 mod field;
@@ -38,11 +39,10 @@ mod surface_link;
 mod syntax_selection;
 mod workflow;
 
-use super::{Workspace, editor_close::CloseTarget, view::positioned};
+use super::{Workspace, editor_close::CloseTarget};
 use crate::grid::windows::plugin_manager::{
-    Detail, Input, ListLayout, MIN_HEIGHT, ManagerView, ManagerWindow, Page, Presentation, Prompt,
-    SEARCH_BUTTONS, comparison, prompt_button_at, rows, secondary_description,
-    secondary_list_entries,
+    Detail, Input, ManagerView, ManagerWindow, Page, Presentation, Prompt, SEARCH_BUTTONS,
+    comparison, prompt_button_at, rows, secondary_description, secondary_list_entries,
 };
 use crate::grid::windows::plugin_surface::SurfaceSnapshot;
 use crate::{
@@ -100,6 +100,8 @@ pub(super) struct PluginCoordinator {
     pub(super) settings_sources: BTreeMap<String, settings_data::Source>,
     view: Arc<View>,
     panel: Entity<Panel>,
+    /// Retained plugin entries scroll independently of tabs and footer actions.
+    pub(in crate::grid::workspace) list_panel: Entity<Panel>,
     manager: ManagerWindow,
     /// Directory project whose navigation currently occupies the native plugin windows.
     project_windows_scope: Option<u64>,
@@ -109,12 +111,15 @@ pub(super) struct PluginCoordinator {
     closing_project_windows: Option<PluginWindowsSnapshot>,
     snapshots: BTreeMap<u64, Arc<DocumentSnapshot>>,
     open_snapshots: BTreeMap<(u64, u64), Arc<DocumentSnapshot>>,
+    /// Snapshots for additional visible panes that only the built-in highlighter reads.
+    visible_syntax: Vec<Arc<DocumentSnapshot>>,
     active: Option<u64>,
     projects: Vec<Project>,
     /// SQL overrides in the last project snapshot sent to the supervisor.
     sql_dialects: BTreeMap<u64, String>,
     /// File type overrides in the last project snapshot sent to the supervisor.
     document_filetypes: nanobug::plugins::session::DocumentFiletypes,
+    document_saves: nanobug::plugins::session::DocumentSaves,
     pub(super) open: bool,
     pub(super) composition: Composition,
     credential_draft: Option<CredentialDraft>,
@@ -137,6 +142,8 @@ pub(super) struct PluginCoordinator {
     pending_definition: Option<language::LanguageResults>,
     /// Detail text and the native query tied to the current normal-mode caret.
     definition_hover: Option<hover::DefinitionHover>,
+    /// Global diagnostic decorations preference, independent of the published language data.
+    pub(in crate::grid::workspace) diagnostic_marks: bool,
     /// Insert-mode results retain editor input and render beside its caret.
     completion: Option<language::CompletionPopup>,
     /// The timer for the latest eligible edit, cancelled by new input or dismissal.
@@ -165,16 +172,19 @@ impl PluginCoordinator {
             settings_sources: BTreeMap::new(),
             view: Arc::new(View::default()),
             panel: cx.new(|_| Panel::new(metrics)),
+            list_panel: cx.new(|_| Panel::new(metrics)),
             manager: ManagerWindow::default(),
             project_windows_scope: None,
             pending_project_surface: None,
             closing_project_windows: None,
             snapshots: BTreeMap::new(),
             open_snapshots: BTreeMap::new(),
+            visible_syntax: Vec::new(),
             active: None,
             projects: Vec::new(),
             sql_dialects: BTreeMap::new(),
             document_filetypes: Default::default(),
+            document_saves: Default::default(),
             open: false,
             composition: Composition::default(),
             credential_draft: None,
@@ -195,6 +205,7 @@ impl PluginCoordinator {
             language: None,
             pending_definition: None,
             definition_hover: None,
+            diagnostic_marks: true,
             completion: None,
             completion_delay: None,
             outline: None,
@@ -265,7 +276,7 @@ impl PluginCoordinator {
         {
             if self.surface.draft != surface.draft {
                 self.surface.draft.clone_from(&surface.draft);
-                self.surface.field = field::Field::default();
+                self.surface.field = Default::default();
             }
             self.surface.pending_draft = None;
         }

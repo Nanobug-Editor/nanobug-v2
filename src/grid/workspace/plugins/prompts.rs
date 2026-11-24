@@ -41,13 +41,13 @@ impl Workspace {
                 {
                     self.plugins.manager.feedback =
                         Some("Enter an absolute Cargo project path".into());
-                    self.plugins.manager.prompt = Some(Input {
-                        kind: Prompt::DevSource {
+                    self.plugins.manager.prompt = Some(Input::new(
+                        Prompt::DevSource {
                             namespace,
                             settings,
                         },
-                        value: input.value,
-                    });
+                        input.value,
+                    ));
                     return;
                 }
                 if settings.source.is_none() {
@@ -91,16 +91,16 @@ impl Workspace {
                         Err(error) => {
                             self.plugins.manager.feedback =
                                 Some(format!("Invalid JSON value: {error}"));
-                            self.plugins.manager.prompt = Some(Input {
-                                kind: Prompt::Setting {
+                            self.plugins.manager.prompt = Some(Input::new(
+                                Prompt::Setting {
                                     scope,
                                     owner,
                                     id,
                                     renamed_from,
                                     original,
                                 },
-                                value: input.value,
-                            });
+                                input.value,
+                            ));
                             return;
                         }
                     }
@@ -178,10 +178,10 @@ impl Workspace {
                 };
                 if let Some(error) = error {
                     self.plugins.manager.feedback = Some(error);
-                    self.plugins.manager.prompt = Some(Input {
-                        kind: Prompt::Shortcut { namespace, command },
-                        value: input.value,
-                    });
+                    self.plugins.manager.prompt = Some(Input::new(
+                        Prompt::Shortcut { namespace, command },
+                        input.value,
+                    ));
                     return;
                 }
                 self.plugins.send(Action::EditConfig(
@@ -223,14 +223,14 @@ impl Workspace {
                 self.plugins.resume_project_windows_after_close();
                 self.plugins.open = true;
             }
-            self.plugins.manager.prompt = Some(Input {
-                kind: Prompt::Credential {
+            self.plugins.manager.prompt = Some(Input::new(
+                Prompt::Credential {
                     namespace: draft.namespace,
                     slot: draft.slot,
                     value: draft.value,
                 },
-                value: String::new(),
-            });
+                String::new(),
+            ));
         }
     }
 

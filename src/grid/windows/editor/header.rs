@@ -1,8 +1,9 @@
 //! Lay out the current page's buffer labels for painting and pointer hit testing.
 
 use super::EditorWindow;
+use crate::ui::components::grid_tab_bar::{GridTabBar, TabAlign, TabGrowth, TabKind, TabOptions};
 use crate::{
-    grid::render::{Frame, OutlineStyle, Rect, SHORTCUT_SEPARATOR},
+    grid::render::{Frame, Rect, SHORTCUT_SEPARATOR},
     ui::{
         file_icons::EntryIcon,
         text::TextSpacing,
@@ -14,6 +15,8 @@ use std::{ops::Range, path::Path};
 
 /// Grid columns for the file icon and its padding.
 const ICON_COLUMNS: usize = 2;
+/// Blank columns beside each file label that also accept clicks.
+const LABEL_HIT_PADDING: usize = 1;
 /// Suffix for an edited buffer.
 const MODIFIED: &str = " [+]";
 
@@ -55,8 +58,8 @@ struct Segment {
     columns: Range<usize>,
     /// Visible text, fitted to the assigned columns.
     label: String,
-    /// Side effect associated with pressing this segment.
-    target: Option<HeaderTarget>,
+    /// Pointer action and the local columns that accept it, including any blank padding.
+    hit: Option<(HeaderTarget, Range<usize>)>,
     /// File icon if its required space fits.
     icon: Option<EntryIcon>,
     /// Whether this is the selected buffer.
@@ -65,8 +68,8 @@ struct Segment {
 
 /// Editor header geometry for one grid rectangle.
 pub(in crate::grid) struct EditorHeader {
-    /// Screen-relative editor rectangle in grid cells.
-    area: Rect,
+    /// Screen-relative title row in grid cells.
+    title: Rect,
     /// File labels and their separators in left-to-right order.
     buffers: Vec<Segment>,
 }
@@ -80,9 +83,10 @@ impl EditorWindow {
         spacing: &TextSpacing,
         visible_cols: usize,
     ) -> EditorHeader {
+        let title = Self::grid_window(area).title();
         let visible = Rect {
-            w: area.w.min(visible_cols.saturating_sub(area.x)),
-            ..area
+            w: title.w.min(visible_cols.saturating_sub(title.x)),
+            ..title
         };
         let columns = visible.border_title_columns(None);
         let active = self.buffer().id;
@@ -98,6 +102,8 @@ impl EditorWindow {
                 .replace(['\r', '\n', '\t'], " ");
             if buffer.terminal.is_some() {
                 label = i18n::text("terminal.title").into();
+            } else if let Some((list, _)) = buffer.list_owner() {
+                label = list.title().into();
             } else if buffer.vim.is_help() && path.is_none() {
                 label = i18n::text("vim_g.help_title").into();
             }
@@ -111,28 +117,27 @@ impl EditorWindow {
             }
         });
         EditorHeader {
-            area,
+            title,
             buffers: fit_buffers(buffers, columns, spacing),
         }
     }
 }
 
 impl EditorHeader {
-    /// Return the label under the screen-relative grid cell (`x`, `y`), if one is actionable.
+    /// Return the action for the screen-relative title cell (`x`, `y`), including label padding.
     pub(in crate::grid) fn target_at(&self, x: usize, y: usize) -> Option<HeaderTarget> {
-        if y != self.area.y || !self.area.contains(x, y) {
+        if !self.title.contains(x, y) {
             return None;
         }
-        let column = x - self.area.x;
-        self.buffers
-            .iter()
-            .find(|item| item.columns.contains(&column))
-            .and_then(|item| item.target)
+        let column = x - self.title.x;
+        self.buffers.iter().find_map(|item| {
+            let (target, columns) = item.hit.as_ref()?;
+            columns.contains(&column).then_some(*target)
+        })
     }
 
-    /// Draw the fitted text, icons and their outline gaps into `frame` using `spacing`.
-    /// `selected` controls the editor outline independently of the highlighted labels.
-    pub(super) fn paint(&self, frame: &mut Frame, spacing: &TextSpacing, selected: bool) {
+    /// Draw the fitted labels into `frame` using `spacing`, returning the end column for the border gap.
+    pub(super) fn paint(&self, frame: &mut Frame, spacing: &TextSpacing) -> Option<usize> {
         for item in &self.buffers {
             let mut columns = item.columns.clone();
             if let Some(icon) = item.icon {
@@ -141,28 +146,14 @@ impl EditorHeader {
             }
             let color = if item.active {
                 ACCENT
-            } else if item.target.is_some() {
+            } else if item.hit.is_some() {
                 TEXT
             } else {
                 MUTED
             };
             frame.label(0, columns, &item.label, color, spacing);
         }
-        let gap = self
-            .buffers
-            .first()
-            .zip(self.buffers.last())
-            .map(|(first, last)| first.columns.start.saturating_sub(1)..last.columns.end + 1);
-        frame.outline(
-            Rect {
-                x: 0,
-                y: 0,
-                ..self.area
-            },
-            if selected { ACCENT } else { MUTED },
-            OutlineStyle::Solid,
-            gap,
-        );
+        self.buffers.last().map(|item| item.columns.end)
     }
 }
 
@@ -183,117 +174,66 @@ fn fit_buffers(
     let active = entries.iter().position(|item| item.active).unwrap_or(0);
     let widths: Vec<_> = entries.iter().map(|item| item.width(spacing)).collect();
     let separator = spacing.columns(SHORTCUT_SEPARATOR);
-    let total = entries.len();
-
-    let mut range = active..active + 1;
-    let mut width = widths[active];
-    // Grow from the active item and charge each candidate for the counters that will remain.
-    loop {
-        let left = range.start.checked_sub(1);
-        let right = (range.end < total).then_some(range.end);
-        let choices = [
-            left.map(|index| (index..range.end, widths[index])),
-            right.map(|index| (range.start..index + 1, widths[index])),
-        ];
-        let Some((next, added)) = choices
-            .into_iter()
-            .flatten()
-            .filter(|(next, added)| {
-                width + added + separator + overflow_width(next.start, total - next.end)
-                    <= columns.len()
-            })
-            .min_by_key(|(_, added)| *added)
-        else {
-            break;
-        };
-        range = next;
-        width += added + separator;
-    }
-
-    let hidden_left = range.start;
-    let hidden_right = total - range.end;
-    let left_width = overflow_side(hidden_left);
-    let right_width = overflow_side(hidden_right);
-    let active_min = 1 + usize::from(entries[active].icon.is_some()) * ICON_COLUMNS;
-    let available = columns.len().saturating_sub(active_min);
-    let show_left = left_width != 0 && left_width <= available;
-    let show_right =
-        right_width != 0 && right_width <= available - if show_left { left_width } else { 0 };
-    let mut segments = Vec::new();
-    let mut position = columns.start;
-    if show_left {
-        let id = entries[hidden_left - 1].id;
-        let label = format!("{hidden_left}← ");
-        position += left_width;
-        segments.push(overflow_segment(columns.start..position, id, label));
-    }
-    let end = columns.end - if show_right { right_width } else { 0 };
-    let first = range.start;
-    let last = range.end;
-    for index in range {
-        if index != first {
-            segments.push(Segment {
-                columns: position..position + separator,
-                label: SHORTCUT_SEPARATOR.into(),
-                target: None,
-                icon: None,
-                active: false,
-            });
-            position += separator;
-        }
-        let item = &entries[index];
-        let slot = widths[index].min(end - position);
-        let icon = item.icon.filter(|_| slot > ICON_COLUMNS);
-        let name_width = slot - usize::from(icon.is_some()) * ICON_COLUMNS;
-        let marker = item.modified && name_width > spacing.columns(MODIFIED);
-        let name_width = name_width - usize::from(marker) * spacing.columns(MODIFIED);
-        let mut label = spacing.ellipsize(&item.label, name_width).into_owned();
-        if marker {
-            label.push_str(MODIFIED);
-        }
-        segments.push(Segment {
-            columns: position..position + slot,
-            label,
-            target: Some(HeaderTarget::Buffer(item.id)),
-            icon,
-            active: item.active,
-        });
-        position += slot;
-    }
-    if show_right {
-        let label = format!(" →{hidden_right}");
-        segments.push(overflow_segment(
-            position..position + right_width,
-            entries[last].id,
-            label,
-        ));
-    }
-    segments
-}
-
-/// Count the cells for a label of hidden `count` entries, including the separating space.
-fn overflow_side(count: usize) -> usize {
-    if count == 0 {
-        0
-    } else {
-        count.ilog10() as usize + 3
-    }
-}
-
-/// Return the combined label width for the hidden counts on the `left` and `right`.
-fn overflow_width(left: usize, right: usize) -> usize {
-    overflow_side(left) + overflow_side(right)
-}
-
-/// Build an indicator from its `columns`, adjacent buffer `id`, and formatted `label`.
-fn overflow_segment(columns: Range<usize>, id: u64, label: String) -> Segment {
-    Segment {
+    let bar = GridTabBar::fit(
+        entries.len(),
+        |index| widths[index],
+        active,
         columns,
-        label,
-        target: Some(HeaderTarget::Overflow(id)),
-        icon: None,
-        active: false,
-    }
+        TabOptions {
+            gap: separator,
+            hit_padding: LABEL_HIT_PADDING,
+            minimum: 1 + usize::from(entries[active].icon.is_some()) * ICON_COLUMNS,
+            growth: TabGrowth::Narrowest,
+            align: TabAlign::Start,
+        },
+    );
+    bar.slots
+        .into_iter()
+        .map(|slot| {
+            let columns = slot.columns;
+            let (label, target, icon, active) = match slot.kind {
+                TabKind::Gap => (SHORTCUT_SEPARATOR.to_owned(), None, None, false),
+                TabKind::Before { count, target } => (
+                    format!("{count}← "),
+                    Some(HeaderTarget::Overflow(entries[target].id)),
+                    None,
+                    false,
+                ),
+                TabKind::After { count, target } => (
+                    format!(" →{count}"),
+                    Some(HeaderTarget::Overflow(entries[target].id)),
+                    None,
+                    false,
+                ),
+                TabKind::Tab(index) => {
+                    let item = &entries[index];
+                    let icon = item.icon.filter(|_| columns.len() > ICON_COLUMNS);
+                    let width = columns.len() - usize::from(icon.is_some()) * ICON_COLUMNS;
+                    let marker_width = spacing.columns(MODIFIED);
+                    let marker = item.modified && width > marker_width;
+                    let mut label = spacing
+                        .ellipsize(&item.label, width - usize::from(marker) * marker_width)
+                        .into_owned();
+                    if marker {
+                        label.push_str(MODIFIED);
+                    }
+                    (
+                        label,
+                        Some(HeaderTarget::Buffer(item.id)),
+                        icon,
+                        item.active,
+                    )
+                }
+            };
+            Segment {
+                columns,
+                label,
+                hit: target.map(|target| (target, slot.hit)),
+                icon,
+                active,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -329,12 +269,13 @@ mod tests {
             buffer(4, "next.rs", false),
         ];
         let header = EditorHeader {
-            area: Rect {
+            title: EditorWindow::grid_window(Rect {
                 x: 5,
                 y: 7,
                 w: 24,
                 h: 8,
-            },
+            })
+            .title(),
             buffers: fit_buffers(entries.into_iter(), 3..21, &spacing),
         };
         let labels: Vec<_> = header
@@ -344,9 +285,35 @@ mod tests {
             .collect();
         assert_eq!(labels, ["2← ", "active.rs", " →1"]);
         assert_eq!(header.target_at(8, 7), Some(HeaderTarget::Overflow(2)));
+        assert_eq!(header.target_at(10, 7), Some(HeaderTarget::Overflow(2)));
         assert_eq!(header.target_at(11, 7), Some(HeaderTarget::Buffer(3)));
+        assert_eq!(header.target_at(22, 7), Some(HeaderTarget::Overflow(4)));
         assert_eq!(header.target_at(24, 7), Some(HeaderTarget::Overflow(4)));
         assert_eq!(header.target_at(11, 8), None);
+    }
+
+    /// Each clickable label includes the adjacent blank cell up to the separator or border.
+    #[test]
+    fn header_hits_padding_but_leaves_the_separator_inert() {
+        let entries = [buffer(1, "a.rs", true), buffer(2, "b.rs", false)];
+        let header = EditorHeader {
+            title: Rect {
+                x: 5,
+                y: 7,
+                w: 30,
+                h: 1,
+            },
+            buffers: fit_buffers(entries.into_iter(), 3..27, &spacing()),
+        };
+        for x in [7, 8, 14] {
+            assert_eq!(header.target_at(x, 7), Some(HeaderTarget::Buffer(1)));
+        }
+        for x in [16, 17, 23] {
+            assert_eq!(header.target_at(x, 7), Some(HeaderTarget::Buffer(2)));
+        }
+        for x in [6, 15, 24] {
+            assert_eq!(header.target_at(x, 7), None);
+        }
     }
 
     /// Preserve an active dirty file's icon and marker when its full Unicode basename is too wide.
@@ -381,6 +348,13 @@ mod tests {
             header.target_at(36, 4),
             Some(HeaderTarget::Buffer(editor.buffer().id))
         );
-        assert_eq!(header.target_at(37, 4), None);
+        assert_eq!(
+            header.target_at(37, 4),
+            Some(HeaderTarget::Buffer(editor.buffer().id))
+        );
+        assert_eq!(header.target_at(38, 4), None);
+        let collapsed = editor.header(Rect { h: 1, ..area }, &spacing, 40);
+        assert!(collapsed.buffers.is_empty());
+        assert_eq!(collapsed.target_at(36, 4), None);
     }
 }

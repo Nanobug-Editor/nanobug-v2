@@ -1,28 +1,32 @@
 //! Filtered project history and the selected project's read-only directory preview.
 
+use crate::ui::components::grid_key_hints::GridKeyHints;
+use crate::ui::components::grid_list::GridList;
+use crate::ui::components::grid_text_field::{FieldLayout, GridTextField};
 use crate::{
     grid::{
-        render::{
-            Frame, LabelStyle, Metrics, OutlineStyle, Rect, SHORTCUT_SEPARATOR, shortcut_hint,
-        },
+        render::{Frame, Metrics, OutlineStyle, Rect},
         windows::manager::Entry,
     },
     ui::{
+        components::{grid_file_row::GridFileRow, grid_window::title_hit_columns},
         icons::Icon,
         ime::Composition,
-        text::{TextSpacing, UNITS_PER_COLUMN},
+        text::TextSpacing,
         theme::{ACCENT, GOLD, MUTED, SELECTION, TEXT},
     },
 };
 use gpui::{KeyDownEvent, Pixels, Point};
-use nanobug::i18n;
+use nanobug::{
+    animation::scroll::{GridScroll, ScrollInput},
+    i18n,
+};
 use std::{
     borrow::Cow,
     collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
 };
-use unicode_segmentation::UnicodeSegmentation;
 
 /// Vertical offsets of the filter, separator and first project row.
 const QUERY_ROW: usize = 1;
@@ -182,6 +186,7 @@ pub(in crate::grid) struct ProjectPicker {
     matches: Vec<usize>,
     /// Committed filter text.
     query: String,
+    field: GridTextField,
     /// Native preedit drawn after the committed filter text.
     pub(in crate::grid) composition: Composition,
     /// Whether printable keys edit the query and the cursor belongs to the filter.
@@ -191,9 +196,9 @@ pub(in crate::grid) struct ProjectPicker {
     /// Selection within the filtered list.
     selected: usize,
     /// First visible project when scrolling the filtered list.
-    first: usize,
+    list_scroll: GridScroll,
     /// First visible entry in the selected directory preview.
-    preview_first: usize,
+    preview_scroll: GridScroll,
 }
 
 impl ProjectPicker {
@@ -230,12 +235,13 @@ impl ProjectPicker {
             matches: (0..projects.len()).collect(),
             projects,
             query: String::new(),
+            field: GridTextField::with_limit(usize::MAX),
             composition: Composition::default(),
             filter_focused: true,
             count: 0,
             selected: 0,
-            first: 0,
-            preview_first: 0,
+            list_scroll: GridScroll::default(),
+            preview_scroll: GridScroll::default(),
         }
     }
 
@@ -244,6 +250,7 @@ impl ProjectPicker {
         let mut refreshed = Self::new(roots);
         refreshed.panes = self.panes;
         refreshed.query = std::mem::take(&mut self.query);
+        refreshed.field = std::mem::take(&mut self.field);
         refreshed.filter_focused = self.filter_focused;
         refreshed.refilter();
         let previous = self.selected_root();
@@ -252,9 +259,10 @@ impl ProjectPicker {
             .iter()
             .position(|&index| Some(refreshed.projects[index].root.as_path()) == previous)
             .unwrap_or(self.selected.min(refreshed.matches.len().saturating_sub(1)));
-        refreshed.first = self.first;
-        if refreshed.selected_root() == previous {
-            refreshed.preview_first = self.preview_first;
+        let same_project = refreshed.selected_root() == previous;
+        refreshed.list_scroll = std::mem::take(&mut self.list_scroll);
+        if same_project {
+            refreshed.preview_scroll = std::mem::take(&mut self.preview_scroll);
         }
         *self = refreshed;
     }
@@ -318,17 +326,13 @@ impl ProjectPicker {
     pub(super) fn caret(&self, layout: ProjectLayout, spacing: &TextSpacing) -> (f32, usize) {
         if self.filter_focused() {
             let width = layout.list_area().expect("focused project list").w;
-            let (query, _) = self.filter_row(width, spacing);
-            let units = spacing.cells(&query).last().map_or(0, |cell| cell.end);
-            (
-                QUERY_COLUMN as f32 + units as f32 / UNITS_PER_COLUMN as f32,
-                QUERY_ROW,
-            )
+            let (field, _) = self.filter_row(width, spacing);
+            (QUERY_COLUMN as f32 + field.caret_columns(), QUERY_ROW)
         } else {
-            let first = self.visible(layout.project_rows()).start;
+            let first = self.visible(layout.project_rows()).range().start;
             (
                 PROJECT_CURSOR_COLUMN as f32,
-                PROJECT_TOP + self.selected - first,
+                PROJECT_TOP + self.selected.saturating_sub(first),
             )
         }
     }
@@ -381,19 +385,25 @@ impl ProjectPicker {
         }
         let count = std::mem::take(&mut self.count).max(1);
         match (modifiers.control, raw) {
-            (false, "up") | (true, "k") => self.move_selection(-1, rows),
-            (false, "down") | (true, "j") => self.move_selection(1, rows),
-            (false, "pageup") => self.move_selection(-(rows as isize), rows),
-            (false, "pagedown") => self.move_selection(rows as isize, rows),
-            (false, "backspace") if self.filter_focused => self.erase(false),
-            (true, "u") if self.filter_focused => self.erase(true),
+            (false, "up") | (true, "k") => self.move_selection(-1),
+            (false, "down") | (true, "j") => self.move_selection(1),
+            (false, "pageup") => self.move_selection(-(rows as isize)),
+            (false, "pagedown") => self.move_selection(rows as isize),
+            (true, "u") if self.filter_focused => self.clear_filter(),
+            _ if self.filter_focused
+                && let Some(changed) = self.field.edit(&mut self.query, key) =>
+            {
+                if changed {
+                    self.refilter();
+                }
+            }
             (false, "enter") => return Open,
             (false, "escape") if self.filter_focused => self.focus_list(),
             (false, "escape") => return Close,
             _ => match (self.filter_focused, character) {
                 (true, _) => return Text,
-                (false, Some("j")) => self.move_selection(count, rows),
-                (false, Some("k")) => self.move_selection(-count, rows),
+                (false, Some("j")) => self.move_selection(count),
+                (false, Some("k")) => self.move_selection(-count),
                 (false, Some("/")) if self.shows_list() => self.focus_filter(),
                 (false, Some("d")) if !event.is_held && self.selected().is_some() => {
                     return ConfirmRemove;
@@ -422,23 +432,17 @@ impl ProjectPicker {
             .map_or_else(|| i18n::text("start.preview"), |project| &project.name)
     }
 
-    /// Append committed single-line `text` and recompute the filtered list.
+    /// Replace the selected text with the committed single-line query and update matches.
     pub(in crate::grid) fn commit_filter(&mut self, text: &str) {
-        self.query
-            .extend(text.chars().filter(|ch| !ch.is_control()));
+        let clean: String = text.chars().filter(|ch| !ch.is_control()).collect();
+        self.field.insert(&mut self.query, &clean);
         self.refilter();
     }
 
-    /// Remove the last grapheme from the filter or clear it when `all` is true.
-    fn erase(&mut self, all: bool) {
-        if self.query.is_empty() {
-            return;
-        }
-        if all {
-            self.query.clear();
-        } else if let Some((start, _)) = self.query.grapheme_indices(true).next_back() {
-            self.query.truncate(start);
-        }
+    /// Clear the query and reset its selection and horizontal offset together.
+    fn clear_filter(&mut self) {
+        self.field.select_prefix(&self.query, self.query.len());
+        self.field.insert(&mut self.query, "");
         self.refilter();
     }
 
@@ -452,67 +456,121 @@ impl ProjectPicker {
             .filter_map(|(index, project)| project.search.contains(&query).then_some(index))
             .collect();
         self.selected = 0;
-        self.first = 0;
-        self.preview_first = 0;
+        self.list_scroll = GridScroll::default();
+        self.preview_scroll = GridScroll::default();
     }
 
-    /// Move the selected project by `offset`, keeping it within `rows` visible items.
-    pub(in crate::grid) fn move_selection(&mut self, offset: isize, rows: usize) {
-        let index = self
-            .selected
-            .saturating_add_signed(offset)
-            .min(self.matches.len().saturating_sub(1));
-        self.select(index, rows);
+    /// Move by a signed number of filtered projects, stopping at either end.
+    pub(in crate::grid) fn move_selection(&mut self, offset: isize) {
+        let index = GridList::moved(self.selected, offset, self.matches.len());
+        self.select(index);
     }
 
-    /// Select filtered `index` and reveal it in `rows` while keeping the input focus.
-    pub(in crate::grid) fn select(&mut self, index: usize, rows: usize) {
+    /// Select a filtered project and reset its directory preview while keeping the input focus.
+    pub(in crate::grid) fn select(&mut self, index: usize) {
         self.count = 0;
         if index < self.matches.len() && index != self.selected {
             self.selected = index;
-            self.first = self.visible(rows).start;
-            self.preview_first = 0;
+            self.preview_scroll = GridScroll::default();
         }
     }
 
-    /// Scroll the selected directory preview of `count` entries by `offset` within `rows`.
-    pub(in crate::grid) fn scroll_preview(&mut self, offset: isize, count: usize, rows: usize) {
-        let max = count.saturating_sub(rows);
-        self.preview_first = self
-            .preview_first
-            .min(max)
-            .saturating_add_signed(offset)
-            .min(max);
+    /// Advance project selection and the independently scrollable preview at workspace time.
+    pub(in crate::grid) fn track(
+        &mut self,
+        rows: usize,
+        preview_rows: usize,
+        preview_count: usize,
+        now: f64,
+    ) {
+        GridList::follow(
+            &mut self.list_scroll,
+            self.matches.len(),
+            rows,
+            self.selected,
+            now,
+        );
+        self.preview_scroll.track_rows(
+            ScrollInput::Advance,
+            None,
+            preview_rows,
+            preview_count,
+            now,
+        );
+    }
+    pub(in crate::grid) fn body_viewports(
+        &self,
+        layout: ProjectLayout,
+    ) -> [Option<(Rect, f32)>; 2] {
+        let list = layout.list_area().map(|area| {
+            (
+                Rect {
+                    x: area.x + 1,
+                    y: area.y + PROJECT_TOP,
+                    w: area.w - 2,
+                    h: layout.project_rows(),
+                },
+                self.list_scroll.fraction(),
+            )
+        });
+        let preview = layout
+            .preview_area()
+            .filter(|_| self.selected().is_some())
+            .map(|area| {
+                (
+                    Rect {
+                        x: area.x + 1,
+                        y: area.y + 1,
+                        w: area.w - 2,
+                        h: layout.preview_rows(),
+                    },
+                    self.preview_scroll.fraction(),
+                )
+            });
+        [list, preview]
     }
 
-    /// Return the range of filtered indices fitting `rows` and containing the selection.
-    fn visible(&self, rows: usize) -> Range<usize> {
-        let first = self
-            .first
-            .min(self.selected)
-            .min(self.matches.len().saturating_sub(rows))
-            .max((self.selected + 1).saturating_sub(rows));
-        first..(first + rows).min(self.matches.len())
+    pub(super) fn list_fraction(&self) -> f32 {
+        if self.filter_focused {
+            0.
+        } else {
+            self.list_scroll.fraction()
+        }
+    }
+    pub(in crate::grid) fn scrolling(&self) -> bool {
+        self.list_scroll.is_active() || self.preview_scroll.is_active()
+    }
+
+    pub(in crate::grid) fn scroll_preview(
+        &mut self,
+        offset: isize,
+        count: usize,
+        rows: usize,
+        now: f64,
+    ) {
+        self.preview_scroll
+            .track_rows(ScrollInput::Wheel(offset), None, rows, count, now);
+    }
+
+    fn visible(&self, rows: usize) -> GridList {
+        GridList::scrolled(self.matches.len(), rows, self.list_scroll.position())
     }
 
     /// Resolve a press in `layout` at `(x, y)` to a visible filtered project row.
-    pub(super) fn hit(&self, layout: ProjectLayout, x: usize, y: usize) -> Option<usize> {
+    pub(super) fn hit(&self, layout: ProjectLayout, x: usize, y: f32) -> Option<usize> {
         let area = layout.list_area()?;
         let column = x.checked_sub(area.x)?;
         if column == 0 || column >= area.w - 1 {
             return None;
         }
-        let range = self.visible(layout.project_rows());
-        let index = range.start + y.checked_sub(layout.area.y + PROJECT_TOP)?;
-        range.contains(&index).then_some(index)
+        self.visible(layout.project_rows())
+            .hit(y - (layout.area.y + PROJECT_TOP) as f32)
     }
 
-    /// Draw the picker at `layout`, with the selected `preview`, action `status` or
-    /// `history_error` and a hint below the panes, measured with `spacing`.
+    /// Draw fixed pane titles, the filter and the footer. Scrolled bodies are composed separately.
     pub(super) fn frame(
         &self,
         layout: ProjectLayout,
-        preview: PreviewRows<'_>,
         status: &str,
         history_error: Option<&str>,
         spacing: &TextSpacing,
@@ -528,21 +586,11 @@ impl ProjectPicker {
                 ACCENT,
                 spacing,
             );
-            self.draw_list(&mut frame, list.w, layout.project_rows(), spacing);
+            self.draw_filter(&mut frame, list.w, spacing);
         }
         if let Some(pane) = layout.preview_area() {
             let columns = pane.x - layout.area.x..w;
-            pane_border(
-                &mut frame,
-                columns.clone(),
-                h,
-                self.preview_title(),
-                MUTED,
-                spacing,
-            );
-            if self.selected().is_some() {
-                self.draw_preview(&mut frame, columns, layout.preview_rows(), preview, spacing);
-            }
+            pane_border(&mut frame, columns, h, self.preview_title(), MUTED, spacing);
         }
         let status = if status.is_empty()
             && let Some(error) = history_error
@@ -553,8 +601,8 @@ impl ProjectPicker {
         };
         if status.is_empty() {
             let slot = 2..w - 2;
-            let shortcuts = self.shortcut_text(slot.len(), spacing);
-            frame.styled_label(h, slot, &shortcuts, TEXT, spacing, LabelStyle::Dimmed);
+            let shortcuts = self.key_hints(slot.len(), spacing);
+            frame.key_hints(h, slot.start, &shortcuts, (TEXT, TEXT), spacing);
         } else {
             let (row, end) = layout
                 .list_area()
@@ -570,35 +618,60 @@ impl ProjectPicker {
         frame
     }
 
-    /// Paint the filter and the visible rows of the recent-project list.
+    /// Retained bodies have their own clips so fractional rows cannot cover the filter or the footer.
+    pub(in crate::grid) fn bodies(
+        &self,
+        layout: ProjectLayout,
+        preview: PreviewRows<'_>,
+        spacing: &TextSpacing,
+    ) -> [Option<Frame>; 2] {
+        let [list, preview_area] = self.body_viewports(layout);
+        let list = list.map(|(viewport, _)| {
+            let rows = viewport.h;
+            let mut frame = Frame::viewport(viewport.w, rows + 1, self.visible(rows).range().start);
+            frame.hide_theme_background();
+            self.draw_list(&mut frame, viewport.w, rows, spacing);
+            frame
+        });
+        let preview = preview_area.map(|(viewport, _)| {
+            let rows = viewport.h;
+            let count = preview.and_then(Result::ok).map_or(0, <[Entry]>::len);
+            let list = GridList::scrolled(count, rows, self.preview_scroll.position());
+            let mut frame = Frame::viewport(viewport.w, rows + 1, list.range().start);
+            frame.hide_theme_background();
+            self.draw_preview(&mut frame, viewport.w, list, preview, spacing);
+            frame
+        });
+        [list, preview]
+    }
+
+    /// Draw project names and icons relative to the scrolled list viewport.
     fn draw_list(&self, frame: &mut Frame, width: usize, rows: usize, spacing: &TextSpacing) {
-        self.draw_filter(frame, width, spacing);
-        let end = width - 1;
+        let end = width;
         if self.matches.is_empty() {
             let message = if self.projects.is_empty() {
                 "start.empty"
             } else {
                 "start.no_projects_match"
             };
-            frame.label(PROJECT_TOP, 2..end, i18n::text(message), MUTED, spacing);
+            frame.label(0, 1..end, i18n::text(message), MUTED, spacing);
         }
-        for (row, index) in self.visible(rows).enumerate() {
-            let row = PROJECT_TOP + row;
+        for (row, index) in self.visible(rows).range().enumerate() {
             let project = &self.projects[self.matches[index]];
             let color = if index == self.selected {
-                frame.tint(row, 1, end, SELECTION);
+                frame.tint(row, 0, end, SELECTION);
                 ACCENT
             } else {
                 TEXT
             };
-            frame.icon(2, row, FOLDER);
+            frame.icon(1, row, FOLDER);
             let name_width = if project.parent.is_some() {
-                (end - LABEL_COLUMN) / 2
+                (end.saturating_sub(LABEL_COLUMN - 1)) / 2
             } else {
-                end - LABEL_COLUMN
+                end.saturating_sub(LABEL_COLUMN - 1)
             };
             let name = spacing.ellipsize(&project.name, name_width);
-            let after = frame.label(row, LABEL_COLUMN..end, &name, color, spacing);
+            let after = frame.label(row, LABEL_COLUMN - 1..end, &name, color, spacing);
             if let Some(parent) = &project.parent {
                 let slot = after + 2..end;
                 frame.label(
@@ -613,7 +686,7 @@ impl ProjectPicker {
     }
 
     /// Format complete shortcuts for the current focus and selection within `columns`, measured by `spacing`.
-    fn shortcut_text(&self, columns: usize, spacing: &TextSpacing) -> String {
+    fn key_hints(&self, columns: usize, spacing: &TextSpacing) -> GridKeyHints {
         let focus_hints: &[(&str, &str)] = if !self.shows_list() {
             &[("picker.hint_back", "Esc")]
         } else if self.filter_focused() {
@@ -630,53 +703,58 @@ impl ProjectPicker {
                 ("start.hint_remove_entry", "d"),
             ],
         };
-        let mut text = String::new();
-        let mut remaining = columns;
-        for &(action, key) in focus_hints.iter().chain(selection_hints) {
-            let separator = if text.is_empty() {
-                ""
-            } else {
-                SHORTCUT_SEPARATOR
-            };
-            let label = shortcut_hint(i18n::text(action), key);
-            let width = spacing.columns(separator) + spacing.columns(&label);
-            if width > remaining {
-                break;
-            }
-            text.push_str(separator);
-            text.push_str(&label);
-            remaining -= width;
-        }
-        text
+        GridKeyHints::fit(
+            columns,
+            focus_hints
+                .iter()
+                .chain(selection_hints)
+                .map(|&(action, key)| (i18n::text(action), key)),
+            spacing,
+        )
     }
 
     /// Fit the query, preedit and count in `width` columns measured by `spacing`.
     /// Keep one column after the visible text for the caret.
-    fn filter_row(&self, width: usize, spacing: &TextSpacing) -> (String, String) {
+    fn filter_row(&self, width: usize, spacing: &TextSpacing) -> (FieldLayout<'_>, String) {
         let count = format!("{}/{}", self.matches.len(), self.projects.len());
-        let available = width.saturating_sub(QUERY_COLUMN + count.len() + 4) * UNITS_PER_COLUMN;
-        let mut query = format!("{}{}", self.query, self.composition.text);
-        let units = spacing.cells(&query).last().map_or(0, |cell| cell.end);
-        if units > available {
-            let start = spacing
-                .cells(&query)
-                .find(|cell| cell.start >= units - available)
-                .map_or(query.len(), |cell| cell.byte);
-            query.drain(..start);
-        }
-        (query, count)
+        let columns = width.saturating_sub(QUERY_COLUMN + count.len() + 3);
+        (
+            self.field
+                .layout(&self.query, &self.composition, columns, spacing),
+            count,
+        )
     }
 
-    /// Draw the filter prompt and count inside the left pane of `width` columns.
+    /// Position the filter caret using the same clipped graphemes as its grid row.
+    pub(in crate::grid) fn press_filter(
+        &mut self,
+        layout: ProjectLayout,
+        point: Point<Pixels>,
+        metrics: Metrics,
+        spacing: &TextSpacing,
+        extend: bool,
+    ) {
+        self.focus_filter();
+        if !self.composition.is_empty() {
+            return;
+        }
+        if let Some(area) = layout.list_area() {
+            let x =
+                f32::from(point.x - metrics.at((area.x + QUERY_COLUMN) as f32, 0.).x) / metrics.cw;
+            let byte = self.filter_row(area.w, spacing).0.byte_at(x, spacing);
+            self.field.place(&self.query, byte, extend);
+        }
+    }
+
+    /// Draw the query and match count inside the left pane.
     fn draw_filter(&self, frame: &mut Frame, width: usize, spacing: &TextSpacing) {
-        let (query, count) = self.filter_row(width, spacing);
+        let (field, count) = self.filter_row(width, spacing);
         frame.right_label(QUERY_ROW, width - 2, &count, MUTED, spacing);
         frame.label(QUERY_ROW, 1..QUERY_COLUMN, "❯", ACCENT, spacing);
-        frame.label(
+        frame.text_field(
             QUERY_ROW,
-            QUERY_COLUMN..width.saturating_sub(count.len() + 4),
-            &query,
-            TEXT,
+            QUERY_COLUMN..width.saturating_sub(count.len() + 3),
+            &field,
             spacing,
         );
         frame.text(1, RULE_ROW, &"─".repeat(width - 2), MUTED, width - 2);
@@ -686,33 +764,24 @@ impl ProjectPicker {
     fn draw_preview(
         &self,
         frame: &mut Frame,
-        columns: Range<usize>,
-        rows: usize,
+        width: usize,
+        list: GridList,
         preview: PreviewRows<'_>,
         spacing: &TextSpacing,
     ) {
-        let x = columns.start;
-        let slot = x + LABEL_COLUMN..columns.end - 1;
+        let slot = LABEL_COLUMN - 1..width;
         match preview {
             Some(Ok(entries)) if !entries.is_empty() => {
-                let first = self.preview_first.min(entries.len().saturating_sub(rows));
-                for (index, entry) in entries.iter().skip(first).take(rows).enumerate() {
-                    let row = index + 1;
-                    let name = entry.path.file_name().unwrap_or_default().to_string_lossy();
-                    frame.icon(x + 2, row, entry.icon(false));
-                    frame.label(
-                        row,
-                        slot.clone(),
-                        &spacing.ellipsize(&name, slot.len()),
-                        TEXT,
-                        spacing,
-                    );
+                for (row, entry) in entries[list.range()].iter().enumerate() {
+                    let mut file = GridFileRow::new(&entry.path, entry.directory, false, 0..width);
+                    file.name_columns = slot.clone();
+                    frame.file_row(row, &file, spacing, None);
                 }
             }
             Some(Err(error)) => {
                 let message = i18n::format("start.preview_error", &[("error", &error)]);
                 frame.label(
-                    1,
+                    0,
                     slot.clone(),
                     &spacing.ellipsize(&message, slot.len()),
                     GOLD,
@@ -725,7 +794,7 @@ impl ProjectPicker {
                 } else {
                     "start.preview_loading"
                 };
-                frame.label(1, slot, i18n::text(key), MUTED, spacing);
+                frame.label(0, slot, i18n::text(key), MUTED, spacing);
             }
         }
     }
@@ -742,8 +811,7 @@ fn pane_border(
     spacing: &TextSpacing,
 ) {
     let (title, slot) = pane_title(columns.len(), title, spacing);
-    let title_start = columns.start + slot.start;
-    let title_end = columns.start + slot.end;
+    let title_columns = columns.start + slot.start..columns.start + slot.end;
     frame.outline(
         Rect {
             x: columns.start,
@@ -753,9 +821,9 @@ fn pane_border(
         },
         color,
         OutlineStyle::Solid,
-        std::iter::once(title_start - 1..title_end + 1),
+        std::iter::once(title_hit_columns(title_columns.clone())),
     );
-    frame.label(0, title_start..title_end, &title, color, spacing);
+    frame.label(0, title_columns, &title, color, spacing);
 }
 
 /// Center `title` in the same columns for painting and pointer hit testing.
@@ -770,7 +838,7 @@ fn pane_title<'a>(
     (title, start..start + title_width)
 }
 
-/// Test `position` against the displayed title inside `area`.
+/// Test `position` against the title and its surrounding padding inside `area`.
 fn title_at(
     area: Rect,
     title: &str,
@@ -779,6 +847,7 @@ fn title_at(
     spacing: &TextSpacing,
 ) -> bool {
     let (_, columns) = pane_title(area.w, title, spacing);
+    let columns = title_hit_columns(columns);
     !columns.is_empty()
         && Rect {
             x: area.x + columns.start,
@@ -844,6 +913,30 @@ mod tests {
         } else {
             action
         }
+    }
+
+    /// After scrolling, the preview keeps the icon and clipped name inside its own pane.
+    #[test]
+    fn scrolled_project_preview_uses_the_file_row_inside_its_border() -> anyhow::Result<()> {
+        use crate::{grid::windows::manager::Explorer, ui::file_icons::EntryIcon};
+        let project = tempfile::tempdir()?;
+        let path = project.path().join("readme-long.txt");
+        std::fs::create_dir(project.path().join("src"))?;
+        std::fs::write(&path, "")?;
+        let root = project.path().to_path_buf();
+        let entries = Explorer::preview(root.clone())?;
+        let mut picker = ProjectPicker::new(&[root]);
+        picker.scroll_preview(1, entries.len(), 1, 0.);
+        picker.track(1, 1, entries.len(), 1.);
+        let spacing = spacing();
+        let list = GridList::scrolled(entries.len(), 1, picker.preview_scroll.position());
+        let mut preview = Frame::new(9, 1);
+        picker.draw_preview(&mut preview, 9, list, Some(Ok(&entries)), &spacing);
+        let mut expected = Frame::new(9, 1);
+        expected.icon(1, 0, EntryIcon::for_path(&path, false, false).image());
+        expected.label(0, 3..9, "readm…", TEXT, &spacing);
+        assert!(preview == expected);
+        Ok(())
     }
 
     /// Rendering and preview-wheel targeting share the same pane after the one-column gap.
@@ -931,10 +1024,10 @@ mod tests {
         );
         picker.commit_filter("OTHER");
         assert_eq!(picker.selected_root(), None);
-        picker.erase(true);
+        picker.clear_filter();
         picker.commit_filter("SCD");
         assert_eq!(picker.selected_root(), None);
-        picker.erase(true);
+        picker.clear_filter();
         picker.commit_filter(" EcO ");
         assert_eq!(picker.selected_root(), Some(roots[1].as_path()));
         assert_eq!(
@@ -946,9 +1039,9 @@ mod tests {
         let (query, count) = picker.filter_row(width, &spacing);
         assert_eq!(
             picker.caret(layout, &spacing),
-            ((QUERY_COLUMN + query.len()) as f32, QUERY_ROW)
+            ((QUERY_COLUMN + query.text().len()) as f32, QUERY_ROW)
         );
-        assert_eq!(QUERY_COLUMN + query.len() + count.len() + 4, width);
+        assert_eq!(QUERY_COLUMN + query.text().len() + count.len() + 4, width);
         assert_eq!(
             press(&mut picker, layout, "escape"),
             ProjectPickerAction::Update
@@ -959,14 +1052,14 @@ mod tests {
         );
         assert_eq!(picker.selected_root(), None);
         assert_eq!(press(&mut picker, layout, "/"), ProjectPickerAction::Update);
-        picker.erase(true);
+        picker.clear_filter();
         assert_eq!(picker.selected_root(), Some(roots[0].as_path()));
         assert_eq!(
             picker.caret(layout, &spacing),
             (QUERY_COLUMN as f32, QUERY_ROW)
         );
         picker.composition.mark(None, "项目", None);
-        assert_eq!(picker.filter_row(width, &spacing).0, "项目");
+        assert_eq!(picker.filter_row(width, &spacing).0.text(), "项目");
         assert_eq!(picker.selected_root(), Some(roots[0].as_path()));
         picker.focus_list();
         assert!(picker.composition.is_empty());
@@ -1020,16 +1113,16 @@ mod tests {
         let mut picker = ProjectPicker::new(&[]);
         let layout = picker.layout(90, 24);
         let spacing = spacing();
-        let filtering = picker.frame(layout, None, "", None, &spacing);
+        let filtering = picker.frame(layout, "", None, &spacing);
         let status = "Project unavailable";
-        let feedback = picker.frame(layout, None, status, None, &spacing);
+        let feedback = picker.frame(layout, status, None, &spacing);
 
         press(&mut picker, layout, "escape");
-        assert!(picker.frame(layout, None, "", None, &spacing) != filtering);
-        assert!(picker.frame(layout, None, status, None, &spacing) == feedback);
+        assert!(picker.frame(layout, "", None, &spacing) != filtering);
+        assert!(picker.frame(layout, status, None, &spacing) == feedback);
 
         press(&mut picker, layout, "/");
-        assert!(picker.frame(layout, None, "", None, &spacing) == filtering);
+        assert!(picker.frame(layout, "", None, &spacing) == filtering);
     }
 
     /// Render mode-specific shortcut groups without cutting a label or its separator.
@@ -1043,11 +1136,14 @@ mod tests {
         let open = i18n::text("picker.hint_open");
         let first = format!("{browse}: Esc");
         assert_eq!(
-            picker.shortcut_text(120, &spacing),
+            picker.key_hints(120, &spacing).labels.join(" | "),
             format!("{first} | {movement}: ↑/↓ | {open}: Enter")
         );
         assert_eq!(
-            picker.shortcut_text(spacing.columns(&first) + 3, &spacing),
+            picker
+                .key_hints(spacing.columns(&first) + 3, &spacing)
+                .labels
+                .join(" | "),
             first
         );
 
@@ -1056,7 +1152,7 @@ mod tests {
         let back = i18n::text("picker.hint_back");
         let remove = i18n::text("start.hint_remove_entry");
         assert_eq!(
-            picker.shortcut_text(120, &spacing),
+            picker.key_hints(120, &spacing).labels.join(" | "),
             format!("{filter}: / | {back}: Esc | {movement}: j/k | {open}: Enter | {remove}: d")
         );
     }
@@ -1103,16 +1199,20 @@ mod tests {
         for key in ["4", "0", "j"] {
             press(&mut picker, layout, key);
         }
+        picker.track(rows, layout.preview_rows(), 0, 1.);
         assert_eq!(picker.selected(), Some(39));
         assert_eq!(
             picker.caret(layout, &spacing()),
             (PROJECT_CURSOR_COLUMN as f32, PROJECT_TOP + rows - 1)
         );
         let last = layout.area.y + PROJECT_TOP + rows - 1;
-        assert_eq!(picker.hit(layout, layout.area.x + 2, last), Some(39));
-        assert_eq!(picker.hit(layout, layout.area.x + 2, last + 1), None);
+        assert_eq!(picker.hit(layout, layout.area.x + 2, last as f32), Some(39));
         assert_eq!(
-            picker.hit(layout, layout.preview_area().unwrap().x + 1, last),
+            picker.hit(layout, layout.area.x + 2, (last + 1) as f32),
+            None
+        );
+        assert_eq!(
+            picker.hit(layout, layout.preview_area().unwrap().x + 1, last as f32),
             None
         );
         for key in ["1", "2", "k"] {

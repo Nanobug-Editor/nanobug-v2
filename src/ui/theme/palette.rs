@@ -63,6 +63,8 @@ color_roles! {
     SYNTAX_CONSTANT: "syntax_constant", 6;
     SYNTAX_COMMENT: "syntax_comment", 6;
     SYNTAX_ATTRIBUTE: "syntax_attribute", 6;
+    WARNING_UNDERLINE: "warning_underline", 6;
+    ERROR_UNDERLINE: "error_underline", 6;
 }
 
 /// An independently themed region, ordered for indexing into `Palette::components`.
@@ -466,6 +468,31 @@ mod tests {
         assert_eq!(rgb(SyntaxKind::Number), 0xaabbcc);
         assert_eq!(rgb(SyntaxKind::Float), 0x010203);
         assert_eq!(rgb(SyntaxKind::Method), 0xff9911);
+        Ok(())
+    }
+
+    /// Existing editor text overrides inherit each variant's dedicated wave colors on upgrade.
+    #[test]
+    fn existing_themes_inherit_diagnostic_underline_colors() -> Result<()> {
+        let editor = Some(ThemeComponent::Editor);
+        for defaults in DEFAULTS.iter() {
+            let loaded = parse(
+                "[components.editor]\nwarning_text = '#334455'\nerror_text = '#112233'\n",
+                Some(defaults),
+            )?;
+            for role in [Role::WARNING_UNDERLINE, Role::ERROR_UNDERLINE] {
+                let index = role as usize;
+                assert_eq!(
+                    loaded.resolved(editor, index),
+                    defaults.resolved(editor, index)
+                );
+            }
+            assert_eq!(
+                loaded.resolved(editor, Role::WARNING_TEXT as usize),
+                0x334455
+            );
+            assert_eq!(loaded.resolved(editor, Role::ERROR_TEXT as usize), 0x112233);
+        }
         Ok(())
     }
 

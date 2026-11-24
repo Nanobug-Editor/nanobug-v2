@@ -107,14 +107,14 @@ impl ManagerWindow {
     /// Start editing the current query in the footer, keeping the prior selection for Escape.
     pub(in crate::grid) fn open_search(&mut self) {
         let manager = self;
-        manager.prompt = Some(Input {
-            kind: Prompt::Search {
+        manager.prompt = Some(Input::new(
+            Prompt::Search {
                 original: manager.search.clone(),
                 selection: manager.selection,
                 offset: manager.offset,
             },
-            value: manager.search.clone(),
-        });
+            manager.search.clone(),
+        ));
     }
     /// Apply confirmed footer text and restart navigation at the first matching row.
     pub(in crate::grid) fn live_search(&mut self) {

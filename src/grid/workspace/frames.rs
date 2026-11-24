@@ -11,29 +11,63 @@ use super::{
 };
 use crate::{
     grid::{
-        render::{Frame, Panel, Rect},
+        render::{Frame, Metrics, Panel, Rect},
         windows::{
             WindowFrame,
-            editor::{MarkdownCache, MarkdownViewMode},
+            editor::{EditorLayers, MarkdownCache, MarkdownViewMode},
         },
     },
-    ui::theme::{
-        ACCENT, CURRENT, CURSOR_TEXT, FOOTER_BLUE, FOOTER_DETAILS, FOOTER_INSERT, FOOTER_VISUAL,
-        MUTED, TEXT, ThemeComponent, WARNING_TEXT, style,
+    ui::{
+        components::grid_file_row::display_path,
+        theme::{
+            ACCENT, CURRENT, CURSOR_TEXT, FOOTER_BLUE, FOOTER_DETAILS, FOOTER_INSERT,
+            FOOTER_VISUAL, MUTED, TEXT, ThemeComponent, WARNING_TEXT,
+        },
     },
 };
-use gpui::{AppContext, Context, Entity, px};
+use gpui::{App, AppContext, Context, Entity, px};
 use nanobug::{
     animation::scroll::ScrollInput, i18n, plugins::session::LanguageServerPhase, vim::Mode,
 };
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
-/// Fixed border and clipped source layers of a visible editor outside the focused pane.
+/// Retained GPUI panels corresponding to the frames produced by an editor.
+pub(super) type EditorPanels = EditorLayers<Entity<Panel>>;
+
+impl EditorPanels {
+    /// Allocate the three panels with the same `metrics` in `cx`.
+    pub(super) fn new(metrics: Metrics, cx: &mut App) -> Self {
+        Self {
+            chrome: cx.new(|_| Panel::new(metrics)),
+            numbers: cx.new(|_| Panel::new(metrics)),
+            text: cx.new(|_| Panel::new(metrics)),
+        }
+    }
+
+    /// Publish each of `frames` to its matching panel through `cx`.
+    fn set_frames(&self, frames: EditorLayers<Frame>, cx: &mut App) {
+        self.chrome
+            .update(cx, |panel, cx| panel.set(frames.chrome, cx));
+        self.numbers
+            .update(cx, |panel, cx| panel.set(frames.numbers, cx));
+        self.text.update(cx, |panel, cx| panel.set(frames.text, cx));
+    }
+
+    /// All retained panels that follow display-scale and appearance changes.
+    pub(super) fn all(&self) -> [&Entity<Panel>; 3] {
+        [&self.chrome, &self.numbers, &self.text]
+    }
+}
+
+/// Panels and Markdown cache of a visible editor outside the focused pane.
 pub(super) struct EditorPanePanels {
     /// Stable editor identity on this page.
     pub(super) pane: PaneId,
     /// Pane border and Bufferline, line numbers, and document text.
-    pub(super) layers: [Entity<Panel>; 3],
+    pub(super) layers: EditorPanels,
     /// Parsed and shaped preview retained at this pane's own width.
     pub(super) markdown: MarkdownCache,
 }
@@ -54,6 +88,26 @@ fn footer_position_label(line: usize, column: usize, progress: usize) -> String 
     format!(
         "{progress:>FOOTER_PROGRESS_DIGITS$}% {line:>FOOTER_LINE_DIGITS$}:{column:<FOOTER_COLUMN_DIGITS$}"
     )
+}
+
+/// Display a single-line path relative to the project, using an absolute path across volumes.
+fn footer_file_path(root: &Path, file: &Path) -> String {
+    let single_line = |path: &Path| path.to_string_lossy().replace(['\t', '\r', '\n'], " ");
+    if let Ok(relative) = file.strip_prefix(root) {
+        return single_line(relative);
+    }
+    let root = display_path(root);
+    let file = display_path(file);
+    let path = Path::new(file.as_ref());
+    let mut relative = PathBuf::new();
+    for ancestor in Path::new(root.as_ref()).ancestors() {
+        if let Ok(tail) = path.strip_prefix(ancestor) {
+            relative.push(tail);
+            return single_line(&relative);
+        }
+        relative.push("..");
+    }
+    single_line(path)
 }
 
 /// Select the localized footer text and foreground role for the server `phase`.
@@ -128,10 +182,7 @@ impl Workspace {
             self.refresh_editor_close(cx);
             return;
         }
-        let (frames, tree_name_preview) = self.frames(style(cx));
-        for (panel, frame) in self.panels.iter().chain(self.bodies.iter()).zip(frames) {
-            panel.update(cx, |panel, cx| panel.set(frame, cx));
-        }
+        let tree_name_preview = self.refresh_pane_frames(cx);
         self.refresh_inactive_editor_panels(cx);
         self.tree_name_preview_rect = tree_name_preview.map(|(rect, frame)| {
             self.tree_name_preview
@@ -179,19 +230,12 @@ impl Workspace {
             } else {
                 panels.push(EditorPanePanels {
                     pane,
-                    layers: std::array::from_fn(|_| cx.new(|_| Panel::new(metrics))),
+                    layers: EditorPanels::new(metrics, cx),
                     markdown: MarkdownCache::default(),
                 });
                 &panels[panels.len() - 1]
             };
-            for (panel, frame) in
-                rendered
-                    .layers
-                    .iter()
-                    .zip([frames.chrome, frames.numbers, frames.text])
-            {
-                panel.update(cx, |panel, cx| panel.set(frame, cx));
-            }
+            rendered.layers.set_frames(frames, cx);
         }
     }
 
@@ -248,7 +292,8 @@ impl Workspace {
     pub(super) fn refresh_footer(&self, cx: &mut Context<Self>) {
         if self.projects.active_project().is_some() && self.file_picker.is_none() {
             let frame = self.footer_frame(self.modal_open());
-            self.panels[2].update(cx, |panel, cx| panel.set(frame, cx));
+            self.footer_panel
+                .update(cx, |panel, cx| panel.set(frame, cx));
         }
     }
 
@@ -281,9 +326,9 @@ impl Workspace {
 
     /// Draw the footer with inward-pointing status badges and dim the mode when `modal_open`.
     fn footer_frame(&self, modal_open: bool) -> Frame {
-        let active = &self.projects.active();
+        let active = self.projects.active();
         let vim = active.editor.vim();
-        let cols = self.layout.cols;
+        let cols = self.layout.visible_cols;
         let mut footer = Frame::new(cols, FOOTER_ROWS);
         footer.set_theme_component(ThemeComponent::Footer);
         footer.inset_row_tints(px(FOOTER_BADGE_INSET_Y));
@@ -365,62 +410,62 @@ impl Workspace {
         );
 
         let verbose = self.input_mappings.last_ex_diagnostic();
-        let (message, color) = if !active.status.is_empty() {
-            (active.status.as_str(), TEXT)
-        } else if !vim.message.is_empty() {
-            (vim.message.as_str(), TEXT)
-        } else if !verbose.is_empty() {
-            (verbose.as_str(), TEXT)
-        } else if active.focus == Focus::Editor
-            && let Some(message) = active.editor.buffer().caret_diagnostic()
-        {
-            // The footer is a single grid row even when the language server sends notes.
-            (message.lines().next().unwrap_or_default(), WARNING_TEXT)
-        } else {
-            ("", TEXT)
-        };
+        let feedback = [
+            active.status.as_str(),
+            vim.message.as_str(),
+            verbose.as_str(),
+        ]
+        .into_iter()
+        .find(|message| !message.is_empty());
+        let path = doc
+            .path
+            .as_deref()
+            .filter(|_| feedback.is_none())
+            .map(|file| footer_file_path(&active.root, file));
+        let message = feedback.or(path.as_deref()).unwrap_or_default();
         let message_start = (tip + 1 + FOOTER_LABEL_GAP).min(slots.left.end);
         let mut message_end = slots.left.end;
         if let Some((server, phase)) = self.active_language_server_status() {
             let (state, color) = language_server_label(phase);
             let message = message.lines().next().unwrap_or_default();
             let available = message_end - message_start;
-            // Keep space for operation feedback and diagnostics before choosing a status label.
-            let feedback = self.spacing.columns(message).min(available / 2);
-            let gap = if feedback > 0 { FOOTER_LABEL_GAP } else { 0 };
+            // Reserve part of the row for the path or command feedback when the server is present.
+            let reserved = self.spacing.columns(message).min(available / 2);
+            let gap = if reserved > 0 { FOOTER_LABEL_GAP } else { 0 };
             for name in [server, "LSP"] {
                 let label = format!("{name} · {state}");
-                if self.spacing.columns(&label) + feedback + gap <= available {
+                if self.spacing.columns(&label) + reserved + gap <= available {
                     let left = footer.right_label(0, message_end, &label, color, &self.spacing);
                     message_end = left.saturating_sub(gap).max(message_start);
                     break;
                 }
             }
         }
-        if active.status.is_empty() && !vim.message.is_empty() && !vim.ex_message_spans().is_empty()
+        let slot = message_start..message_end;
+        if let Some(path) = &path {
+            let fitted = self.spacing.ellipsize_start(path, slot.len());
+            footer.label(0, slot, &fitted, TEXT, &self.spacing);
+        } else if active.status.is_empty()
+            && !vim.message.is_empty()
+            && !vim.ex_message_spans().is_empty()
         {
-            footer.highlighted_label(
-                0,
-                message_start..message_end,
-                message,
-                color,
-                &self.spacing,
-                |offset| nanobug::vim::ExMessageOutput::style_at(vim.ex_message_spans(), offset),
-            );
+            footer.highlighted_label(0, slot, message, TEXT, &self.spacing, |offset| {
+                nanobug::vim::ExMessageOutput::style_at(vim.ex_message_spans(), offset)
+            });
         } else {
-            footer.label(0, message_start..message_end, message, color, &self.spacing);
+            footer.label(0, slot, message, TEXT, &self.spacing);
         }
         footer
     }
 
-    /// Compose the active project's panes and use `appearance` for the Explorer preview background.
-    fn frames(&self, appearance: crate::ui::theme::Style) -> ([Frame; 6], Option<(Rect, Frame)>) {
+    /// Refresh the active project's named pane layers through `cx`, returning its optional filename preview.
+    fn refresh_pane_frames(&self, cx: &mut Context<Self>) -> Option<(Rect, Frame)> {
         let layout = self.layout;
         let pane_areas = self.workspace_pane_areas();
         let vim = self.projects.active().editor.vim();
         let help_open = self.help.is_open();
         let modal_open = self.modal_open();
-        let footer = self.footer_frame(modal_open);
+        self.refresh_footer(cx);
         let context = |pane, area| WindowFrame {
             area,
             selected: !self.small_modal_open()
@@ -437,7 +482,6 @@ impl Workspace {
                         context(Focus::Manager, layout.tree),
                         layout.cols,
                         vim.doc.path.as_deref(),
-                        appearance,
                     );
                     let (top, bottom) = pane_border_offsets(layout.tree, &pane_areas, self.metrics);
                     frames.chrome.offset_pane_borders(top, bottom);
@@ -452,23 +496,51 @@ impl Workspace {
         );
         let (top, bottom) = pane_border_offsets(editor_area, &pane_areas, self.metrics);
         editor.chrome.offset_pane_borders(top, bottom);
-        (
-            [
-                manager_chrome,
-                editor.chrome,
-                footer,
-                manager_body,
-                editor.numbers,
-                editor.text,
-            ],
-            manager_preview,
-        )
+        self.manager_chrome
+            .update(cx, |panel, cx| panel.set(manager_chrome, cx));
+        self.manager_body
+            .update(cx, |panel, cx| panel.set(manager_body, cx));
+        self.editor_panels.set_frames(editor, cx);
+        manager_preview
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::footer_position_label;
+    use super::{footer_file_path, footer_position_label};
+    use std::path::Path;
+
+    #[test]
+    fn footer_paths_are_relative_to_the_project() {
+        let root = Path::new("workspace").join("project");
+        let file = Path::new("src").join("main.rs");
+        assert_eq!(
+            footer_file_path(&root, &root.join(&file)),
+            file.to_string_lossy()
+        );
+        let sibling = Path::new("workspace").join("library").join("lib.rs");
+        assert_eq!(
+            footer_file_path(&root, &sibling),
+            Path::new("..")
+                .join("library")
+                .join("lib.rs")
+                .to_string_lossy()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_footer_handles_verbatim_paths_and_other_drives() {
+        let root = Path::new(r"\\?\C:\project");
+        assert_eq!(
+            footer_file_path(root, Path::new(r"C:\project\src\main.rs")),
+            r"src\main.rs"
+        );
+        assert_eq!(
+            footer_file_path(root, Path::new(r"\\?\D:\lib.rs")),
+            r"D:\lib.rs"
+        );
+    }
 
     /// Crossing digit boundaries keeps the percent sign and colon in the same slots.
     #[test]

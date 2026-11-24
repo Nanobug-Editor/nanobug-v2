@@ -4,6 +4,7 @@ mod buffer;
 mod command_window;
 mod commands;
 mod completion;
+mod diagnostics;
 mod directory;
 mod ex_matches;
 mod header;
@@ -14,6 +15,7 @@ mod markdown;
 mod pointer;
 mod presentation;
 mod project_session;
+mod result_list;
 mod session;
 pub(in crate::grid) mod shortcuts;
 mod signs;
@@ -33,6 +35,8 @@ pub(in crate::grid) use hover::{DefinitionHoverContent, DefinitionHoverPopup};
 pub(in crate::grid) use input::EditResult;
 pub(in crate::grid) use markdown::{MarkdownCache, MarkdownPreview, MarkdownViewMode};
 pub(in crate::grid) use project_session::EditorSnapshot;
+pub(in crate::grid) use result_list::ResultList;
+pub(in crate::grid) use view::EditorLayers;
 
 use crate::ui::ime::Composition;
 use gpui::{Pixels, Point};
@@ -57,6 +61,8 @@ pub(in crate::grid) struct EditorWindow {
     register: Register,
     /// Cursor positions visited in this pane, shared by its retained buffers.
     jump_history: JumpHistory,
+    /// Whether the shared workspace diagnostic display is enabled for this pane.
+    diagnostic_marks: bool,
     /// Native preedit text, committed to the document only once.
     composition: Composition,
     /// Selection anchor and original pointer position for drag-jitter rejection.
@@ -98,6 +104,7 @@ impl EditorWindow {
             directory: DirectorySlot::default(),
             register: Register::default(),
             jump_history,
+            diagnostic_marks: true,
             composition: Composition::default(),
             dragging: None,
             horizontal_wheel: 0.,
@@ -107,6 +114,11 @@ impl EditorWindow {
     /// Return the modal model of the displayed buffer.
     pub(in crate::grid) fn vim(&self) -> &Vim {
         &self.buffers[self.active].vim
+    }
+
+    /// Show or hide diagnostic decorations while keeping the provider data available to navigation.
+    pub(in crate::grid) fn set_diagnostic_marks(&mut self, enabled: bool) -> bool {
+        std::mem::replace(&mut self.diagnostic_marks, enabled) != enabled
     }
 
     /// Inspect this window's Ex directory override.

@@ -381,6 +381,9 @@ impl Workspace {
                     self.metrics,
                     &self.spacing,
                 );
+                if event.click_count == 2 && self.activate_result_row(window, cx) {
+                    return;
+                }
             }
         }
         self.sync(window, cx);
@@ -544,7 +547,8 @@ impl Workspace {
         if self.projects.start().is_some() {
             return self.middle_close_start_title(position, window, cx);
         }
-        if self.panels[0]
+        if self
+            .manager_chrome
             .read(cx)
             .title_at(self.layout.tree, position, self.metrics)
         {
@@ -564,7 +568,7 @@ impl Workspace {
         let project = self.projects.active_project()?;
         let panes = self.workspace_pane_areas();
         self.editor_rects().into_iter().find_map(|(pane, area)| {
-            let mut title = Rect { h: 1, ..area }.pixels(self.metrics);
+            let mut title = EditorWindow::grid_window(area).title().pixels(self.metrics);
             title.origin.y += pane_border_offsets(area, &panes, self.metrics).0;
             if !title.contains(&position) {
                 return None;
@@ -738,6 +742,14 @@ impl Workspace {
         }
     }
 
+    /// Accumulate native pixel deltas until a whole grid-row step is available.
+    pub(super) fn take_wheel_rows(&mut self, event: &ScrollEvent) -> isize {
+        self.wheel += f32::from(event.delta.pixel_delta(px(self.metrics.lh)).y) / self.metrics.lh;
+        let rows = self.wheel.trunc() as isize;
+        self.wheel -= rows as f32;
+        rows
+    }
+
     /// Route `event` to the panel under the pointer and retain partial steps on each axis.
     /// Shift pans editor text horizontally. `window` and `cx` drive viewport animation.
     pub(super) fn scroll(
@@ -758,6 +770,12 @@ impl Workspace {
         }
         if self.command_window.is_some() {
             self.wheel_command_window(event, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self.wheel_completion_list(event, window, cx)
+            || self.wheel_plugin_list(event, window, cx)
+        {
             cx.stop_propagation();
             return;
         }
@@ -828,9 +846,7 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
-        self.wheel += f32::from(event.delta.pixel_delta(px(self.metrics.lh)).y) / self.metrics.lh;
-        let rows = self.wheel.trunc() as isize;
-        self.wheel -= rows as f32;
+        let rows = self.take_wheel_rows(event);
         if rows == 0 {
             return;
         }

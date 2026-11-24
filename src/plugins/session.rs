@@ -160,7 +160,7 @@ pub struct DocumentPresentation {
     pub features: nanobug_plugin_sdk::language::DocumentFeatures,
 }
 
-/// Resolve the built-in highlighter used for documents without an official language package.
+/// Resolve the bundled grammar that can color this file before a plugin or language server replies.
 pub fn builtin_syntax_grammar(
     path: Option<&std::path::Path>,
     filetype: Option<&str>,
@@ -173,6 +173,7 @@ pub fn builtin_syntax_grammar(
         "c" | "h" => "c",
         "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
         "lua" => "lua",
+        "rs" | "rust" => "rust",
         _ => return None,
     })
 }
@@ -187,12 +188,14 @@ pub struct DocumentSyntax {
     pub highlights: Vec<nanobug_plugin_sdk::language::Highlight>,
 }
 
-/// Live diagnostics for one version of the current document.
+/// Live diagnostics for a named or unsaved buffer at a specific revision.
 #[derive(Clone)]
 pub struct DocumentDiagnostics {
+    /// Source opening and text revision supplied to the provider.
     pub version: (u64, u64),
     /// File identity, because a rename may leave the editor revision unchanged.
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
+    /// Validated UTF-8 byte ranges, including point diagnostics.
     pub diagnostics: Vec<nanobug_plugin_sdk::Diagnostic>,
 }
 
@@ -328,12 +331,14 @@ pub struct View {
     pub surfaces: BTreeMap<Key, Surface>,
     /// The latest valid presentation of the current document from each provider.
     pub document_presentations: BTreeMap<Key, Arc<DocumentPresentation>>,
-    /// Syntax for configuration and source formats that have a bundled grammar and no standard plugin.
-    pub builtin_syntax: Option<(u64, Arc<DocumentSyntax>)>,
+    /// Lexical results for visible documents, indexed by project scope and opening.
+    pub builtin_syntax: BTreeMap<(u64, u64), Arc<DocumentSyntax>>,
     /// Revision-matched semantic roles and modifiers from authorized language servers.
     pub semantic_syntax: BTreeMap<Key, Arc<DocumentSyntax>>,
-    /// Revision-matched diagnostics from the project language server.
-    pub document_diagnostics: BTreeMap<Key, Arc<DocumentDiagnostics>>,
+    /// Native server diagnostics indexed by module and document opening.
+    pub document_diagnostics: BTreeMap<(Key, u64), Arc<DocumentDiagnostics>>,
+    /// Guest Diagnose replies for documents awaiting, or without, a native result.
+    pub guest_diagnostics: BTreeMap<(Key, u64), Arc<DocumentDiagnostics>>,
     /// Language server for each selected document, or a server started for the project.
     pub language_servers: BTreeMap<u64, LanguageServerStatus>,
     /// Latest language-server startup or transport failure for each interested module.
@@ -547,11 +552,16 @@ pub enum SettingsWrite {
 /// Explicit file types indexed by project ID and document opening.
 pub type DocumentFiletypes = BTreeMap<(u64, u64), String>;
 
+/// Last successful write per project and document opening, independent of the text revision.
+pub type DocumentSaves = BTreeMap<(u64, u64), u64>;
+
 type Projects = (
     Option<u64>,
     Vec<Project>,
     BTreeMap<u64, String>,
     DocumentFiletypes,
+    Vec<Arc<DocumentSnapshot>>,
+    DocumentSaves,
 );
 type SharedProjects = Arc<Mutex<Arc<Projects>>>;
 type SharedView = Arc<Mutex<Arc<View>>>;
@@ -663,7 +673,40 @@ impl Session {
         dialects: BTreeMap<u64, String>,
         filetypes: DocumentFiletypes,
     ) {
-        *self.projects.lock().unwrap() = Arc::new((active, projects, dialects, filetypes));
+        self.projects_with_visible_syntax(active, projects, dialects, filetypes, Vec::new());
+    }
+
+    /// Publish the open projects and the active tabpage's additional lexical-only snapshots.
+    pub fn projects_with_visible_syntax(
+        &self,
+        active: Option<u64>,
+        projects: Vec<Project>,
+        dialects: BTreeMap<u64, String>,
+        filetypes: DocumentFiletypes,
+        visible_syntax: Vec<Arc<DocumentSnapshot>>,
+    ) {
+        self.sync_documents(
+            active,
+            projects,
+            dialects,
+            filetypes,
+            visible_syntax,
+            DocumentSaves::new(),
+        );
+    }
+
+    /// Coalesce editor overlays and their last successful saves in the same publication.
+    pub fn sync_documents(
+        &self,
+        active: Option<u64>,
+        projects: Vec<Project>,
+        dialects: BTreeMap<u64, String>,
+        filetypes: DocumentFiletypes,
+        visible_syntax: Vec<Arc<DocumentSnapshot>>,
+        saves: DocumentSaves,
+    ) {
+        *self.projects.lock().unwrap() =
+            Arc::new((active, projects, dialects, filetypes, visible_syntax, saves));
         self.wake.unpark();
     }
 

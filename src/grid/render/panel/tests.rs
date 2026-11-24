@@ -274,6 +274,62 @@ fn highlighted_labels_keep_byte_styles_and_clipped_decorations() {
     );
 }
 
+/// Wavy decorations resolve palette roles and clip to complete measured cells.
+#[test]
+fn diagnostic_waves_draw_in_the_scoped_palette_within_the_clip() {
+    use crate::ui::theme::{ERROR_UNDERLINE, WARNING_UNDERLINE};
+    let glyphs = Arc::new(gpui::NoopTextSystem::new());
+    let text_system = WindowTextSystem::new(Arc::new(gpui::TextSystem::new(glyphs.clone())));
+    let metrics = Metrics {
+        cw: 9.,
+        lh: 21.,
+        font_size: GRID_FONT_SIZE,
+        origin: point(px(0.), px(0.)),
+    };
+    let spacing = TextSpacing::new(glyphs, FontId(0), metrics.font_size, metrics.cw);
+    let panel = Panel::new(metrics);
+    let mut frame = Frame::new(6, 1);
+    frame.styled_viewport_line(0, spacing.cells("ab cd"), 0..6, 0, 0, None, |bytes| {
+        let color = if bytes.start < 2 {
+            WARNING_UNDERLINE
+        } else {
+            ERROR_UNDERLINE
+        };
+        CellPaint::new(TEXT, 0, false).with_undercurl(color)
+    });
+    let mut data = panel.data.borrow_mut();
+    data.set_frame(frame);
+    let style = data.style;
+    let row = data.prepare_row(0, &text_system).unwrap();
+    let clip = px(4.)..px(37.);
+    let mut marks = Vec::new();
+    for run in &row.runs {
+        run.paint_decorations(
+            point(run.x, px(0.)),
+            metrics.lh,
+            Some(&clip),
+            |bounds, color| {
+                marks.push((bounds, color >> 8));
+            },
+        );
+    }
+    assert_eq!(marks.first().unwrap().0.left(), px(9.));
+    assert_eq!(marks.last().unwrap().0.right(), px(36.));
+    assert!(
+        marks
+            .iter()
+            .any(|(bounds, _)| bounds.top() != marks[0].0.top())
+    );
+    for (bounds, color) in marks {
+        let role = if bounds.left() < px(18.) {
+            WARNING_UNDERLINE
+        } else {
+            ERROR_UNDERLINE
+        };
+        assert_eq!(color, style.foreground(role));
+    }
+}
+
 /// Selection recolors names without changing the glyph coordinates used to paint them.
 #[test]
 fn tree_names_keep_glyph_positions_when_selected() {

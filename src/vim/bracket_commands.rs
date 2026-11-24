@@ -35,6 +35,14 @@ pub(super) const BRACKET_BACKWARD: &[Continuation] = &[
     ("A", "vim_bracket.first_argument", false),
     ("d", "vim_bracket.previous_diagnostic", false),
     ("D", "vim_bracket.first_diagnostic", false),
+    ("e", "vim_bracket.previous_error", false),
+    ("w", "vim_bracket.previous_warning", false),
+    ("q", "vim_bracket.previous_quickfix", false),
+    ("Q", "vim_bracket.first_quickfix", false),
+    ("l", "vim_bracket.previous_location", false),
+    ("L", "vim_bracket.first_location", false),
+    ("Ctrl+q", "vim_bracket.previous_quickfix_file", false),
+    ("Ctrl+l", "vim_bracket.previous_location_file", false),
 ];
 
 /// Available completions after the closing square bracket.
@@ -64,6 +72,14 @@ pub(super) const BRACKET_FORWARD: &[Continuation] = &[
     ("A", "vim_bracket.last_argument", false),
     ("d", "vim_bracket.next_diagnostic", false),
     ("D", "vim_bracket.last_diagnostic", false),
+    ("e", "vim_bracket.next_error", false),
+    ("w", "vim_bracket.next_warning", false),
+    ("q", "vim_bracket.next_quickfix", false),
+    ("Q", "vim_bracket.last_quickfix", false),
+    ("l", "vim_bracket.next_location", false),
+    ("L", "vim_bracket.last_location", false),
+    ("Ctrl+q", "vim_bracket.next_quickfix_file", false),
+    ("Ctrl+l", "vim_bracket.next_location_file", false),
 ];
 
 /// Keys that remain valid bracket motions after an operator.
@@ -84,6 +100,14 @@ pub(super) fn is_motion_hint(label: &str) -> bool {
             | "A"
             | "d"
             | "D"
+            | "e"
+            | "w"
+            | "q"
+            | "Q"
+            | "l"
+            | "L"
+            | "Ctrl+q"
+            | "Ctrl+l"
     )
 }
 
@@ -190,8 +214,41 @@ impl Vim {
                     arguments: String::new(),
                 })
             }
-            "[d" | "]d" | "[D" | "]D" if self.mode == Mode::Normal && !self.read_only => {
+            "[q" | "]q" | "[Q" | "]Q" | "[l" | "]l" | "[L" | "]L" | "[Ctrl+q" | "]Ctrl+q"
+            | "[Ctrl+l" | "]Ctrl+l"
+                if self.mode == Mode::Normal =>
+            {
+                use super::QuickfixCommand as Q;
+                let location = command.ends_with(['l', 'L']);
+                let operation = match command {
+                    "[q" | "]q" => Q::Bracket {
+                        forward,
+                        count: steps,
+                    },
+                    "[Ctrl+q" | "]Ctrl+q" | "[Ctrl+l" | "]Ctrl+l" => Q::File {
+                        forward,
+                        count: steps,
+                    },
+                    "[l" => Q::Previous(steps),
+                    "]l" => Q::Next(steps),
+                    "[Q" | "[L" => count.map_or(Q::First, |n| Q::Current(Some(n))),
+                    _ => count.map_or(Q::Last, |n| Q::Current(Some(n))),
+                };
+                Some(Action::Quickfix {
+                    location,
+                    command: operation,
+                })
+            }
+            "[d" | "]d" | "[D" | "]D" | "[e" | "]e" | "[w" | "]w"
+                if self.mode == Mode::Normal && !self.read_only =>
+            {
+                use nanobug_plugin_sdk::DiagnosticSeverity;
                 Some(Action::BracketDiagnostic {
+                    severity: match command {
+                        "[e" | "]e" => Some(DiagnosticSeverity::Error),
+                        "[w" | "]w" => Some(DiagnosticSeverity::Warning),
+                        _ => None,
+                    },
                     forward,
                     edge: command.ends_with('D'),
                     count: steps,

@@ -1,16 +1,19 @@
 //! Render the three browser columns, prompt, and selection in the shared character grid.
 
 use super::{FilePicker, PickerEntry, Preview, PromptKind, delete_buttons, display_path, same_row};
-use crate::ui::file_icons::EntryIcon;
+use crate::ui::components::grid_confirm::{ButtonAlign, ConfirmButton, GridConfirm};
+use crate::ui::components::grid_file_row::{FileRowState, GridFileRow};
+use crate::ui::components::grid_popup::GridPopup;
+use crate::ui::components::grid_text_field::FieldLayout;
 use crate::{
-    grid::render::{Frame, MessageLevel, Rect},
+    grid::render::{Frame, Rect},
     ui::{
-        text::{TextSpacing, UNITS_PER_COLUMN},
-        theme::{ACCENT, CURRENT, GOLD, MUTED, SELECTION, TEXT},
+        text::TextSpacing,
+        theme::{ACCENT, GOLD, MUTED, TEXT},
     },
 };
 use nanobug::i18n;
-use std::{borrow::Cow, ops::Range, path::Path};
+use std::{borrow::Cow, path::Path};
 
 /// Layout in window cells. Column rectangles are relative to `area`.
 #[derive(Clone, Copy)]
@@ -102,66 +105,11 @@ impl PickerLayout {
         }
     }
 
-    /// Lay out `message` above the preview with severity `level` and measured text `spacing`.
-    pub fn message_frame(
-        self,
-        level: MessageLevel,
-        message: &str,
-        spacing: &TextSpacing,
-    ) -> (Rect, Frame) {
-        let width = spacing
-            .columns(message)
-            .max(level.heading_columns(spacing))
-            .min(self.preview.w.saturating_sub(4))
-            .min(54);
-        let mut remaining = message;
-        let mut lines = Vec::new();
-        for _ in 0..2 {
-            let end = spacing
-                .fitting_cells(remaining, width * UNITS_PER_COLUMN)
-                .last()
-                .map_or(0, |cell| cell.byte + cell.text.len());
-            if end == 0 || end == remaining.len() {
-                break;
-            }
-            let end = if remaining[end..].starts_with(' ') {
-                end
-            } else {
-                remaining[..end]
-                    .rfind(' ')
-                    .filter(|&split| split > 0)
-                    .unwrap_or(end)
-            };
-            lines.push(Cow::Borrowed(&remaining[..end]));
-            remaining = remaining[end..].trim_start();
-        }
-        lines.push(spacing.ellipsize(remaining, width));
-        let w = width + 4;
-        let area = Rect {
-            x: self.area.x + self.area.w.saturating_sub(w + 1),
-            y: self.area.y + 1,
-            w,
-            h: lines.len() + 2,
-        };
-        let (_, text) = level.colors();
-        let mut frame = Frame::new(area.w, area.h);
-        frame.message_border(level, spacing);
-        for (row, line) in lines.into_iter().enumerate() {
-            frame.label(row + 1, 2..area.w - 2, &line, text, spacing);
-        }
-        (area, frame)
-    }
-
     /// Center the search or filter box beneath the column headings.
     fn floating_prompt_area(self) -> Rect {
         let w = self.area.w.saturating_sub(4).min(64);
         let h = 3;
-        Rect {
-            x: self.area.x + (self.area.w - w) / 2,
-            y: self.area.y + self.current.y.min(self.area.h.saturating_sub(h)),
-            w,
-            h,
-        }
+        GridPopup::new(self.area).centered_on_row(self.area.y + self.current.y, w, h)
     }
 
     /// Relative row of the active prompt, jump hints or confirmation question.
@@ -186,25 +134,19 @@ impl PickerLayout {
     }
 
     /// Positions of the localized delete buttons and their actions.
-    fn buttons(self, spacing: &TextSpacing) -> impl Iterator<Item = (bool, Range<usize>)> {
-        let mut start = 2;
-        delete_buttons().into_iter().map(move |(confirm, caption)| {
-            let width: usize = caption
-                .spans()
-                .into_iter()
-                .map(|(text, _)| spacing.columns(text))
-                .sum();
-            let slot = start..(start + width).min(self.area.w.saturating_sub(1));
-            start = slot.end + 2;
-            (confirm, slot)
-        })
+    fn buttons(self, spacing: &TextSpacing) -> Vec<ConfirmButton<bool>> {
+        GridConfirm::new(delete_buttons()).slots(
+            2..self.area.w.saturating_sub(1),
+            ButtonAlign::Start,
+            2,
+            spacing,
+        )
     }
 
     /// Resolve a click in area-relative `x`, `y` to the displayed confirmation button.
     pub fn delete_hit(self, x: usize, y: usize, spacing: &TextSpacing) -> Option<bool> {
         (y == self.delete_buttons_row()).then_some(())?;
-        self.buttons(spacing)
-            .find_map(|(confirm, slot)| slot.contains(&x).then_some(confirm))
+        GridConfirm::hit(&self.buttons(spacing), x)
     }
 }
 
@@ -418,38 +360,18 @@ impl FilePicker {
         matched: bool,
         spacing: &TextSpacing,
     ) {
-        let y = rect.y + row;
+        let mut file = GridFileRow::new(
+            &entry.path,
+            entry.directory,
+            selected,
+            rect.x..rect.x + rect.w,
+        );
         if selected {
-            frame.tint(
-                y,
-                rect.x,
-                rect.x + rect.w,
-                if active { SELECTION } else { CURRENT },
-            );
+            file.state = FileRowState::selection(active);
         }
-        if self.marked.contains(&entry.path) {
-            frame.text(rect.x + 1, y, "●", GOLD, 1);
-        }
-        frame.icon(
-            rect.x + 2,
-            y,
-            EntryIcon::for_path(&entry.path, entry.directory, selected).image(),
-        );
-        let slot = rect.x + 4..rect.x + rect.w;
-        let color = if matched {
-            GOLD
-        } else if selected && active {
-            ACCENT
-        } else {
-            TEXT
-        };
-        frame.label(
-            y,
-            slot.clone(),
-            &spacing.ellipsize(&entry.name(), slot.len()),
-            color,
-            spacing,
-        );
+        file.matched = matched;
+        file.mark = self.marked.contains(&entry.path).then_some(rect.x + 1);
+        frame.file_row(rect.y + row, &file, spacing, None);
     }
 
     /// Draw directory rows or the text gutter and preview status in the right column.
@@ -573,8 +495,7 @@ impl FilePicker {
         spacing: &TextSpacing,
     ) -> Option<Frame> {
         let area = self.floating_prompt_area(layout)?;
-        let mut frame = Frame::new(area.w, area.h);
-        frame.border(i18n::text(self.prompt_label()), true, false, spacing);
+        let mut frame = Frame::titled(area, i18n::text(self.prompt_label()), spacing);
         self.draw_prompt(&mut frame, layout, spacing);
         Some(frame)
     }
@@ -602,18 +523,8 @@ impl FilePicker {
                 GOLD,
                 spacing,
             );
-            for ((_, slot), (_, caption)) in layout.buttons(spacing).zip(delete_buttons()) {
-                let mut x = slot.start;
-                for (text, style) in caption.spans() {
-                    x = frame.styled_label(
-                        layout.delete_buttons_row(),
-                        x..slot.end,
-                        text,
-                        TEXT,
-                        spacing,
-                        style,
-                    );
-                }
+            for button in layout.buttons(spacing) {
+                frame.button(layout.delete_buttons_row(), &button, TEXT, spacing);
             }
             return;
         }
@@ -634,41 +545,21 @@ impl FilePicker {
 
     /// Paint input into its owning `frame`, using `layout` and `spacing` for caret-aligned scrolling.
     fn draw_prompt(&self, frame: &mut Frame, layout: PickerLayout, spacing: &TextSpacing) {
-        let Some((start, caret, first)) = self.prompt_view(layout, spacing) else {
+        let Some((slot, text)) = self.prompt_view(layout, spacing) else {
             return;
         };
-        let prompt = self.prompt.as_ref().expect("prompt view");
         let floating = self.floating_prompt_area(layout);
-        let input = floating.map_or(layout.input_row(), |_| 1);
-        let end = floating.unwrap_or(layout.area).w - 2;
+        let y = slot.y;
         if floating.is_none() {
             frame.label(
-                input,
-                2..start,
+                y,
+                2..slot.x,
                 i18n::text(self.prompt_label()),
                 ACCENT,
                 spacing,
             );
         }
-        let mut text = prompt.value[first..prompt.caret].to_owned();
-        text.push_str(&self.composition.text);
-        text.push_str(&prompt.value[prompt.caret..]);
-        let (anchor, cursor) = if prompt.anchor < prompt.caret {
-            (prompt.anchor, prompt.caret)
-        } else {
-            (prompt.caret, prompt.anchor)
-        };
-        if cursor > first && cursor != anchor {
-            let x = start + spacing.columns(&prompt.value[first..anchor.max(first)]);
-            frame.tint(
-                input,
-                x,
-                (x + spacing.columns(&prompt.value[anchor.max(first)..cursor])).min(end),
-                SELECTION,
-            );
-        }
-        frame.label(input, start..end, &text, TEXT, spacing);
-        debug_assert!(caret < end);
+        frame.text_field(y, slot.x..slot.x + slot.w, &text, spacing);
     }
 
     /// Catalog key for the label of the active prompt.
@@ -682,28 +573,62 @@ impl FilePicker {
         }
     }
 
-    /// Return panel-local text/caret columns and the first visible byte for `layout` and `spacing`.
+    /// Return the frame-local editable slot and the shared layout used for painting and input.
     fn prompt_view(
         &self,
         layout: PickerLayout,
         spacing: &TextSpacing,
-    ) -> Option<(usize, usize, usize)> {
+    ) -> Option<(Rect, FieldLayout<'_>)> {
         let prompt = self.prompt.as_ref()?;
         let floating = self.floating_prompt_area(layout);
         let area = floating.unwrap_or(layout.area);
-        let start = if floating.is_some() {
+        let x = if floating.is_some() {
             2
         } else {
-            (spacing.columns(i18n::text(self.prompt_label())) + 3).min(area.w - 4)
+            (spacing.columns(i18n::text(self.prompt_label())) + 3).min(area.w.saturating_sub(4))
         };
-        let prefix = &prompt.value[..prompt.caret];
-        let width = spacing.columns(prefix) * UNITS_PER_COLUMN;
-        let available = (area.w - 3 - start) * UNITS_PER_COLUMN;
-        let first = spacing
-            .cells(prefix)
-            .find(|cell| width.saturating_sub(cell.start) <= available)
-            .map_or(prefix.len(), |cell| cell.byte);
-        Some((start, start + spacing.columns(&prefix[first..]), first))
+        let slot = Rect {
+            x,
+            y: floating.map_or(layout.input_row(), |_| 1),
+            w: area.w.saturating_sub(x + 2),
+            h: 1,
+        };
+        Some((
+            slot,
+            prompt
+                .field
+                .layout(&prompt.value, &self.composition, slot.w, spacing),
+        ))
+    }
+
+    /// Position the insertion point inside the same visible text slot as the IME caret.
+    pub(in crate::grid) fn press_prompt(
+        &mut self,
+        layout: PickerLayout,
+        position: gpui::Point<gpui::Pixels>,
+        metrics: crate::grid::render::Metrics,
+        spacing: &TextSpacing,
+        extend: bool,
+    ) {
+        if !self.composition.is_empty() {
+            return;
+        }
+        let Some((mut slot, text)) = self.prompt_view(layout, spacing) else {
+            return;
+        };
+        let area = self.floating_prompt_area(layout).unwrap_or(layout.area);
+        slot.x += area.x;
+        slot.y += area.y;
+        let (x, y) = metrics.cell(position);
+        if !slot.contains(x, y) {
+            return;
+        }
+        let byte = text.byte_at(
+            f32::from(position.x - slot.pixels(metrics).left()) / metrics.cw,
+            spacing,
+        );
+        let prompt = self.prompt.as_mut().unwrap();
+        prompt.field.place(&prompt.value, byte, extend);
     }
 
     /// Return the window-relative caret and input/visibility flags for `layout` and text `spacing`.
@@ -713,12 +638,12 @@ impl FilePicker {
         spacing: &TextSpacing,
     ) -> (f32, f32, f32, bool, bool) {
         let area = layout.area;
-        if let Some((_, x, _)) = self.prompt_view(layout, spacing) {
+        if let Some((slot, text)) = self.prompt_view(layout, spacing) {
             let floating = self.floating_prompt_area(layout);
             let input_area = floating.unwrap_or(area);
             return (
-                (input_area.x + x) as f32,
-                (input_area.y + floating.map_or(layout.input_row(), |_| 1)) as f32,
+                (input_area.x + slot.x) as f32 + text.caret_columns(),
+                (input_area.y + slot.y) as f32,
                 1.,
                 true,
                 true,
@@ -811,6 +736,54 @@ mod tests {
         assert!(picker.floating_prompt_area(search_layout) == Some(filter));
         assert_eq!(search_layout.current.h, layout.current.h);
         assert_eq!(picker.prompt_label(), "picker.search");
+    }
+
+    /// A composing rename replaces the selected stem. The suffix and click position survive the native commit.
+    #[test]
+    fn rename_uses_one_field_for_preedit_clicks_and_commit() {
+        use crate::grid::render::Metrics;
+        let metrics = Metrics {
+            cw: 9.,
+            lh: 18.,
+            font_size: 16.,
+            origin: gpui::point(gpui::px(2.), gpui::px(5.)),
+        };
+        let spacing = TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 9.);
+        let name = "旧名👩‍💻.rs";
+        let mut picker = FilePicker {
+            prompt: Some(Prompt::new(
+                PromptKind::Rename(name.into()),
+                name.into(),
+                name.find('.').unwrap(),
+            )),
+            ..FilePicker::default()
+        };
+        let layout = PickerLayout::new(
+            Rect {
+                x: 4,
+                y: 3,
+                w: 72,
+                h: 20,
+            },
+            Some(&picker),
+        );
+        picker.composition.mark(None, "新名", None);
+        assert_eq!(
+            picker.prompt_view(layout, &spacing).unwrap().1.text(),
+            "新名.rs"
+        );
+        assert_eq!(picker.prompt.as_ref().unwrap().value, name);
+        picker.prompt.as_mut().unwrap().insert("新名");
+        picker.composition.clear();
+        let (slot, field) = picker.prompt_view(layout, &spacing).unwrap();
+        assert_eq!(field.text(), "新名.rs");
+        let at = metrics.at(
+            (layout.area.x + slot.x) as f32,
+            (layout.area.y + slot.y) as f32 + 0.5,
+        );
+        picker.press_prompt(layout, at, metrics, &spacing, false);
+        picker.prompt.as_mut().unwrap().insert("a");
+        assert_eq!(picker.prompt.unwrap().value, "a新名.rs");
     }
 
     /// Columns fill the lower grid, with space reserved for active commands.

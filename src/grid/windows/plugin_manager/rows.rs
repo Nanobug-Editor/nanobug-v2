@@ -787,14 +787,14 @@ fn config(ui: &RowContext<'_>, namespace: &str, manifest: &Manifest, rules: bool
             rows.push(row(
                 format!("{}  ·  {label}", module.id),
                 "Enter true, false, inherit, or a JS function body.",
-                Target::Prompt(Input {
-                    kind: Prompt::Rule {
+                Target::Prompt(Input::new(
+                    Prompt::Rule {
                         scope,
                         owner: owner.clone(),
                         module: module.id.clone(),
                     },
-                    value: text.into(),
-                }),
+                    text.into(),
+                )),
             ));
         }
     } else {
@@ -823,7 +823,7 @@ fn config(ui: &RowContext<'_>, namespace: &str, manifest: &Manifest, rules: bool
                     .unwrap_or_default();
                 rows.push(row(format!("Cargo project · {}", if value.is_empty() { "Choose a path…" } else { &value }),
                     "The selected Cargo project can run build scripts with your current system permissions.",
-                    Target::Prompt(Input { kind: Prompt::DevSource { namespace: namespace.into(), settings: settings.clone() }, value })));
+                    Target::Prompt(Input::new(Prompt::DevSource { namespace: namespace.into(), settings: settings.clone() }, value))));
                 if settings.source.is_some() {
                     let mut toggled = settings.clone();
                     toggled.automatic = !settings.automatic;
@@ -850,13 +850,13 @@ fn config(ui: &RowContext<'_>, namespace: &str, manifest: &Manifest, rules: bool
                 rows.push(row(
                     format!("Shortcut · {} · {effective}", command.title),
                     "Global mapping for every project. Apply to change it.",
-                    Target::Prompt(Input {
-                        kind: Prompt::Shortcut {
+                    Target::Prompt(Input::new(
+                        Prompt::Shortcut {
                             namespace: namespace.into(),
                             command: command.id.clone(),
                         },
                         value,
-                    }),
+                    )),
                 ));
             }
         }
@@ -916,14 +916,11 @@ fn config(ui: &RowContext<'_>, namespace: &str, manifest: &Manifest, rules: bool
                         } else {
                             "Enter a new credential, then choose Apply to save it."
                         },
-                        Target::Prompt(Input {
-                            kind: Prompt::Credential {
+                        Target::Prompt(Input::new(Prompt::Credential {
                                 namespace: namespace.into(),
                                 slot: id.clone(),
                                 value: zeroize::Zeroizing::new(String::with_capacity(2048)),
-                            },
-                            value: String::new(),
-                        }),
+                            }, String::new())),
                     ));
                     rows.push(row(
                         format!("Remove saved {}", decl.title),
@@ -961,16 +958,16 @@ fn config(ui: &RowContext<'_>, namespace: &str, manifest: &Manifest, rules: bool
                 )
                 .trim_start()
                 .to_owned(),
-                Target::Prompt(Input {
-                    kind: Prompt::Setting {
+                Target::Prompt(Input::new(
+                    Prompt::Setting {
                         scope,
                         owner: owner.clone(),
                         id: id.clone(),
                         renamed_from: decl.renamed_from.clone(),
                         original: current.cloned(),
                     },
-                    value: text,
-                }),
+                    text,
+                )),
             ));
             if let Some(settings) = values.map(|plugin| &plugin.settings)
                 && !settings.contains_key(id)

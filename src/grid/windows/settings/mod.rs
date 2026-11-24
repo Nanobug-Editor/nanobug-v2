@@ -5,13 +5,17 @@ mod input;
 mod selector;
 mod view;
 
+use crate::ui::components::{
+    grid_button_row::{ButtonSlot, GridButtonRow},
+    grid_text_field::GridTextField,
+};
 use crate::{
-    grid::{
+    grid::render::{Metrics, Panel},
+    ui::{
+        components::grid_tree::{GridTree, TreeRoots},
+        ime::Composition,
         mnemonic::Mnemonic,
-        render::{Metrics, Panel},
-        text_field,
     },
-    ui::ime::Composition,
 };
 use gpui::{App, AppContext, Entity};
 use nanobug::{animation::scroll::GridScroll, i18n};
@@ -136,14 +140,8 @@ enum Pane {
 
 /// Transient changes in a dropdown or text editor are committed to the form only on completion.
 enum Editor {
-    Input {
-        text: String,
-        field: text_field::Field,
-    },
-    List {
-        cursor: usize,
-        value: Value,
-    },
+    Input { text: String, field: GridTextField },
+    List { cursor: usize, value: Value },
 }
 
 #[derive(Clone, Copy)]
@@ -163,10 +161,12 @@ const BUTTONS: [(Button, &str); 5] = [
     (Button::Confirm, "settings.confirm"),
 ];
 
-fn buttons() -> impl Iterator<Item = (Button, Mnemonic)> {
-    BUTTONS
-        .into_iter()
-        .map(|(button, key)| (button, Mnemonic::parse(i18n::text(key))))
+fn buttons() -> GridButtonRow<Button> {
+    GridButtonRow::new(
+        BUTTONS
+            .into_iter()
+            .map(|(button, key)| (button, Mnemonic::parse(i18n::text(key)))),
+    )
 }
 
 /// A stable directory node. Parent links keep the hierarchy independent of backend page order.
@@ -178,6 +178,17 @@ struct Node {
 }
 
 impl Node {
+    /// Build shared rows from stable node indices, including asynchronously appended pages.
+    fn visible_tree(nodes: &[Self], expanded: &HashSet<usize>) -> GridTree {
+        GridTree::from_parents(
+            TreeRoots::Separate,
+            nodes
+                .iter()
+                .enumerate()
+                .map(|(id, node)| (node.parent, node.branch && expanded.contains(&id))),
+        )
+    }
+
     /// Add missing ancestors for a page without disturbing any existing node indices.
     fn add_page(nodes: &mut Vec<Self>, page: &Page, index: usize) {
         let mut parent = None;
@@ -210,6 +221,8 @@ pub(in crate::grid) struct Settings {
     forms: Vec<Form>,
     nodes: Vec<Node>,
     expanded: HashSet<usize>,
+    /// Shared visible order for painting, pointer hits, keyboard navigation and the caret.
+    visible: GridTree,
     tree_row: usize,
     page: usize,
     row: usize,
@@ -256,6 +269,7 @@ impl Settings {
             .collect();
         Self {
             forms: pages.into_iter().map(Form::new).collect(),
+            visible: Node::visible_tree(&nodes, &expanded),
             nodes,
             expanded,
             tree_row,
@@ -288,6 +302,9 @@ impl Settings {
             Node::add_page(&mut self.nodes, &page, self.forms.len());
             self.forms.push(Form::new(page));
         }
+        if self.nodes.len() == previous_len {
+            return;
+        }
         self.expanded.extend(
             self.nodes
                 .iter()
@@ -295,6 +312,7 @@ impl Settings {
                 .skip(previous_len)
                 .filter_map(|(i, n)| n.parent.is_none().then_some(i)),
         );
+        self.visible = Node::visible_tree(&self.nodes, &self.expanded);
     }
 
     /// Gather writes across every visited page or only the currently displayed one for Apply.
@@ -444,24 +462,17 @@ impl Settings {
         self.field().map(|field| field.id.as_str())
     }
 
-    /// Enumerate only visible nodes in tree order, even when backend pages interleave subtrees.
-    fn visible_tree(&self) -> Vec<usize> {
-        fn children(settings: &Settings, parent: Option<usize>, out: &mut Vec<usize>) {
-            for (id, node) in settings
-                .nodes
-                .iter()
-                .enumerate()
-                .filter(|(_, n)| n.parent == parent)
-            {
-                out.push(id);
-                if node.branch && settings.expanded.contains(&id) {
-                    children(settings, Some(id), out);
-                }
-            }
+    /// Change the expansion state and reindex visible rows together.
+    fn set_expanded(&mut self, id: usize, open: bool) -> bool {
+        let changed = if open {
+            self.expanded.insert(id)
+        } else {
+            self.expanded.remove(&id)
+        };
+        if changed {
+            self.visible = Node::visible_tree(&self.nodes, &self.expanded);
         }
-        let mut out = Vec::new();
-        children(self, None, &mut out);
-        out
+        changed
     }
 
     fn field(&self) -> Option<&Field> {

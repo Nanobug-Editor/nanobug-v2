@@ -79,10 +79,7 @@ impl Settings {
         }
         let mut x = bounds.x as f32;
         let row = match self.cursor_region() {
-            CursorRegion::Tree => self
-                .visible_tree()
-                .iter()
-                .position(|&id| id == self.tree_row)?,
+            CursorRegion::Tree => self.visible.position(self.tree_row)?,
             CursorRegion::Form => {
                 if let Some(Editor::Input { text, field }) = &self.editor {
                     let layout = field.layout(

@@ -199,12 +199,12 @@ fn sql_dialect_release_packages_route_presented_features() {
         );
         let view = wait(&editor, |view| {
             view.document_diagnostics
-                .get(active)
+                .get(&(active.clone(), 1))
                 .is_some_and(|diagnostics| diagnostics.version == (1, revision))
         });
-        assert!(!view.document_diagnostics.contains_key(other));
+        assert!(!view.document_diagnostics.contains_key(&(other.clone(), 1)));
         assert_eq!(
-            view.document_diagnostics[active]
+            view.document_diagnostics[&(active.clone(), 1)]
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.message.starts_with("PRS:")),
@@ -321,7 +321,7 @@ fn sql_project_prelaunch_uses_the_authorized_saved_dialect() {
             })
             && view
                 .document_diagnostics
-                .get(&postgres)
+                .get(&(postgres.clone(), 2))
                 .is_some_and(|diagnostics| {
                     diagnostics.version == (2, 0)
                         && diagnostics
@@ -329,7 +329,7 @@ fn sql_project_prelaunch_uses_the_authorized_saved_dialect() {
                             .iter()
                             .any(|diagnostic| diagnostic.message.starts_with("PRS:"))
                 })
-            && !view.document_diagnostics.contains_key(&tsql)
+            && !view.document_diagnostics.contains_key(&(tsql.clone(), 2))
     });
 
     project.document = Some(readme);

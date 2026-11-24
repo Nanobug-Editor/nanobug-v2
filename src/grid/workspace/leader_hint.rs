@@ -3,8 +3,9 @@
 use super::{
     Workspace,
     keyboard::{LeaderAvailability, LeaderPrefix, PendingPrefix},
-    layout::{FOOTER_ROWS, Focus},
+    layout::{FOOTER_ROWS, Focus, pane_border_offsets},
 };
+use crate::ui::components::grid_popup::GridPopup;
 use crate::{
     grid::{
         render::{Frame, LabelStyle, Metrics, Rect, key_hint_slots},
@@ -167,6 +168,8 @@ impl<'a> ActiveHint<'a> {
 struct HintLayout {
     /// Popup bounds within the workspace.
     area: Rect,
+    /// Signed logical pixels aligning the popup's bottom stroke with the docked pane.
+    bottom_offset: Pixels,
     /// Maximum number of bindings stacked above the footer.
     rows: usize,
     /// Number of bindings that fit on a page.
@@ -331,6 +334,10 @@ impl Workspace {
 
     /// Read the popup only after its delay, or immediately for spelling candidates.
     fn visible_sequence_hint(&self) -> Option<ActiveHint<'_>> {
+        let viewport = self.sequence_hint_viewport();
+        if viewport.w < 4 || viewport.h < 5 {
+            return None;
+        }
         self.active_sequence_hint().filter(|hint| {
             matches!(self.hint_delay, HintDelay::Visible) || matches!(hint, ActiveHint::Spelling(_))
         })
@@ -358,12 +365,9 @@ impl Workspace {
             h: height,
             ..
         } = layout.area;
-        let mut frame = Frame::new(columns, height);
-        let title = hint.title();
+        let mut frame = Frame::titled(layout.area, &hint.title(), &self.spacing);
+        frame.offset_pane_borders(px(0.), layout.bottom_offset);
         let custom_mapping = matches!(hint, ActiveHint::Mapping(_));
-        frame.border_with_title(true, false, false, |frame, slot, color| {
-            frame.label(0, slot, &title, color, &self.spacing)
-        });
         let column_width = columns / rows.len().div_ceil(layout.rows).max(1);
         for (column, bindings) in rows.chunks(layout.rows).enumerate() {
             let left = column * column_width;
@@ -375,7 +379,7 @@ impl Workspace {
                 .max()
                 .unwrap_or(1)
                 .min(column_width.saturating_sub(10));
-            let end = left + column_width - padding;
+            let end = left + column_width.saturating_sub(padding);
             for (index, &(label, description, group)) in bindings.iter().enumerate() {
                 let row = index + 1;
                 let label = if custom_mapping {
@@ -406,9 +410,9 @@ impl Workspace {
             }
         }
         if matches!(hint, ActiveHint::Leader(..)) {
-            frame.key_hints(height - 2, self.metrics.cw, &self.spacing, hint_captions());
+            frame.icon_key_hints(height - 2, self.metrics.cw, &self.spacing, hint_captions());
         } else {
-            frame.key_hints(height - 2, self.metrics.cw, &self.spacing, cancel_hint());
+            frame.icon_key_hints(height - 2, self.metrics.cw, &self.spacing, cancel_hint());
         }
         if pages > 1 {
             let status = format!(
@@ -431,10 +435,8 @@ impl Workspace {
             .update(cx, |panel, cx| panel.set(frame, cx));
     }
 
-    /// Anchor `hint` at the right above the history window or status bar, wrapping longer lists.
-    fn sequence_hint_layout(&self, hint: &ActiveHint<'_>) -> HintLayout {
-        let pane_hint = !matches!(hint, ActiveHint::Leader(..));
-        let right = self.layout.visible_cols;
+    /// Exclude the top tab row and any footer or open command history from the hint's viewport.
+    fn sequence_hint_viewport(&self) -> Rect {
         let bottom = self
             .layout
             .visible_rows
@@ -442,12 +444,62 @@ impl Workspace {
         let bottom = self
             .command_window_area()
             .map_or(bottom, |history| history.y.min(bottom));
+        Rect {
+            x: 0,
+            y: 1,
+            w: self.layout.visible_cols,
+            h: bottom.saturating_sub(1),
+        }
+    }
+
+    /// Set the Leader's lower-right anchor from the visible docked panes within `viewport`.
+    /// Return the available grid and the bottom stroke offset in logical pixels.
+    fn leader_hint_viewport(&self, viewport: Rect) -> (Rect, Pixels) {
+        if self.file_picker.is_some() {
+            return (viewport, px(0.));
+        }
+        let panes = self.workspace_pane_areas();
+        let Some((pane, visible)) = panes
+            .iter()
+            .map(|&pane| (pane, self.layout.visible_region(pane)))
+            .filter(|(_, visible)| visible.w > 1 && visible.h > 1)
+            .max_by_key(|(_, visible)| (visible.y + visible.h, visible.x + visible.w))
+        else {
+            return (viewport, px(0.));
+        };
+        let right = (visible.x + visible.w).min(viewport.x + viewport.w);
+        let bottom = (visible.y + visible.h).min(viewport.y + viewport.h);
+        let anchored = Rect {
+            w: right.saturating_sub(viewport.x),
+            h: bottom.saturating_sub(viewport.y),
+            ..viewport
+        };
+        if anchored.w < 4 || anchored.h < 5 {
+            return (viewport, px(0.));
+        }
+        let bottom_offset = if bottom == pane.y + pane.h {
+            pane_border_offsets(pane, &panes, self.metrics).1
+        } else {
+            px(0.)
+        };
+        (anchored, bottom_offset)
+    }
+
+    /// Position `hint` with its right edge anchored and wrap longer lists.
+    fn sequence_hint_layout(&self, hint: &ActiveHint<'_>) -> HintLayout {
+        let viewport = self.sequence_hint_viewport();
+        let (viewport, bottom_offset) = if matches!(hint, ActiveHint::Leader(..)) {
+            self.leader_hint_viewport(viewport)
+        } else {
+            (viewport, px(0.))
+        };
+        let available = viewport.h.saturating_sub(4).max(1);
         let mut rows = hint.len().max(1);
         let mut columns = HINT_COLUMNS;
-        let mut page_size = rows;
+        let page_size;
         if matches!(hint, ActiveHint::Mapping(_)) {
             // Give command text one wide column and page vertically when the list grows.
-            rows = rows.min(bottom.saturating_sub(5).max(1));
+            rows = rows.min(available);
             page_size = rows;
             let (key_width, command_width) = hint.rows().into_iter().fold(
                 (0, 0),
@@ -461,10 +513,9 @@ impl Workspace {
             columns = columns
                 .max(key_width + command_width + 8)
                 .max(self.spacing.columns(&hint.title()) + 5);
-        } else if pane_hint {
+        } else if !matches!(hint, ActiveHint::Leader(..)) {
             // Balance the bindings when the viewport cannot fit a single column.
-            let available = bottom.saturating_sub(5).max(1);
-            let max_columns = (right / 12).max(1);
+            let max_columns = (viewport.w / 12).max(1);
             let column_count = rows.div_ceil(available).min(max_columns);
             rows = rows.div_ceil(column_count).min(available);
             page_size = rows * column_count;
@@ -475,17 +526,15 @@ impl Workspace {
             } else {
                 HINT_COLUMNS
             };
+        } else {
+            rows = rows.min(available);
+            page_size = rows;
         }
         // Leave a blank row between the bindings and the footer.
-        let width = columns.min(right.max(16));
         let height = rows + 4;
         HintLayout {
-            area: Rect {
-                x: right.saturating_sub(width),
-                y: bottom.saturating_sub(height).max(1),
-                w: width,
-                h: height,
-            },
+            area: GridPopup::new(viewport).bottom_right(columns, height),
+            bottom_offset,
             rows,
             page_size,
         }
@@ -507,7 +556,7 @@ impl Workspace {
         true
     }
 
-    /// Return the active hint's bounds at the workspace's lower-right corner.
+    /// Return the active hint's placed grid bounds for painting and hit testing.
     pub(super) fn sequence_hint_area(&self) -> Option<Rect> {
         let hint = self.visible_sequence_hint()?;
         Some(self.sequence_hint_layout(&hint).area)
@@ -684,6 +733,10 @@ impl Workspace {
             vec![(HintControl::Close, slot)]
         };
         for (control, slot) in controls {
+            let slot = slot.start..slot.end.min(area.w);
+            if slot.is_empty() {
+                continue;
+            }
             hint = hint.child(
                 div()
                     .id(("sequence-hint-control", slot.start))

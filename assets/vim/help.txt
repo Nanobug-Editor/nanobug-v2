@@ -1,5 +1,36 @@
 Nanobug Vim Help
 
+                                         *diagnostic* *vim.diagnostic* *:Trouble*
+Use Space c d or CTRL-W d for diagnostics on the cursor line. Use [d and
+]d to jump between diagnostics, [e and ]e for errors, [w and ]w for
+warnings. Space x x toggles live project diagnostics. Space x X limits
+the view to the current buffer. Space u d toggles diagnostic decorations.
+Space s d/D searches project/buffer diagnostics. Space s q/l searches
+Quickfix/the location list. Enter confirms a search, n/N moves between
+matches, and Enter on a result jumps to its source.
+
+                                         *quickfix* *location-list* *:copen* *:lopen*
+To review a fixed list of the diagnostics already reported by plugins:
+
+    :lua vim.diagnostic.setqflist()
+    :lua vim.diagnostic.setloclist()
+
+The first command fills the project's Quickfix list. The second fills
+the source window's location list from its current buffer. By default,
+results open in a split. Pass {open=false} to fill a list and keep editing.
+
+Use :cnext and :cprevious to move through Quickfix, :cfirst and :clast
+for the endpoints, and :cc 3 to visit entry 3. Use :lnext, :lprevious,
+:lfirst, :llast and :ll 3 for the location list. Space x q and Space x l
+toggle the respective list windows. In a list, press Enter to jump to
+the selected source position or q to close the window.
+
+                                        *:chistory* *:colder* *:cnewer*
+Use :Cfilter /pattern/ to keep matching entries in a new list, or
+:Cfilter! /pattern/ to exclude them. :colder restores the original list,
+:cnewer returns to the filtered list, and :chistory shows the history.
+Use :Lfilter, :lolder, :lnewer and :lhistory for the location list.
+
                                                       *g==*
 Move to a Vim example and press g== to run the complete block.
 

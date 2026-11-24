@@ -1,7 +1,7 @@
 //! Windows renderer and real workspace input coverage for the unified settings dialog.
 
 use super::super::{Workspace, native_test};
-use crate::grid::{mnemonic::Mnemonic, windows::settings::Action};
+use crate::{grid::windows::settings::Action, ui::mnemonic::Mnemonic};
 use anyhow::{Context as _, Result, ensure};
 use gpui::{
     AppContext, AsyncApp, Context, EntityInputHandler, KeyDownEvent, Keystroke, MouseButton,
@@ -37,6 +37,80 @@ fn keys(
         );
     }
     Ok(())
+}
+
+/// A single click folds a settings branch. Late plugin pages respect its fold and keep their stable IDs.
+#[test]
+#[ignore = "requires the Windows DirectWrite and DirectX renderer"]
+fn native_settings_tree_clicks_follow_late_pages() -> Result<()> {
+    use crate::grid::windows::settings::{Page, Settings};
+
+    let temp = tempfile::tempdir()?;
+    let options = Options::take(
+        &mut vec![
+            "--no-plugins".into(),
+            "--plugin-profile".into(),
+            "profile".into(),
+        ],
+        temp.path(),
+    )?;
+    native_test::run_async_visible(
+        temp.path().to_owned(),
+        options,
+        |_| {},
+        async move |handle, app| {
+            let _temp = temp;
+            handle.update(app, |ws, win, cx| -> Result<()> {
+                ws.sync(win, cx);
+                let page = |id: &str, root: &str, leaf: &str| Page {
+                    id: id.into(),
+                    path: vec![root.into(), leaf.into()],
+                    fields: vec![],
+                };
+                let mut settings = Settings::new(
+                    vec![
+                        page("indent", "Editor", "Indent"),
+                        page("build", "Plugins", "Build"),
+                    ],
+                    ws.metrics,
+                    cx,
+                );
+                let area = ws.settings_area();
+                ensure!(
+                    area.w >= 32 && area.h >= 9,
+                    "unmeasured settings viewport {area:?}"
+                );
+                let click = |settings: &mut Settings, row: usize| {
+                    let point = ws
+                        .metrics
+                        .at((area.x + 2) as f32, (area.y + 1 + row) as f32 + 0.5);
+                    settings.click(point, area, ws.metrics, &ws.spacing);
+                };
+                click(&mut settings, 0);
+                ensure!(
+                    settings.selected_tree_path() == ["Editor"],
+                    "root click landed on {:?}",
+                    settings.selected_tree_path()
+                );
+                settings.append_pages(vec![page("theme", "Editor", "Theme")]);
+                click(&mut settings, 1);
+                ensure!(
+                    settings.selected_tree_path() == ["Plugins"],
+                    "collapsed row hit {:?}",
+                    settings.selected_tree_path()
+                );
+                click(&mut settings, 0);
+                click(&mut settings, 2);
+                ensure!(
+                    settings.selected_page_id() == "theme",
+                    "expanded row opened {}",
+                    settings.selected_page_id()
+                );
+                Ok(())
+            })??;
+            Ok(())
+        },
+    )
 }
 
 /// Locate a footer button by the visible widths of its translated character spans.

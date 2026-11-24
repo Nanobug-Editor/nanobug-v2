@@ -1,6 +1,7 @@
 //! Character frames and the retained panel renderer.
 //! Frames contain derived display data; panels retain shaped rows until those rows change.
 
+mod components;
 mod cursor;
 mod geometry;
 mod layer;
@@ -9,31 +10,27 @@ mod panel;
 mod popup;
 mod prompt;
 
+use crate::ui::components::grid_toast::MESSAGE_ICON_COLUMNS;
+pub(crate) use crate::ui::grid_geometry::Rect;
+pub(in crate::grid) use crate::ui::{components::grid_toast::MessageLevel, text::LabelStyle};
 pub(in crate::grid) use cursor::Cursor;
+pub(crate) use geometry::Metrics;
 pub(in crate::grid) use geometry::exposed_regions;
-pub(crate) use geometry::{Metrics, Rect};
 pub(in crate::grid) use layer::GridLayer;
 pub(in crate::grid) use outline::{OutlineStyle, outline_path, solid_stroke_width};
 pub(in crate::grid) use panel::sample_waves;
 pub(crate) use panel::{CursorCell, Panel};
-pub(in crate::grid) use popup::{
-    PopupBackdrop, dashed_outline_element, paint_dashed_outline, popup_outline,
-};
+pub(in crate::grid) use popup::{dashed_outline_element, dialog_backdrop, paint_dashed_outline};
 pub(in crate::grid) use prompt::{PromptRow, SEARCH_ICON};
 
 use crate::ui::{
+    components::grid_window::{GridWindow, title_hit_columns},
     icons::{Icon, KeyIcon},
     text::{TextCell, TextSpacing, UNITS_PER_COLUMN},
-    theme::{
-        ACCENT, ERROR_BORDER, ERROR_TEXT, GOLD, MUTED, Style, TEXT, TREE_GUIDE, ThemeComponent,
-        WARNING_BORDER, WARNING_TEXT,
-    },
+    theme::{ACCENT, GOLD, MUTED, Style, TEXT, TREE_GUIDE, ThemeComponent},
 };
 use gpui::{Bounds, Pixels, Point, point, px, size};
-use nanobug::{
-    i18n,
-    vim::{HighlightAttributes, HighlightStyle},
-};
+use nanobug::vim::{HighlightAttributes, HighlightStyle};
 use outline::{EdgeGaps, Outline};
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
@@ -42,66 +39,10 @@ use unicode_width::UnicodeWidthStr;
 /// Separator between complete action and key captions in a grid footer.
 pub(in crate::grid) const SHORTCUT_SEPARATOR: &str = " | ";
 
-/// Format a localized `action` followed by its displayed `key` binding.
-pub(in crate::grid) fn shortcut_hint(action: &str, key: &str) -> String {
-    format!("{action}: {key}")
-}
-
 /// Corner and horizontal rule cells between each side and its padded label.
 const BORDER_LABEL_INSET: usize = 2;
 /// Logical pixels between a key's visible path and its footer caption.
 const KEY_HINT_GAP: f32 = 4.;
-/// Space for a severity icon and the gap before its title.
-const MESSAGE_ICON_COLUMNS: usize = 3;
-/// Filled warning triangle with a transparent exclamation mark.
-const WARNING_ICON: Icon = Icon::new(
-    include_bytes!("../../../assets/icons/message-warning.svg"),
-    1.,
-);
-/// Filled error circle with a transparent cross.
-const ERROR_ICON: Icon = Icon::new(
-    include_bytes!("../../../assets/icons/message-error.svg"),
-    1.,
-);
-
-/// Severity of feedback drawn in a message frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::grid) enum MessageLevel {
-    /// Progress or a successful result.
-    Info,
-    /// An action needs a different selection or input.
-    Warning,
-    /// An action failed.
-    Error,
-}
-
-impl MessageLevel {
-    /// Return the RGB outline and text colors in that order.
-    pub fn colors(self) -> (u32, u32) {
-        match self {
-            Self::Info => (MUTED, TEXT),
-            Self::Warning => (WARNING_BORDER, WARNING_TEXT),
-            Self::Error => (ERROR_BORDER, ERROR_TEXT),
-        }
-    }
-
-    /// Return the icon and localized title displayed in the outline.
-    fn heading(self) -> Option<(Icon, &'static str)> {
-        match self {
-            Self::Info => None,
-            Self::Warning => Some((WARNING_ICON, i18n::text("message.warning"))),
-            Self::Error => Some((ERROR_ICON, i18n::text("message.error"))),
-        }
-    }
-
-    /// Measure the severity icon and localized title in the grid's text `spacing`.
-    pub fn heading_columns(self, spacing: &TextSpacing) -> usize {
-        self.heading().map_or(0, |(_, title)| {
-            MESSAGE_ICON_COLUMNS + spacing.columns(title)
-        })
-    }
-}
-
 /// Center `hints` within `columns` and return their hit ranges using `cell_width` and `spacing`.
 pub(in crate::grid) fn key_hint_slots<const N: usize>(
     columns: usize,
@@ -197,6 +138,13 @@ impl CellPaint {
         self
     }
 
+    /// Underline this grapheme with a wave in the given RGB color or theme role.
+    pub(in crate::grid) fn with_undercurl(mut self, color: u32) -> Self {
+        self.attributes.undercurl = true;
+        self.special = Some(color);
+        self
+    }
+
     /// Resolve foreground and background together so reversal also works for palette roles.
     fn colors(self, theme: Style) -> (u32, u32) {
         let fg = theme.foreground(self.foreground);
@@ -273,19 +221,6 @@ impl FrameRow {
             self.positions.clear();
         }
     }
-}
-
-/// Presentation of a measured label without changing its grid advance.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(in crate::grid) enum LabelStyle {
-    /// Ordinary grid text.
-    Text,
-    /// Ordinary grid text and shadow at half opacity.
-    Dimmed,
-    /// Underlined keyboard key name.
-    Key,
-    /// Text glyph from the symbol face.
-    Symbol,
 }
 
 /// Measured text anchored independently of the row's border and other fields.
@@ -501,7 +436,7 @@ pub struct Frame {
     chevrons: Vec<RowChevron>,
     /// Path outlines whose geometry stays independent of the shaped rows.
     outlines: Vec<Outline>,
-    /// Frame-local cells occupied by the primary border title.
+    /// Frame-local pointer columns of the border title and its blank padding.
     title_columns: Range<usize>,
     /// Vertical inset of row tint fills, in logical pixels.
     tint_inset: Pixels,
@@ -519,6 +454,27 @@ impl Frame {
     /// Allocate `width` by `height` blank transparent cells.
     pub fn new(width: usize, height: usize) -> Self {
         Self::viewport(width, height, 0)
+    }
+
+    /// Paint the fixed chrome of `window` with its `component` theme and `active` focus color.
+    /// The title painter receives local columns and ink, and returns the end of its title if present.
+    pub(in crate::grid) fn grid_window(
+        window: GridWindow,
+        component: ThemeComponent,
+        active: bool,
+        draw_title: impl FnOnce(&mut Self, Range<usize>, u32) -> Option<usize>,
+    ) -> Self {
+        let area = window.bounds();
+        let body = window.body();
+        let mut frame = Self::new(area.w, area.h);
+        frame.set_theme_component(component);
+        frame.exclude_theme_background(Rect {
+            x: body.x - area.x,
+            y: body.y - area.y,
+            ..body
+        });
+        frame.draw_border(active, false, false, draw_title);
+        frame
     }
 
     /// Allocate `width` by `height` cells for the visible content starting at `first_row`.
@@ -718,13 +674,15 @@ impl Frame {
         tint: u32,
         mut style: impl FnMut(usize) -> (u32, u32, bool),
     ) {
-        self.styled_viewport_line(y, cells, viewport, 0, tint, |byte| {
-            let (fg, bg, dimmed) = style(byte);
+        self.styled_viewport_line(y, cells, viewport, 0, tint, None, |bytes| {
+            let (fg, bg, dimmed) = style(bytes.start);
             CellPaint::new(fg, bg, dimmed)
         });
     }
 
     /// Retain `cells` in row `y` with `indent_units` of leading padding before their measured positions.
+    /// Clip to `viewport`, fill blanks with `tint`, and style each grapheme's full byte range.
+    /// If supplied, `end_paint` marks one cell at the measured end of the line.
     pub(in crate::grid) fn styled_viewport_line<'a>(
         &mut self,
         y: usize,
@@ -732,7 +690,8 @@ impl Frame {
         viewport: Range<usize>,
         indent_units: usize,
         tint: u32,
-        mut style: impl FnMut(usize) -> CellPaint,
+        end_paint: Option<CellPaint>,
+        mut style: impl FnMut(Range<usize>) -> CellPaint,
     ) {
         let row = &mut self.rows[y];
         let left = viewport.start * UNITS_PER_COLUMN;
@@ -753,17 +712,35 @@ impl Frame {
                 CellPaint::new(TEXT, tint, false),
             );
         }
+        let mut end = indent_units;
         for mut cell in cells {
             cell.start += indent_units;
             cell.end += indent_units;
+            end = cell.end;
             if cell.start >= right {
                 break;
             }
             if cell.end <= left {
                 continue;
             }
-            let appearance = style(cell.byte);
+            let appearance = style(cell.byte..cell.byte + cell.text.len());
             column = row.place(column, cell, left, appearance);
+        }
+        if let Some(paint) = end_paint
+            && (left..right).contains(&end)
+        {
+            column = row.place(
+                column,
+                TextCell {
+                    byte: 0,
+                    text: " ",
+                    columns: 1,
+                    start: end,
+                    end: end + UNITS_PER_COLUMN,
+                },
+                left,
+                paint,
+            );
         }
         let remaining = ((right - left) as isize - row.x(column)).max(0) as usize;
         let needed = column + remaining.div_ceil(UNITS_PER_COLUMN);
@@ -894,7 +871,7 @@ impl Frame {
     }
 
     /// Center `hints` on `row`, using `cell_width` and `spacing` to align their captions.
-    pub(in crate::grid) fn key_hints<const N: usize>(
+    pub(in crate::grid) fn icon_key_hints<const N: usize>(
         &mut self,
         row: usize,
         cell_width: f32,
@@ -918,7 +895,7 @@ impl Frame {
 
     /// Add a trunk at `column` and `row`. `continues` makes it reach the next row.
     /// `branch_before` adds a horizontal arm that stops before the given icon column.
-    pub fn tree_guide(
+    fn tree_guide(
         &mut self,
         column: usize,
         row: usize,
@@ -977,6 +954,22 @@ impl Frame {
         include_help: bool,
         draw_title: impl FnOnce(&mut Self, Range<usize>, u32) -> usize,
     ) {
+        self.draw_border(
+            active,
+            show_controls,
+            include_help,
+            |frame, columns, color| Some(draw_title(frame, columns, color)),
+        );
+    }
+
+    /// Draw the focused or inactive outline and optional corner controls, leaving a gap for a visible title.
+    fn draw_border(
+        &mut self,
+        active: bool,
+        show_controls: bool,
+        include_help: bool,
+        draw_title: impl FnOnce(&mut Self, Range<usize>, u32) -> Option<usize>,
+    ) {
         let area = Rect {
             w: self.rows.first().map_or(0, |row| row.cells.len()),
             h: self.rows.len(),
@@ -991,11 +984,13 @@ impl Frame {
             .flatten();
         let columns = area.border_title_columns(controls.as_ref());
         let mut gaps = EdgeGaps::new();
-        if !columns.is_empty() {
-            let start = columns.start;
-            let end = draw_title(self, columns, color);
-            self.title_columns = start..end;
-            gaps.push(BORDER_LABEL_INSET..end + 1);
+        let start = columns.start;
+        if !columns.is_empty()
+            && let Some(end) = draw_title(self, columns, color)
+            && end > start
+        {
+            self.title_columns = title_hit_columns(start..end);
+            gaps.push(self.title_columns.clone());
         }
         if let Some(controls) = controls {
             let area = controls.area();
@@ -1020,10 +1015,13 @@ impl Frame {
         }
         let local = area.border_title_columns(None);
         let columns = area.x + local.start..area.x + local.end;
-        let gap = (!columns.is_empty()).then(|| {
-            let end = draw_title(self, columns);
-            area.x + BORDER_LABEL_INSET..end + 1
-        });
+        let gap = (!columns.is_empty())
+            .then(|| {
+                let start = columns.start;
+                let end = draw_title(self, columns);
+                title_hit_columns(start..end)
+            })
+            .filter(|gap| !gap.is_empty());
         self.outline(area, color, OutlineStyle::Solid, gap);
     }
 
@@ -1105,12 +1103,12 @@ impl Frame {
             return;
         }
         let start = (width - heading) / 2;
-        self.title_columns = start..start + heading;
+        self.title_columns = title_hit_columns(start..start + heading);
         self.outline(
             area,
             border,
             OutlineStyle::Solid,
-            Some(start - 1..start + heading + 1),
+            Some(self.title_columns.clone()),
         );
         self.icon(start, 0, icon);
         self.label(

@@ -28,6 +28,7 @@ mod canvas;
 pub(super) mod config;
 mod credential_control;
 pub(super) mod developer;
+mod diagnostics;
 mod drafts;
 mod language;
 mod resource;
@@ -106,6 +107,7 @@ struct Engine {
     sql_dialects: sql_dialect::Dialects,
     /// Explicit file types of editor-supplied openings, outside the guest document wire.
     document_filetypes: super::DocumentFiletypes,
+    document_saves: super::DocumentSaves,
     active: Option<u64>,
     rules: Rules,
     config: config::Configurations,
@@ -139,6 +141,8 @@ struct Engine {
     project_execution: BTreeMap<String, bool>,
     project_flags: BTreeMap<u64, Arc<AtomicBool>>,
     analyzers: BTreeMap<Key, analyzer::Binding>,
+    /// Debounced checks from language plugins that supply their own diagnostics.
+    guest_diagnostics: diagnostics::Checks,
     /// Session-local native server policy and in-flight stop/restart operations.
     server_controls: analyzer::ServerControls,
     developer_io: Pool,
@@ -243,6 +247,7 @@ impl Engine {
             project_execution,
             project_flags: BTreeMap::new(),
             analyzers: BTreeMap::new(),
+            guest_diagnostics: Default::default(),
             server_controls: analyzer::ServerControls::default(),
             developer_io: Pool::new(1, 1),
             store,
@@ -254,6 +259,7 @@ impl Engine {
             projects: BTreeMap::new(),
             sql_dialects: sql_dialect::Dialects::new(&state),
             document_filetypes: Default::default(),
+            document_saves: Default::default(),
             active: None,
             draft: drafts,
             draft_write: Instant::now(),
@@ -371,9 +377,14 @@ impl Engine {
         }
     }
 
-    fn projects(&mut self, (active, projects, dialects, filetypes): Projects) {
+    fn projects(
+        &mut self,
+        (active, projects, dialects, filetypes, visible_syntax, saves): Projects,
+    ) {
         let types_changed = self.document_filetypes != filetypes;
         self.document_filetypes = filetypes;
+        self.document_saves = saves;
+        self.builtin_syntax.visible = visible_syntax;
         self.active = active;
         self.projects = projects
             .into_iter()
@@ -516,6 +527,7 @@ impl Engine {
         }
         self.sync_builtin_syntax();
         self.sync_analyzers();
+        self.sync_guest_diagnostics();
         self.advance_peer_calls();
         self.advance_credential_events();
         self.advance_background_tools();

@@ -107,6 +107,90 @@ const LEADER_BINDINGS: &[LeaderBinding] = &[
         shortcut: None,
     },
     LeaderBinding {
+        sequence: "c",
+        description_key: "leader.code_group",
+        shortcut: None,
+    },
+    LeaderBinding {
+        sequence: "x",
+        description_key: "leader.diagnostics_group",
+        shortcut: None,
+    },
+    LeaderBinding {
+        sequence: "u",
+        description_key: "leader.ui_group",
+        shortcut: None,
+    },
+    LeaderBinding {
+        sequence: "s",
+        description_key: "leader.search_group",
+        shortcut: None,
+    },
+    LeaderBinding {
+        sequence: "sd",
+        description_key: "leader.project_diagnostics",
+        shortcut: Some(ShellShortcut::SearchList(ListSearch::ProjectDiagnostics)),
+    },
+    LeaderBinding {
+        sequence: "sD",
+        description_key: "leader.buffer_diagnostics",
+        shortcut: Some(ShellShortcut::SearchList(ListSearch::BufferDiagnostics)),
+    },
+    LeaderBinding {
+        sequence: "sq",
+        description_key: "leader.quickfix_list",
+        shortcut: Some(ShellShortcut::SearchList(ListSearch::Quickfix)),
+    },
+    LeaderBinding {
+        sequence: "sl",
+        description_key: "leader.location_list",
+        shortcut: Some(ShellShortcut::SearchList(ListSearch::Location)),
+    },
+    LeaderBinding {
+        sequence: "cd",
+        description_key: "leader.line_diagnostics",
+        shortcut: Some(ShellShortcut::LineDiagnostics),
+    },
+    LeaderBinding {
+        sequence: "ud",
+        description_key: "leader.toggle_diagnostics",
+        shortcut: Some(ShellShortcut::ToggleDiagnosticDisplay),
+    },
+    LeaderBinding {
+        sequence: "xx",
+        description_key: "leader.project_diagnostics",
+        shortcut: Some(ShellShortcut::DiagnosticList {
+            current_buffer: false,
+        }),
+    },
+    LeaderBinding {
+        sequence: "xX",
+        description_key: "leader.buffer_diagnostics",
+        shortcut: Some(ShellShortcut::DiagnosticList {
+            current_buffer: true,
+        }),
+    },
+    LeaderBinding {
+        sequence: "xq",
+        description_key: "leader.quickfix_list",
+        shortcut: Some(ShellShortcut::ResultList { location: false }),
+    },
+    LeaderBinding {
+        sequence: "xQ",
+        description_key: "leader.quickfix_list",
+        shortcut: Some(ShellShortcut::ResultList { location: false }),
+    },
+    LeaderBinding {
+        sequence: "xl",
+        description_key: "leader.location_list",
+        shortcut: Some(ShellShortcut::ResultList { location: true }),
+    },
+    LeaderBinding {
+        sequence: "xL",
+        description_key: "leader.location_list",
+        shortcut: Some(ShellShortcut::ResultList { location: true }),
+    },
+    LeaderBinding {
         sequence: "w",
         description_key: "leader.window_group",
         shortcut: None,
@@ -301,6 +385,7 @@ impl LeaderPrefix {
                     | ShellShortcut::CloseBuffers(_),
                 ) => availability.editor,
                 Some(ShellShortcut::CloseWindow) => availability.close_window,
+                _ if binding.sequence.starts_with(['c', 'x', 'u', 's']) => availability.editor,
                 None if binding.sequence == "b" => availability.editor,
                 _ if binding.sequence.starts_with('w') => availability.windows,
                 _ if binding.sequence.starts_with('m') => availability.markdown,
@@ -338,6 +423,16 @@ enum ShellShortcut {
     OpenSettings,
     /// Show shortcuts for the active pane or file picker.
     OpenHelp,
+    /// Show all diagnostics on the caret's line.
+    LineDiagnostics,
+    /// Toggle editor diagnostic decorations throughout this workspace.
+    ToggleDiagnosticDisplay,
+    /// Toggle the diagnostic list for the current buffer or project.
+    DiagnosticList { current_buffer: bool },
+    /// Toggle Quickfix or the active editor's location list.
+    ResultList { location: bool },
+    /// Focus the requested list and start the grid's native forward search.
+    SearchList(ListSearch),
     /// Add a tab showing the start page.
     OpenStart,
     /// Create another page for the active buffer inside the current project.
@@ -364,6 +459,15 @@ enum ShellShortcut {
     ResizeWindow { stacked: bool, grow: bool },
     /// Give sibling windows equal sizes using the existing window command.
     EqualizeWindows,
+}
+
+/// Source for a LazyVim-style result search in the native editor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListSearch {
+    ProjectDiagnostics,
+    BufferDiagnostics,
+    Quickfix,
+    Location,
 }
 
 impl ShellShortcut {
@@ -1041,6 +1145,29 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
+        if !keyboard_help
+            && focus == Focus::Editor
+            && mode == nanobug::vim::Mode::Normal
+            && !awaiting_key
+            && !modifiers.modified()
+            && !modifiers.shift
+            && let Some((kind, _)) = self.projects.active().editor.buffer().list_owner()
+        {
+            match raw {
+                "enter" => {
+                    self.activate_result_row(window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "q" => {
+                    self.held_close_key = Some(raw.into());
+                    self.close_result_list(kind, window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
         if raw == "f6" {
             self.cycle_cursor_effect(modifiers.shift, window, cx);
             cx.stop_propagation();
@@ -1418,6 +1545,47 @@ impl Workspace {
             ShellShortcut::OpenFilePicker => self.open_file_picker(window, cx),
             ShellShortcut::OpenPluginManager => self.open_plugin_manager(window, cx),
             ShellShortcut::OpenSettings => self.open_settings(window, cx),
+            ShellShortcut::LineDiagnostics => self.show_line_diagnostics(window, cx),
+            ShellShortcut::ToggleDiagnosticDisplay => self.toggle_diagnostic_display(window, cx),
+            ShellShortcut::DiagnosticList { current_buffer } => {
+                self.toggle_diagnostics(current_buffer, window, cx);
+            }
+            ShellShortcut::ResultList { location } => self.toggle_quickfix(location, window, cx),
+            ShellShortcut::SearchList(target) => {
+                use crate::grid::windows::editor::ResultList;
+                match target {
+                    ListSearch::BufferDiagnostics | ListSearch::ProjectDiagnostics => {
+                        self.show_diagnostics(target == ListSearch::BufferDiagnostics, window, cx)
+                    }
+                    ListSearch::Location | ListSearch::Quickfix => self.quickfix_command(
+                        target == ListSearch::Location,
+                        nanobug::vim::QuickfixCommand::Open(None),
+                        window,
+                        cx,
+                    ),
+                }
+                let kind = self
+                    .projects
+                    .active()
+                    .editor
+                    .buffer()
+                    .list_owner()
+                    .map(|(kind, _)| kind);
+                if matches!(
+                    (target, kind),
+                    (
+                        ListSearch::BufferDiagnostics,
+                        Some(ResultList::BufferDiagnostics(_))
+                    ) | (
+                        ListSearch::ProjectDiagnostics,
+                        Some(ResultList::Diagnostics)
+                    ) | (ListSearch::Location, Some(ResultList::Location(_)))
+                        | (ListSearch::Quickfix, Some(ResultList::Quickfix))
+                ) {
+                    self.run_vim(|vim, reg| vim.key("/", reg), window, cx);
+                    self.sync(window, cx);
+                }
+            }
             ShellShortcut::OpenHelp => {
                 if self.file_picker.is_some() {
                     self.open_file_picker_help(window, cx);

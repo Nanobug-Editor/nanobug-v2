@@ -2,6 +2,7 @@
 
 use super::{
     EditorWindow, TEXT_OVERSCAN,
+    diagnostics::DiagnosticUnderlines,
     signs::{EditorGutter, RowSigns},
 };
 use crate::{
@@ -10,6 +11,7 @@ use crate::{
         windows::WindowFrame,
     },
     ui::{
+        components::grid_window::GridWindow,
         icons::Icon,
         theme::{CURRENT, GOLD, MUTED, PREEDIT, TEXT, ThemeComponent, WARNING_TEXT, syntax_color},
     },
@@ -43,25 +45,25 @@ static DIAGNOSTIC_FOLD_ARROW: Icon = Icon::new(
     8.8 / 13.4,
 );
 
-/// Retained frames used by the editor's fixed chrome and independently clipped text layers.
-pub(in crate::grid) struct EditorFrames {
+/// Fixed chrome and independently clipped content, as frames or their retained panels.
+pub(in crate::grid) struct EditorLayers<T> {
     /// Border with Bufferline and Tabpage labels.
-    pub chrome: Frame,
+    pub chrome: T,
     /// Vertically scrolling line numbers.
-    pub numbers: Frame,
+    pub numbers: T,
     /// Text scrolling on both axes.
-    pub text: Frame,
+    pub text: T,
 }
 
 impl EditorWindow {
+    /// Lay out an editor in `area` with file tabs on the title border and no fixed interior rows.
+    pub(in crate::grid) fn grid_window(area: Rect) -> GridWindow {
+        GridWindow::new(area, 0, 0)
+    }
+
     /// Return the scrollable body inside the bordered grid rectangle `area`.
     pub(in crate::grid) fn body(area: Rect) -> Rect {
-        Rect {
-            x: area.x + 1,
-            y: area.y + 1,
-            w: area.w.saturating_sub(2),
-            h: area.h.saturating_sub(2),
-        }
+        Self::grid_window(area).body()
     }
 
     /// Return the text viewport within `area`, accounting for the gutter, divider gap and view height.
@@ -111,26 +113,29 @@ impl EditorWindow {
         context: WindowFrame<'_>,
         visible_cols: usize,
         mappings: &InputMappings,
-    ) -> EditorFrames {
-        let mut edit = Frame::new(context.area.w, context.area.h);
-        edit.set_theme_component(ThemeComponent::Editor);
-        edit.exclude_theme_background(Self::body(Rect {
-            x: 0,
-            y: 0,
-            ..context.area
-        }));
-        self.header(context.area, context.spacing, visible_cols)
-            .paint(&mut edit, context.spacing, context.selected);
+    ) -> EditorLayers<Frame> {
+        let window = Self::grid_window(context.area);
+        let mut edit = Frame::grid_window(
+            window,
+            ThemeComponent::Editor,
+            context.selected,
+            |frame, _, _| {
+                self.header(context.area, context.spacing, visible_cols)
+                    .paint(frame, context.spacing)
+            },
+        );
         if self.markdown_view_mode() == Some(super::MarkdownViewMode::Split)
             && let Some(preview) = self.markdown_preview_area(context.area)
         {
             let divider = preview.x - context.area.x - 1;
-            for row in 1..context.area.h.saturating_sub(1) {
+            let body = window.body();
+            let first = body.y - context.area.y;
+            for row in first..first + body.h {
                 edit.vertical_rule(divider, row, MUTED);
             }
         }
         let (numbers, text) = self.content_frames_with_mappings(context, |_| None, mappings);
-        EditorFrames {
+        EditorLayers {
             chrome: edit,
             numbers,
             text,
@@ -302,6 +307,11 @@ impl EditorWindow {
                 let end = doc.folded_end_row(row.line).unwrap_or(row.line);
                 doc.starts.get(end + 2).copied().unwrap_or(doc.text.len())
             });
+        let underlines = if self.diagnostic_marks {
+            DiagnosticUnderlines::new(buffer.diagnostics(), visible_start..visible_end)
+        } else {
+            DiagnosticUnderlines::default()
+        };
         let slot_matches = super::ex_matches::visible_matches(
             self.register.ex_matches(),
             mappings,
@@ -392,7 +402,8 @@ impl EditorWindow {
                     );
                 }
                 if let Some(column) = Self::fold_arrow_column(gutter.width) {
-                    let diagnostic = buffer.diagnostic_on_line(line);
+                    let diagnostic =
+                        self.diagnostic_marks && buffer.line_diagnostics(line).next().is_some();
                     if diagnostic && let Some(diagnostic_column) = gutter.diagnostic {
                         numbers.text(diagnostic_column, visible, "!", WARNING_TEXT, 1);
                     }
@@ -431,6 +442,26 @@ impl EditorWindow {
                     .line
                     .map_or(paint, |style| paint.with_highlight(style))
             };
+            let underline = |paint: CellPaint, offset, len| {
+                underlines
+                    .color(offset..offset + len)
+                    .map_or(paint, |ink| paint.with_undercurl(ink))
+            };
+            let end_paint = if painted.fold_suffix.is_none()
+                && byte_start + fragment.len() == painted.text.len()
+            {
+                let line_end = doc.line_range(line).end;
+                let end = if line == last_line {
+                    doc.text.len()
+                } else {
+                    line_end
+                };
+                underlines
+                    .at_line_end(line_end..=end)
+                    .map(|ink| CellPaint::new(TEXT, tint, false).with_undercurl(ink))
+            } else {
+                None
+            };
             text.styled_viewport_line(
                 visible,
                 context
@@ -439,7 +470,9 @@ impl EditorWindow {
                 left..right,
                 indent_units,
                 tint,
-                |byte| {
+                end_paint,
+                |bytes| {
+                    let byte = bytes.start;
                     if let Some(suffix) = painted
                         .fold_suffix
                         .as_ref()
@@ -450,7 +483,9 @@ impl EditorWindow {
                         } else {
                             let offset = suffix.closing_offset + byte - suffix.closing_byte;
                             let paint = decorate(source_styles(offset, tint));
-                            ex_style(offset).map_or(paint, |style| paint.with_highlight(style))
+                            let paint =
+                                ex_style(offset).map_or(paint, |style| paint.with_highlight(style));
+                            underline(paint, offset, bytes.len())
                         };
                     }
                     if painted
@@ -469,7 +504,7 @@ impl EditorWindow {
                         let offset = vim.doc.starts[line] + byte;
                         let paint = decorate(source_styles(offset, tint));
                         let matched = ex_style(offset);
-                        if selection
+                        let paint = if selection
                             .as_ref()
                             .or(substitution.as_ref())
                             .is_some_and(|range| range.contains(&offset))
@@ -494,7 +529,8 @@ impl EditorWindow {
                             )
                         } else {
                             paint
-                        }
+                        };
+                        underline(paint, offset, bytes.len())
                     }
                 },
             );

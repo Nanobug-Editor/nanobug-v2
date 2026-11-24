@@ -291,9 +291,21 @@ fn repeated_mouse_presses_do_not_confirm_a_second_file() {
     };
     let row = area.y + area.h - 2;
     for multiple in [false, true] {
-        for (choice, label, slot) in button_slots(&spacing, multiple) {
+        for ConfirmButton {
+            action: choice,
+            caption: label,
+            columns: slot,
+            ..
+        } in button_slots(&spacing, multiple, area.w)
+        {
             assert!(slot.end <= COLUMNS - 2);
-            let key = label.spans()[2].0.to_ascii_lowercase();
+            let key = label
+                .spans()
+                .into_iter()
+                .find(|(_, style)| *style == crate::ui::text::LabelStyle::Key)
+                .unwrap()
+                .0
+                .to_ascii_lowercase();
             let keyed = press(&key, false, multiple);
             assert_eq!(keyed, Some(choice));
             for x in slot {

@@ -8,7 +8,6 @@ pub(in crate::grid) mod shortcuts;
 mod tree;
 mod view;
 
-use crate::ui::file_icons::EntryIcon;
 pub(in crate::grid) use input::ManagerCommand;
 use nanobug::filesystem::{FileTransfers, TransferKind};
 pub(in crate::grid) use session::ExplorerSnapshot;

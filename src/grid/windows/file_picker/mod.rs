@@ -8,7 +8,9 @@ pub(in crate::grid) use preview::{Preview, SyntaxColors};
 pub(in crate::grid) use view::PickerLayout;
 
 use super::{Shortcut, ShortcutKeys::Fixed};
-use crate::{grid::mnemonic::Mnemonic, ui::ime::Composition};
+use crate::ui::components::grid_file_row::{display_path, file_name};
+use crate::ui::components::grid_text_field::GridTextField;
+use crate::ui::{ime::Composition, mnemonic::Mnemonic};
 use anyhow::{Context, Result, ensure};
 use nanobug::i18n;
 use std::{
@@ -17,7 +19,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use unicode_segmentation::UnicodeSegmentation;
 
 /// Bindings for browsing files to open in the workspace.
 pub(in crate::grid) const SHORTCUTS: &[Shortcut] = &shortcuts("picker.open_help");
@@ -83,9 +84,7 @@ pub(in crate::grid) struct PickerEntry {
 impl PickerEntry {
     /// Return the basename, or the whole path for a volume root.
     fn name(&self) -> Cow<'_, str> {
-        self.path
-            .file_name()
-            .map_or_else(|| display_path(&self.path), |name| name.to_string_lossy())
+        file_name(&self.path)
     }
 }
 
@@ -247,20 +246,6 @@ fn drives() -> Vec<PickerEntry> {
         .collect()
 }
 
-/// Show Windows canonical paths in conventional drive or UNC form.
-fn display_path(path: &Path) -> Cow<'_, str> {
-    let text = path.to_string_lossy();
-    if cfg!(windows) {
-        if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
-            return Cow::Owned(format!(r"\\{unc}"));
-        }
-        if let Some(drive) = text.strip_prefix(r"\\?\") {
-            return Cow::Owned(drive.to_owned());
-        }
-    }
-    text
-}
-
 /// Match a listing path to a preferred row, including Windows drive-root aliases.
 fn same_row(path: &Path, preferred: &Path) -> bool {
     path == preferred
@@ -310,75 +295,27 @@ pub(in crate::grid) struct Prompt {
     pub kind: PromptKind,
     /// Committed input.
     pub value: String,
-    /// Insertion endpoint in bytes.
-    caret: usize,
-    /// Other endpoint of the selected range in bytes.
-    anchor: usize,
+    /// Selection and visible text position of the editable value.
+    field: GridTextField,
 }
 
 impl Prompt {
-    /// Initialize kind with text and select its prefix through end.
+    /// Open an input and select its prefix, retaining a rename's extension.
     pub fn new(kind: PromptKind, value: String, end: usize) -> Self {
-        Self {
-            kind,
-            value,
-            caret: end,
-            anchor: 0,
-        }
+        let mut field = GridTextField::with_limit(usize::MAX);
+        field.select_prefix(&value, end);
+        Self { kind, value, field }
     }
 
-    /// Replace the selection with single-line committed text.
+    /// Keep paths and queries single-line when the system commits or pastes text.
     pub fn insert(&mut self, text: &str) {
-        let start = self.anchor.min(self.caret);
-        let end = self.anchor.max(self.caret);
-        let text: String = text.chars().filter(|c| !c.is_control()).collect();
-        self.value.replace_range(start..end, &text);
-        self.caret = start + text.len();
-        self.anchor = self.caret;
+        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+        self.field.insert(&mut self.value, &clean);
     }
 
-    /// Apply an editing key to the text, returning whether it was handled.
-    pub fn edit(&mut self, key: &str) -> bool {
-        let left = self.value[..self.caret]
-            .grapheme_indices(true)
-            .next_back()
-            .map_or(0, |(i, _)| i);
-        let right = self.caret
-            + self.value[self.caret..]
-                .graphemes(true)
-                .next()
-                .map_or(0, str::len);
-        if matches!(key, "backspace" | "delete") {
-            if self.anchor == self.caret {
-                self.anchor = if key == "backspace" { left } else { right };
-            }
-            self.insert("");
-        } else if key == "select-all" {
-            self.anchor = 0;
-            self.caret = self.value.len();
-        } else {
-            self.caret = match key {
-                "left" => {
-                    if self.anchor != self.caret {
-                        self.anchor.min(self.caret)
-                    } else {
-                        left
-                    }
-                }
-                "right" => {
-                    if self.anchor != self.caret {
-                        self.anchor.max(self.caret)
-                    } else {
-                        right
-                    }
-                }
-                "home" => 0,
-                "end" => self.value.len(),
-                _ => return false,
-            };
-            self.anchor = self.caret;
-        }
-        true
+    /// Route motion and editing to the same field that paints the selection.
+    pub fn edit(&mut self, key: &gpui::Keystroke) -> bool {
+        self.field.edit(&mut self.value, key).is_some()
     }
 }
 
@@ -685,10 +622,12 @@ mod tests {
     #[test]
     fn reveals_drive_root_and_browses_unc_share() {
         let drive = Path::new(r"\\?\C:\");
+        assert_eq!(file_name(drive), r"C:\");
         assert!(
             matches!(Browse::reveal_directory(drive), Browse::Drives(Some(path)) if path == drive)
         );
         let share = Path::new(r"\\?\UNC\server\share\");
+        assert_eq!(file_name(share), r"\\server\share\");
         assert!(
             matches!(Browse::reveal_directory(share), Browse::Path(path, None) if path == share)
         );
@@ -863,7 +802,7 @@ mod tests {
         );
         prompt.insert("👩‍💻");
         assert_eq!(prompt.value, "👩‍💻.txt");
-        assert!(prompt.edit("backspace"));
+        assert!(prompt.edit(&gpui::Keystroke::parse("backspace").unwrap()));
         assert_eq!(prompt.value, ".txt");
     }
 

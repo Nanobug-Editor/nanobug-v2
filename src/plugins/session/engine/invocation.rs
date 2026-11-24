@@ -145,6 +145,8 @@ impl Engine {
                 kind,
                 CallKind::User
                     | CallKind::Explicit
+                    | CallKind::BackgroundDiagnose
+                    | CallKind::BackgroundDiagnoseResult
                     | CallKind::Format
                     | CallKind::Continued
                     | CallKind::PeerService
@@ -480,6 +482,13 @@ impl Engine {
                 if let Some(change) = &call.credential_read {
                     self.credential_check_finished(&key, change, output.credential_rejected);
                     // Never publish free-form text from a callback which received a credential.
+                    return;
+                }
+                if matches!(
+                    call.kind,
+                    CallKind::BackgroundDiagnose | CallKind::BackgroundDiagnoseResult
+                ) {
+                    self.background_diagnostic_reply(key, runtime.generation, call, output);
                     return;
                 }
                 if matches!(call.kind, CallKind::CanvasPassive(_))

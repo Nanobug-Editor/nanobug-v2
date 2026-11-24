@@ -12,6 +12,38 @@ fn tabs_with_store(directory: &Path) -> WorkspaceTabs {
     tabs
 }
 
+#[test]
+fn quickfix_windows_are_transient_and_leave_the_source_layout_intact() -> Result<()> {
+    use crate::grid::windows::editor::{Buffer, ResultList};
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
+    let mut project = Project::new(root.clone(), None);
+    let source = project.active_editor_id();
+    let list = Buffer::result_list(ResultList::Quickfix, source, "#1|1:1 E| initial");
+    let area = Rect {
+        x: 0,
+        y: 0,
+        w: 80,
+        h: 40,
+    };
+    assert!(project.open_split(
+        SplitAxis::Rows,
+        false,
+        SplitDocument::SharedView(Box::new(list)),
+        area,
+        0.
+    )?);
+    project
+        .editor
+        .update_result_rows("#1|2:1 E| updated", Some(0));
+    assert!(!project.editor.vim().doc.modified());
+    let restored = ProjectSnapshot::capture(&project).restore(root)?;
+    assert_eq!(restored.splits().ids(), vec![source]);
+    assert_eq!(restored.active_editor_id(), source);
+    assert!(restored.editor.buffer().list_owner().is_none());
+    Ok(())
+}
+
 /// Restore a file mark in another Tabpage, using the editor where the jump starts.
 #[test]
 fn restores_file_marks_for_each_session() -> Result<()> {

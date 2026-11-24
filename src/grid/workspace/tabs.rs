@@ -5,6 +5,7 @@ mod pages;
 mod windows;
 
 use super::{Workspace, layout::OUTER_INSET_Y, projects::WorkspaceTabs, view::positioned};
+use crate::ui::components::grid_tab_bar::{GridTabBar, TabAlign, TabGrowth, TabKind, TabOptions};
 use crate::{
     grid::render::{Frame, Metrics, Panel, Rect},
     ui::{
@@ -219,9 +220,9 @@ pub(super) struct TabBar {
     layout: Option<(usize, u64, (usize, usize), Option<u64>, Locale)>,
     /// Index of the first visible tab, retained until the selected tab needs room.
     first: usize,
-    /// Visible tab rectangles in order, excluding separators and overflow indicators.
-    targets: Vec<Rect>,
-    /// Page labels and overflow targets in their painted caption cells.
+    /// Destinations of visible project tabs and their overflow arrows.
+    targets: Vec<(usize, Rect)>,
+    /// Page labels with adjacent blank cells, and the painted overflow targets.
     page_targets: Vec<(usize, Rect)>,
     /// Width available to the project selection animation, excluding page numbers.
     project_cols: usize,
@@ -292,66 +293,65 @@ impl TabBar {
         let widths: Vec<_> = names.iter().map(|name| spacing.columns(name)).collect();
         let mut labels = Frame::new(cols, 1);
         let mut covered = Frame::new(cols, 1);
-        self.page_targets = pages::draw(&mut labels, cols, pages.0, pages.1, spacing);
-        let cols = self
-            .page_targets
-            .first()
-            .map_or(cols, |(_, bounds)| bounds.x.saturating_sub(pages::PAGE_GAP));
+        let (cols, page_targets) = pages::draw(&mut labels, cols, pages.0, pages.1, spacing);
+        self.page_targets = page_targets;
         self.project_cols = cols;
-        let visible = visible_tabs(&widths, cols, self.first, projects.selected);
-        self.first = visible.start;
+        let bar = project_tabs(&widths, cols, self.first, projects.selected);
+        self.first = bar.visible.start;
         self.targets.clear();
-        let hidden_left = visible.start;
-        let hidden_right = names.len() - visible.end;
-        let mut column = hidden_columns(hidden_left);
-        let limit = cols.saturating_sub(hidden_columns(hidden_right));
         let mut label = |slot: Range<usize>, text: &str, color| {
             let slot = slot.start..slot.end.min(cols);
             labels.label(0, slot.clone(), text, color, spacing);
             covered.label(0, slot, text, CURSOR_TEXT, spacing);
         };
-        if hidden_left > 0 {
-            label(0..column - 1, &format!("←{hidden_left}"), MUTED);
-        }
-        for i in visible.clone() {
-            let start = column + TAB_PADDING;
-            let width = widths[i].min(limit.saturating_sub(start + TAB_PADDING));
-            let end = start + width;
-            label(start..end, &names[i], TEXT);
-            if i == projects.selected {
-                let units = spacing
-                    .fitting_cells(&names[i], width * UNITS_PER_COLUMN)
-                    .last()
-                    .map_or(0, |cell| cell.end);
-                let target = [
-                    column as f64,
-                    (start + TAB_PADDING) as f64 + units as f64 / UNITS_PER_COLUMN as f64,
-                ];
-                if self.layout.is_none() {
-                    for (edge, goal) in self.edges.iter_mut().zip(target) {
-                        edge.snap(goal);
+        for slot in bar.slots {
+            let cells = slot.columns.clone();
+            if let Some(index) = slot.target() {
+                self.targets.push((
+                    index,
+                    Rect {
+                        x: slot.hit.start,
+                        y: 0,
+                        w: slot.hit.len(),
+                        h: 1,
+                    },
+                ));
+            }
+            match slot.kind {
+                TabKind::Gap => label(cells, "|", MUTED),
+                TabKind::Before { count, .. } => {
+                    label(cells.start..cells.end - 1, &format!("←{count}"), MUTED)
+                }
+                TabKind::After { count, .. } => {
+                    label(cells.start + 1..cells.end, &format!("{count}→"), MUTED)
+                }
+                TabKind::Tab(index) => {
+                    // Reserve a visible name cell even when the entire project slot is narrower than its padding.
+                    let padding = TAB_PADDING.min(cells.len().saturating_sub(1) / 2);
+                    let start = cells.start + padding;
+                    let end = cells.end.saturating_sub(padding);
+                    label(start..end, &names[index], TEXT);
+                    if index == projects.selected {
+                        let units = spacing
+                            .fitting_cells(&names[index], (end - start) * UNITS_PER_COLUMN)
+                            .last()
+                            .map_or(0, |cell| cell.end);
+                        let target = [
+                            cells.start as f64,
+                            (start + padding) as f64 + units as f64 / UNITS_PER_COLUMN as f64,
+                        ];
+                        if self.layout.is_none() {
+                            for (edge, goal) in self.edges.iter_mut().zip(target) {
+                                edge.snap(goal);
+                            }
+                        }
+                        if self.target != target {
+                            self.target = target;
+                            self.sampled_at = Instant::now();
+                        }
                     }
                 }
-                if self.target != target {
-                    self.target = target;
-                    self.sampled_at = Instant::now();
-                }
             }
-            let next = end + TAB_PADDING;
-            self.targets.push(Rect {
-                x: column,
-                y: 0,
-                w: next.min(cols).saturating_sub(column),
-                h: 1,
-            });
-            column = next;
-            if i + 1 < visible.end {
-                label(column..column + TAB_SEPARATOR, "|", MUTED);
-                column += TAB_SEPARATOR;
-            }
-        }
-        if hidden_right > 0 {
-            label(limit + 1..cols, &format!("{hidden_right}→"), MUTED);
         }
         self.layout = Some(key);
         self.labels.update(cx, |panel, cx| panel.set(labels, cx));
@@ -373,8 +373,7 @@ impl TabBar {
     ) -> impl Iterator<Item = (CaptionTarget, Bounds<Pixels>)> + '_ {
         self.targets
             .iter()
-            .enumerate()
-            .map(move |(offset, target)| (CaptionTarget::Project(self.first + offset), *target))
+            .map(|&(index, target)| (CaptionTarget::Project(index), target))
             .chain(
                 self.page_targets
                     .iter()
@@ -444,37 +443,21 @@ impl TabBar {
     }
 }
 
-/// Columns needed for a `count` indicator, including its arrow and inner gap.
-fn hidden_columns(count: usize) -> usize {
-    count.checked_ilog10().map_or(0, |power| power as usize + 3)
-}
-
-/// Fit a contiguous range of tab `widths` in `cols`, always including `selected`.
-/// Keep the previous `first` until it crowds the selection, then backfill any unused space.
-fn visible_tabs(widths: &[usize], cols: usize, first: usize, selected: usize) -> Range<usize> {
-    let mut edges = Vec::with_capacity(widths.len() + 1);
-    edges.push(0);
-    for width in widths {
-        edges.push(edges.last().unwrap() + width + 2 * TAB_PADDING + TAB_SEPARATOR);
-    }
-    let fits = |start, end| {
-        edges[end] - edges[start] - TAB_SEPARATOR
-            + hidden_columns(start)
-            + hidden_columns(widths.len() - end)
-            <= cols
-    };
-    let mut start = first.min(selected);
-    let mut end = selected + 1;
-    while start < selected && !fits(start, end) {
-        start += 1;
-    }
-    while end < widths.len() && fits(start, end + 1) {
-        end += 1;
-    }
-    while start > 0 && fits(start - 1, end) {
-        start -= 1;
-    }
-    start..end
+/// Fit project names with symmetric tab padding and preserve the first visible project on navigation.
+fn project_tabs(widths: &[usize], cols: usize, first: usize, active: usize) -> GridTabBar {
+    GridTabBar::fit(
+        widths.len(),
+        |i| widths[i] + 2 * TAB_PADDING,
+        active,
+        0..cols,
+        TabOptions {
+            gap: TAB_SEPARATOR,
+            hit_padding: 0,
+            minimum: 1,
+            growth: TabGrowth::Retain(first),
+            align: TabAlign::Fill,
+        },
+    )
 }
 
 #[cfg(test)]

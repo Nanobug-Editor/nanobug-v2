@@ -4,6 +4,7 @@ use super::{
     EditorWindow,
     markdown::{MarkdownSnippet, PreviewLayout},
 };
+use crate::ui::components::grid_popover::GridPopover;
 use crate::{
     grid::render::{Frame, LabelStyle, Metrics, OutlineStyle, Rect, outline_path},
     ui::{
@@ -12,8 +13,8 @@ use crate::{
     },
 };
 use gpui::{
-    AnyElement, App, Bounds, IntoElement, Pixels, Point, Size, Styled, Window, canvas, fill, point,
-    px, rgb, rgba, size,
+    AnyElement, App, Bounds, IntoElement, Pixels, Point, Styled, Window, canvas, fill, point, px,
+    rgb, rgba, size,
 };
 use nanobug::{animation::scroll::GridScroll, i18n, vim::Mode};
 use std::{cell::Cell, rc::Rc};
@@ -45,6 +46,14 @@ struct WidthKey {
 }
 
 impl DefinitionHoverContent {
+    /// Render diagnostic messages as plain text, preserving literal markup and embedded newlines.
+    pub(in crate::grid) fn plain(text: String) -> Self {
+        Self {
+            markdown: MarkdownSnippet::plain(text),
+            preferred: Cell::new(None),
+        }
+    }
+
     /// Retain the server's `text` as Markdown and defer measuring it until layout.
     pub(in crate::grid) fn new(text: String) -> Self {
         Self {
@@ -116,14 +125,10 @@ impl EditorWindow {
         let body = self.text_area(area).pixels(metrics).intersect(&viewport);
         let caret = metrics.at(x, y);
         let row_height = px(metrics.lh);
-        if !body.contains(&caret) || body.bottom() < caret.y + row_height {
-            return None;
-        }
-
-        let above = caret.y - body.top();
-        let below = body.bottom() - caret.y - row_height;
+        let popover = GridPopover::at_caret(body, caret, row_height)?;
         let chrome_height = row_height * (1. + EDGE_ROWS * 2.);
-        let content_rows = ((f32::from(above.max(below) - chrome_height) / metrics.lh) as usize)
+        let content_rows = (((popover.available_height() - f32::from(chrome_height)) / metrics.lh)
+            as usize)
             .min(MAX_CONTENT_ROWS);
         let body_columns = (f32::from(body.size.width) / metrics.cw).floor() as usize;
         let text_limit = body_columns.min(MAX_COLUMNS).saturating_sub(2);
@@ -160,12 +165,7 @@ impl EditorWindow {
         };
         let columns = content_columns.max(spacing.columns(hint)).min(text_limit) + 2;
         let width = px(columns as f32 * metrics.cw);
-        let bounds = popup_bounds(
-            body,
-            caret,
-            row_height,
-            size(width, body_height + chrome_height),
-        );
+        let bounds = popover.pixel_bounds(body, caret.x, size(width, body_height + chrome_height));
         Some(DefinitionHoverPopup {
             bounds,
             layout,
@@ -180,23 +180,6 @@ impl EditorWindow {
             hint,
         })
     }
-}
-
-/// Fit a popup of `size` inside the editor `body`, below the `caret` and its `row_height` if possible.
-fn popup_bounds(
-    body: Bounds<Pixels>,
-    caret: Point<Pixels>,
-    row_height: Pixels,
-    size: Size<Pixels>,
-) -> Bounds<Pixels> {
-    let left = caret.x.min(body.right() - size.width).max(body.left());
-    let below = caret.y + row_height;
-    let top = if body.bottom() - below >= size.height {
-        below
-    } else {
-        caret.y - size.height
-    };
-    Bounds::new(point(left, top), size)
 }
 
 impl DefinitionHoverPopup {
@@ -330,13 +313,17 @@ mod tests {
     fn definition_details_flip_and_limit_content_without_covering_the_caret() {
         let body = Bounds::new(point(px(9.), px(20.)), size(px(270.), px(160.)));
         let caret = point(px(204.), px(160.));
-        let panel = popup_bounds(body, caret, px(20.), size(px(180.), px(130.)));
+        let panel = GridPopover::at_caret(body, caret, px(20.))
+            .unwrap()
+            .pixel_bounds(body, caret.x, size(px(180.), px(130.)));
         assert_eq!(panel.bottom(), caret.y);
         assert_eq!(panel.right(), body.right());
         assert!(panel.left() >= body.left() && panel.top() >= body.top());
 
         let caret = point(px(50.), px(25.));
-        let panel = popup_bounds(body, caret, px(20.), size(px(120.), px(45.)));
+        let panel = GridPopover::at_caret(body, caret, px(20.))
+            .unwrap()
+            .pixel_bounds(body, caret.x, size(px(120.), px(45.)));
         assert_eq!(panel.top(), px(45.));
         assert_eq!(panel.left(), caret.x);
     }

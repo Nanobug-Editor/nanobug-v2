@@ -12,7 +12,7 @@ use nanobug::{
     vim::{ExMessageOutput, ExMessageSpan, HighlightStyle, Vim},
 };
 use nanobug_plugin_sdk::{
-    Diagnostic,
+    Diagnostic, DiagnosticSeverity,
     language::{Highlight, Symbol},
 };
 use std::{
@@ -124,6 +124,8 @@ pub(in crate::grid) struct Buffer {
     pub(in crate::grid) vim: Vim,
     /// Terminal screen and process when this buffer is backed by a PTY.
     pub(super) terminal: Option<Terminal>,
+    /// List shown by this read-only buffer and the pane used for jumps.
+    pub(super) results: Option<(super::ResultList, usize)>,
     /// Continuous viewport position with a whole-row destination.
     pub(in crate::grid) scroll: GridScroll,
     /// Last bound target and the requested row before clamping at a document boundary.
@@ -148,6 +150,10 @@ pub(in crate::grid) struct Buffer {
     message_spans: Vec<ExMessageSpan>,
     /// Latest diagnostic sets received for this buffer from live language providers.
     diagnostics: Vec<Arc<DocumentDiagnostics>>,
+    /// Shared buffer number at delivery, so reopening a file cannot inherit stale ranges.
+    diagnostic_buffer: Option<u64>,
+    /// Changes whenever a provider replaces the diagnostics, including within one text revision.
+    diagnostic_epoch: u64,
     /// SQL dialect override retained only for this open buffer.
     sql_dialect: Option<String>,
 }
@@ -241,6 +247,7 @@ impl Buffer {
             id: NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed),
             vim,
             terminal: None,
+            results: None,
             scroll: GridScroll::default(),
             bound_scroll: None,
             columns: GridScroll::default(),
@@ -253,6 +260,8 @@ impl Buffer {
             syntax_layers: Default::default(),
             message_spans: Vec::new(),
             diagnostics: Vec::new(),
+            diagnostic_buffer: None,
+            diagnostic_epoch: 0,
             sql_dialect: None,
         }
     }
@@ -415,7 +424,9 @@ impl Buffer {
         &mut self,
         incoming: Vec<Arc<DocumentDiagnostics>>,
     ) -> bool {
-        if self.diagnostics.len() == incoming.len()
+        let number = (!incoming.is_empty()).then(|| self.vim.doc.buffer_number());
+        if self.diagnostic_buffer == number
+            && self.diagnostics.len() == incoming.len()
             && self
                 .diagnostics
                 .iter()
@@ -425,55 +436,73 @@ impl Buffer {
             return false;
         }
         self.diagnostics = incoming;
+        self.diagnostic_buffer = number;
+        self.diagnostic_epoch += 1;
         true
     }
 
-    /// Show diagnostics only on the exact opening and revision they describe.
-    fn diagnostics(&self) -> impl Iterator<Item = &Diagnostic> {
-        let version = (self.vim.doc.opening, self.vim.doc.revision);
+    /// Identify the data used by a diagnostic popup while the caret stays still.
+    pub(in crate::grid) fn diagnostic_epoch(&self) -> u64 {
+        self.diagnostic_epoch
+    }
+
+    /// Share a provider's ranges across views of the same buffer, path and revision.
+    pub(super) fn diagnostics(&self) -> impl Iterator<Item = &Diagnostic> {
+        let doc = &self.vim.doc;
         self.diagnostics
             .iter()
             .filter(move |data| {
-                data.version == version && self.vim.doc.path.as_ref() == Some(&data.path)
+                self.diagnostic_buffer == Some(doc.buffer_number())
+                    && data.version.1 == doc.revision
+                    && doc.path == data.path
             })
             .flat_map(|data| &data.diagnostics)
     }
 
-    /// Whether a diagnostic touches the document line, including a point at the line end.
-    pub(super) fn diagnostic_on_line(&self, line: usize) -> bool {
-        let range = self.vim.doc.line_range(line);
-        self.diagnostics().any(|item| {
+    /// Return all diagnostics touching displayed `line`, including points at the end of the file.
+    pub(in crate::grid) fn line_diagnostics(
+        &self,
+        line: usize,
+    ) -> impl Iterator<Item = &Diagnostic> {
+        let mut range = self.vim.doc.line_range(line);
+        if line + 1 == self.vim.line_count() {
+            range.end = self.vim.doc.text.len();
+        }
+        self.diagnostics().filter(move |item| {
             item.start <= range.end
                 && (range.start < item.end || item.start == item.end && item.start >= range.start)
         })
     }
 
-    /// Get the first message at the caret, including diagnostics that mark a single position.
-    pub(in crate::grid) fn caret_diagnostic(&self) -> Option<&str> {
-        let offset = self.vim.doc.cursor;
-        self.diagnostics()
-            .find(|item| {
-                item.start <= offset
-                    && (offset < item.end || item.start == item.end && item.start == offset)
-            })
-            .map(|item| item.message.as_str())
-    }
-
     /// Resolve a diagnostic offset `count` positions in the `forward` direction.
-    /// With `edge`, choose the first or last available position directly.
+    /// With `edge`, choose the first or last position directly. `severity` filters before counting.
     pub(in crate::grid) fn diagnostic_target(
         &self,
         forward: bool,
         edge: bool,
         count: usize,
+        severity: Option<DiagnosticSeverity>,
     ) -> Option<usize> {
+        use unicode_segmentation::UnicodeSegmentation;
+        let doc = &self.vim.doc;
         let mut positions: Vec<_> = self
             .diagnostics()
+            .filter(|item| severity.is_none_or(|level| level == item.severity))
             .map(|item| {
-                self.vim
-                    .doc
-                    .text
-                    .floor_char_boundary(item.start.min(self.vim.doc.text.len()))
+                // Count attainable Normal-mode positions, including diagnostics inside a grapheme
+                // or at an insertion point just beyond the last character.
+                let row = doc
+                    .starts
+                    .partition_point(|&start| start <= item.start)
+                    .saturating_sub(1)
+                    .min(self.vim.line_count() - 1);
+                let start = doc.starts[row];
+                doc.line(row)
+                    .grapheme_indices(true)
+                    .map(|(byte, _)| start + byte)
+                    .take_while(|&byte| byte <= item.start)
+                    .last()
+                    .unwrap_or(start)
             })
             .collect();
         positions.sort_unstable();

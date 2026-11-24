@@ -7,8 +7,6 @@ use crate::{
 };
 use gpui::{Context, MouseMoveEvent, Pixels, Point, Window, px};
 
-pub(super) use crate::grid::text_field::*;
-
 impl Workspace {
     /// Place the host caret from the exact grid positions used to draw this field.
     pub(super) fn press_plugin_field(

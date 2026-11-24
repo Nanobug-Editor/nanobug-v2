@@ -424,6 +424,7 @@ mod tests {
             phase: LanguageServerPhase::Ready,
             documents: Vec::new(),
             languages: BTreeMap::new(),
+            saves: BTreeMap::new(),
             diagnostics: BTreeMap::new(),
             semantics: BTreeMap::new(),
             calls: BTreeMap::new(),

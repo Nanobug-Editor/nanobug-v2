@@ -168,14 +168,19 @@ impl Workspace {
         );
     }
 
+    /// Send filtered text to Ex redirection and verbose logs, independently of the footer.
+    pub(super) fn capture_ex_message(&self, message: &str) -> String {
+        let message = self.input_mappings.filter_ex_output(message);
+        if !message.is_empty() {
+            self.input_mappings.record_ex_output(&message, true);
+        }
+        message
+    }
+
     /// Publish a native Ex status message through the same stream as a script message.
     pub(super) fn ex_output_message(&mut self, message: &str, remember: bool) {
-        let message = self.input_mappings.filter_ex_output(message);
-        if message.is_empty() {
-            return;
-        }
-        self.input_mappings.record_ex_output(&message, true);
-        if self.input_mappings.ex_silence().is_some() {
+        let message = self.capture_ex_message(message);
+        if message.is_empty() || self.input_mappings.ex_silence().is_some() {
             return;
         }
         if remember {

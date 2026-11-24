@@ -5,17 +5,22 @@ use super::{
     layout::*,
     rows::{self, Row, RowContext},
 };
+use crate::ui::components::grid_list::GridList;
 use crate::{
     grid::render::{Frame, LabelStyle, OutlineStyle, Rect},
     ui::{
+        components::grid_tab_bar::TitleTabs,
         ime::Composition,
         text::{TextSpacing, UNITS_PER_COLUMN},
         theme::{ACCENT, GOLD, MUTED, TEXT},
     },
 };
 use nanobug::i18n;
-use std::ops::{Deref, Range};
+use std::ops::Deref;
 use unicode_segmentation::UnicodeSegmentation;
+
+/// Row of the four plugin detail tabs, below the scope or prompt row.
+const DETAIL_TABS_ROW: usize = 2;
 
 /// Editor-side operations supply only their visible content, without exposing task state.
 pub(in crate::grid) struct Presentation {
@@ -61,6 +66,72 @@ impl Deref for VisibleRows<'_> {
 }
 
 impl ManagerView<'_> {
+    /// Measure the detail tabs for both painting and pointer input in `area`.
+    fn detail_tabs(&self, area: Rect) -> Option<TitleTabs<4>> {
+        if self.manager.detail.is_none()
+            || self.presentation.document_hint.is_some()
+            || area.h <= DETAIL_TABS_ROW
+        {
+            return None;
+        }
+        let labels = [
+            "plugin_manager.overview",
+            "plugin_manager.modules",
+            "plugin_manager.rules",
+            "plugin_manager.logs",
+        ];
+        Some(TitleTabs::new(
+            2..area.w.saturating_sub(2),
+            labels.map(i18n::text),
+            false,
+            self.spacing,
+        ))
+    }
+
+    /// Resolve a frame-local pointer target on the current list or detail titles.
+    pub(in crate::grid) fn tab_at(
+        &self,
+        area: Rect,
+        (column, row): (usize, usize),
+    ) -> Option<usize> {
+        if self.uses_plugin_list_layout() {
+            let layout = self.plugin_list_layout(area);
+            if row == layout.list.y && layout.list.h >= 2 {
+                return layout.tabs(self.manager, self.spacing).tab_at(column);
+            }
+            return None;
+        }
+        if row == DETAIL_TABS_ROW {
+            return self.detail_tabs(area)?.tab_at(column);
+        }
+        None
+    }
+
+    /// Paint the visible `tabs` and dividers on `row`, returning the trailing edge.
+    pub(super) fn draw_tabs<const N: usize>(
+        &self,
+        frame: &mut Frame,
+        row: usize,
+        tabs: TitleTabs<N>,
+        selected: usize,
+    ) -> Option<usize> {
+        let mut end = None;
+        for (index, label, columns) in tabs.visible() {
+            if let Some(previous) = end {
+                frame.label(
+                    row,
+                    previous..columns.start,
+                    tabs.separator(),
+                    MUTED,
+                    self.spacing,
+                );
+            }
+            let ink = if index == selected { ACCENT } else { MUTED };
+            end = Some(frame.label(row, columns, label, ink, self.spacing));
+        }
+        end
+    }
+
     pub(in crate::grid) fn rows(&self) -> VisibleRows<'_> {
         match &self.presentation.rows {
             Some(rows) => VisibleRows::Operation(rows),
@@ -96,9 +167,8 @@ impl ManagerView<'_> {
     }
 
     /// Compose the manager's content and frame decorations within `area`.
-    pub(in crate::grid) fn manager_frame(&self, area: Rect) -> Frame {
+    pub(in crate::grid) fn manager_frame(&self, area: Rect) -> (Frame, Option<(Rect, Frame)>) {
         let manager = &self.manager;
-        let mut frame = Frame::new(area.w, area.h);
         let manifest = rows::manifest(&self.data);
         let title = if let Some(title) = &self.presentation.title {
             title.clone()
@@ -116,10 +186,18 @@ impl ManagerView<'_> {
                 |manifest| i18n::format("plugin_manager.details", &[("name", &manifest.name)]),
             )
         };
-        frame.border(&title, true, false, self.spacing);
-        if self.uses_plugin_list_layout() {
-            self.draw_plugin_list(&mut frame, &self.plugin_list_layout(area));
-            return frame;
+        let list = self
+            .uses_plugin_list_layout()
+            .then(|| self.plugin_list_layout(area));
+        let outer_active = list
+            .as_ref()
+            .is_none_or(|layout| layout.list.w < 2 || layout.list.h < 2);
+        let mut frame = Frame::with_title(area, outer_active, false, |frame, columns, ink| {
+            frame.label(0, columns, &title, ink, self.spacing)
+        });
+        if let Some(layout) = list {
+            let body = self.draw_plugin_list(&mut frame, &layout);
+            return (frame, Some((layout.entries, body)));
         }
         let right = area.w.saturating_sub(2);
         let document_list = self.presentation.document_hint.is_some();
@@ -142,7 +220,7 @@ impl ManagerView<'_> {
                     self.spacing,
                 );
             }
-            return frame;
+            return (frame, None);
         }
         if let Some(review) = &self.data.view.review {
             frame.label(
@@ -189,7 +267,7 @@ impl ManagerView<'_> {
                     self.spacing,
                 );
             }
-            return frame;
+            return (frame, None);
         }
         if manager.confirm_remove.is_some() {
             frame.label(
@@ -200,7 +278,7 @@ impl ManagerView<'_> {
                 self.spacing,
             );
             self.prompt_buttons(&mut frame, area.h - 2, right.saturating_sub(SEARCH_BUTTONS));
-            return frame;
+            return (frame, None);
         }
         if manager.prompt.is_some() {
             let (label, text) = self.plugin_prompt_text(area.w.saturating_sub(SEARCH_BUTTONS + 5));
@@ -236,39 +314,14 @@ impl ManagerView<'_> {
                 self.spacing,
             );
         }
-        let (labels, selected): (&[_], usize) = if document_list {
-            (&[], 0)
-        } else if manager.detail.is_some() {
-            (
-                &[
-                    "plugin_manager.overview",
-                    "plugin_manager.modules",
-                    "plugin_manager.rules",
-                    "plugin_manager.logs",
-                ],
-                match manager.detail_page {
-                    Detail::Overview | Detail::Settings => 0,
-                    Detail::Modules => 1,
-                    Detail::Rules | Detail::Compare => 2,
-                    Detail::Logs | Detail::Operations => 3,
-                    Detail::Cleanup => 0,
-                },
-            )
-        } else {
-            (&[], 0)
-        };
-        let mut x = 2;
-        for (index, label) in labels.iter().enumerate() {
-            if index != 0 {
-                x = frame.label(2, x..right, " | ", MUTED, self.spacing);
-            }
-            x = frame.label(
-                2,
-                x..right,
-                i18n::text(label),
-                if index == selected { ACCENT } else { MUTED },
-                self.spacing,
-            );
+        if let Some(tabs) = self.detail_tabs(area) {
+            let selected = match manager.detail_page {
+                Detail::Overview | Detail::Settings | Detail::Cleanup => 0,
+                Detail::Modules => 1,
+                Detail::Rules | Detail::Compare => 2,
+                Detail::Logs | Detail::Operations => 3,
+            };
+            self.draw_tabs(&mut frame, DETAIL_TABS_ROW, tabs, selected);
         }
         let entries = secondary_list_entries(area);
         let preview = self.comparison_preview();
@@ -280,25 +333,27 @@ impl ManagerView<'_> {
         };
         let count = lines.as_ref().map_or(rows.len(), |lines| lines.len());
         let selected = manager.selection.min(count.saturating_sub(1));
-        let visible = self.plugin_visible_rows(entries.h, count);
+        let visible = self.plugin_list(entries.h, count).range();
         let offset = visible.start;
+        let mut body = Frame::viewport(entries.w, entries.h + 1, offset);
+        body.hide_theme_background();
         for index in visible {
             let text = match (preview, &lines) {
                 (Some(preview), Some(lines)) => preview.line(lines[index].clone()),
                 _ => &rows[index].label,
             };
-            frame.label(
-                entries.y + index - offset,
-                2..right,
+            body.label(
+                index - offset,
+                0..entries.w,
                 text,
                 if index == selected { ACCENT } else { TEXT },
                 self.spacing,
             );
         }
         if count == 0 {
-            frame.label(
-                entries.y,
-                2..right,
+            body.label(
+                0,
+                0..entries.w,
                 self.presentation.empty_label,
                 MUTED,
                 self.spacing,
@@ -354,7 +409,7 @@ impl ManagerView<'_> {
                 LabelStyle::Dimmed,
             );
         }
-        frame
+        (frame, Some((entries, body)))
     }
 
     /// Only show the preview while the comparison owns the manager's current focus.
@@ -376,35 +431,24 @@ impl ManagerView<'_> {
         )
     }
 
+    /// The area of selectable entries below this page's fixed headings.
+    pub(in crate::grid) fn entries_area(&self, area: Rect) -> Rect {
+        if self.uses_plugin_list_layout() {
+            self.plugin_list_layout(area).entries
+        } else {
+            secondary_list_entries(area)
+        }
+    }
+
     /// Resolve visible row indices for drawing, caret placement and hit testing after list changes.
-    pub(in crate::grid) fn plugin_visible_rows(
-        &self,
-        capacity: usize,
-        count: usize,
-    ) -> Range<usize> {
-        let manager = &self.manager;
-        let selected = manager.selection.min(count.saturating_sub(1));
-        let offset =
-            list_offset(manager.offset, selected, capacity).min(count.saturating_sub(capacity));
-        offset..(offset + capacity).min(count)
+    pub(in crate::grid) fn plugin_list(&self, capacity: usize, count: usize) -> GridList {
+        GridList::scrolled(count, capacity, self.manager.list_scroll.position())
     }
 
     /// Draw the prompt actions on `row`, starting at the same column used for mouse input.
     pub(in crate::grid) fn prompt_buttons(&self, frame: &mut Frame, row: usize, start: usize) {
-        for (slot, (prefix, key)) in prompt_button_columns(start)
-            .into_iter()
-            .zip([("[✓ ", "Enter"), ("[✕ ", "Esc")])
-        {
-            let start = frame.label(row, slot.clone(), prefix, TEXT, self.spacing);
-            let end = frame.styled_label(
-                row,
-                start..slot.end,
-                key,
-                TEXT,
-                self.spacing,
-                LabelStyle::Key,
-            );
-            frame.label(row, end..slot.end, "]", TEXT, self.spacing);
+        for button in prompt_buttons(start, self.spacing) {
+            frame.button(row, &button, TEXT, self.spacing);
         }
     }
 
@@ -474,7 +518,7 @@ impl ManagerView<'_> {
         if let Some(input) = &manager.prompt {
             let (column, row, units, visible) = if let Some(layout) = &layout {
                 let slot = layout.prompt(&input.kind, self.spacing).input;
-                let (_, units) = self.plugin_list_prompt(slot.len());
+                let units = self.plugin_list_prompt(slot.len()).caret;
                 (
                     slot.start,
                     layout.footer.y,
@@ -502,10 +546,11 @@ impl ManagerView<'_> {
         let entries = layout.map_or_else(|| secondary_list_entries(area), |layout| layout.entries);
         let len = self.plugin_row_count(area);
         let selected = manager.selection.min(len.saturating_sub(1));
-        let visible = self.plugin_visible_rows(entries.h, len);
+        let list = self.plugin_list(entries.h, len);
+        let visible = list.range();
         Some((
             (area.x + entries.x) as f32,
-            (area.y + entries.y + selected.saturating_sub(visible.start)) as f32,
+            (area.y + entries.y + selected) as f32 - list.position(),
             1.,
             false,
             visible.contains(&selected),

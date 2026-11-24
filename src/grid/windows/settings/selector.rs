@@ -1,6 +1,8 @@
 //! Floating value selectors share placement between painting, clipping, cursor and pointer input.
 
 use super::{Editor, Kind, Settings, view};
+use crate::ui::components::grid_list::GridList;
+use crate::ui::components::grid_popover::GridPopover;
 use crate::{
     grid::render::{Frame, GridLayer, Metrics, OutlineStyle, Rect},
     ui::{
@@ -11,6 +13,7 @@ use crate::{
 use gpui::{App, Bounds, Pixels, Point, px};
 
 pub(super) struct SelectorLayout {
+    count: usize,
     frame: Rect,
     pub(super) rows: Rect,
     /// Fractional row shared by the frame and its contents while the anchor is scrolling.
@@ -20,24 +23,12 @@ pub(super) struct SelectorLayout {
 impl SelectorLayout {
     /// Prefer opening below the field. Near the bottom edge use the side with more space.
     fn at(body: Rect, anchor: f32, count: usize) -> Option<Self> {
-        if body.w == 0 || body.h == 0 || count == 0 || anchor <= -1. || anchor >= body.h as f32 {
+        if body.w == 0 || count == 0 {
             return None;
         }
-        let above = anchor.floor().max(0.) as usize;
-        let below = (body.h as f32 - anchor - 1.).floor().max(0.) as usize;
-        let wanted = count.saturating_add(2);
-        let up = below < wanted && above > below;
-        let room = if up { above } else { below };
-        // Short viewports can still display and select one option without a top/bottom border.
-        let border = usize::from(room >= 3 && body.w >= 4);
-        let height = (count + border * 2).min(room.max(1));
-        let top = if room == 0 {
-            anchor.max(0.).min(body.h.saturating_sub(1) as f32)
-        } else if up {
-            anchor - height as f32
-        } else {
-            anchor + 1.
-        };
+        let popover = GridPopover::new(0.0..body.h as f32, anchor..anchor + 1.)?;
+        let list = popover.rows(count, body.w >= 4);
+        let (top, height, border) = (list.top, list.height, list.inset);
         let width = (body.w - view::value_column(body.w)).max(12.min(body.w));
         let frame = Rect {
             x: body.x + body.w - width,
@@ -46,6 +37,7 @@ impl SelectorLayout {
             h: height,
         };
         Some(Self {
+            count,
             frame,
             rows: Rect {
                 x: frame.x + border,
@@ -70,11 +62,15 @@ impl SelectorLayout {
     /// Resolve the visible option under the pointer, accounting for both scrolling surfaces.
     pub(super) fn hit(&self, point: Point<Pixels>, metrics: Metrics, scroll: f32) -> Option<usize> {
         let clip = self.bounds(self.rows, metrics);
-        clip.contains(&point).then(|| {
-            (f32::from(point.y - clip.top()) / metrics.lh + scroll)
-                .floor()
-                .max(0.) as usize
-        })
+        if !clip.contains(&point) {
+            return None;
+        }
+        self.list(scroll)
+            .hit(f32::from(point.y - clip.top()) / metrics.lh)
+    }
+
+    fn list(&self, scroll: f32) -> GridList {
+        GridList::scrolled(self.count, self.rows.h, scroll)
     }
 }
 
@@ -119,14 +115,9 @@ impl Settings {
         let mut items = Frame::new(layout.rows.w, layout.rows.h + 1);
         items.hide_theme_background();
         let multi = matches!(self.field().map(|f| &f.kind), Some(Kind::Multi(_)));
-        let first = self.selector_scroll.first_cell();
-        for (y, choice) in self
-            .choices()
-            .iter()
-            .skip(first)
-            .take(layout.rows.h + 1)
-            .enumerate()
-        {
+        let rows = layout.list(self.selector_scroll.position()).range();
+        let first = rows.start;
+        for (y, choice) in self.choices()[rows].iter().enumerate() {
             let selected = if multi {
                 value
                     .as_array()

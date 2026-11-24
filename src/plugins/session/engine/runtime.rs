@@ -59,6 +59,9 @@ pub(super) enum CallKind {
     Open,
     Refresh,
     Explicit,
+    /// Read-only automatic Diagnose invocation and its single awaited-service callback.
+    BackgroundDiagnose,
+    BackgroundDiagnoseResult,
     /// A manual or save-triggered formatter request, bound to the active snapshot.
     Format,
     User,
@@ -76,7 +79,11 @@ impl CallKind {
     pub(super) fn is_service(self) -> bool {
         matches!(
             self,
-            Self::Service | Self::Continued | Self::CredentialReply | Self::PeerService
+            Self::Service
+                | Self::Continued
+                | Self::BackgroundDiagnoseResult
+                | Self::CredentialReply
+                | Self::PeerService
         )
     }
 

@@ -4,20 +4,21 @@ use super::{
     Workspace, buffer_management::BufferRange, editor_splits::PaneId, layout::Focus,
     projects::WorkspaceTabs,
 };
+use crate::ui::components::grid_confirm::{ButtonAlign, ConfirmButton, GridConfirm};
 use crate::{
     grid::{
-        mnemonic::Mnemonic,
         render::{Frame, MessageLevel, Rect},
         windows::editor::EditorWindow,
     },
     ui::{
+        mnemonic::Mnemonic,
         text::TextSpacing,
         theme::{ACCENT, MUTED, TEXT},
     },
 };
 use gpui::{Context, KeyDownEvent, Modifiers, MouseDownEvent, Window};
 use nanobug::{document::Document, i18n};
-use std::{collections::VecDeque, ops::Range, path::PathBuf};
+use std::{collections::VecDeque, path::PathBuf};
 
 /// Width of the confirmation in grid columns, including the longest button row.
 const COLUMNS: usize = 64;
@@ -57,22 +58,14 @@ fn buttons(multiple: bool) -> impl Iterator<Item = (Choice, Mnemonic)> {
         .map(|(choice, label)| (choice, Mnemonic::parse(i18n::text(label))))
 }
 
-/// Measure visible button slots with the same `spacing` as drawing, including bulk choices if `multiple`.
-fn button_slots(
-    spacing: &TextSpacing,
-    multiple: bool,
-) -> impl Iterator<Item = (Choice, Mnemonic, Range<usize>)> + '_ {
-    let mut start = 2;
-    buttons(multiple).map(move |(choice, label)| {
-        let width: usize = label
-            .spans()
-            .map(|(text, _)| spacing.columns(text))
-            .into_iter()
-            .sum();
-        let slot = start..start + width;
-        start = slot.end + 2;
-        (choice, label, slot)
-    })
+/// Measure localized choices within `width` using `spacing`, including bulk actions for `multiple`.
+fn button_slots(spacing: &TextSpacing, multiple: bool, width: usize) -> Vec<ConfirmButton<Choice>> {
+    GridConfirm::new(buttons(multiple)).slots(
+        2..width.saturating_sub(2),
+        ButtonAlign::Start,
+        2,
+        spacing,
+    )
 }
 
 /// Match a fresh `event` against visible captions, including bulk choices if `multiple`, or Escape.
@@ -85,9 +78,7 @@ fn key_choice(event: &KeyDownEvent, multiple: bool) -> Option<Choice> {
     if key.key == "escape" && mods == Modifiers::default() {
         return Some(Choice::Cancel);
     }
-    buttons(multiple)
-        .find(|(_, label)| label.matches(&key.key))
-        .map(|(choice, _)| choice)
+    GridConfirm::new(buttons(multiple)).key(&key.key)
 }
 
 /// Find the button at grid `(x, y)` in `area`, using the drawn `spacing` and `multiple` choices.
@@ -99,11 +90,10 @@ fn click_choice(
     spacing: &TextSpacing,
     multiple: bool,
 ) -> Option<Choice> {
-    if click_count > 1 || !area.contains(x, y) || y != area.y + area.h - 2 {
+    if click_count > 1 || area.h < 2 || !area.contains(x, y) || y != area.y + area.h - 2 {
         return None;
     }
-    button_slots(spacing, multiple)
-        .find_map(|(choice, _, slot)| slot.contains(&(x - area.x)).then_some(choice))
+    GridConfirm::hit(&button_slots(spacing, multiple, area.w), x - area.x)
 }
 
 /// The scope of the user's close request.
@@ -621,7 +611,7 @@ impl Workspace {
     pub(super) fn editor_close_area(&self) -> Option<Rect> {
         self.editor_close
             .as_ref()
-            .map(|close| self.small_popup_area(COLUMNS, ROWS + usize::from(close.error.is_some())))
+            .map(|close| self.corner_dialog(COLUMNS, ROWS + usize::from(close.error.is_some())))
     }
 
     /// Paint the current filename, any error and the marked captions through `cx`.
@@ -641,7 +631,7 @@ impl Workspace {
             },
         );
         let spacing = &self.spacing;
-        let slot = 2..area.w - 2;
+        let slot = 2..area.w.saturating_sub(2);
         let mut frame = Frame::new(area.w, area.h);
         let title = i18n::text("editor_close.title");
         let details_row = if close.error.is_some() {
@@ -678,12 +668,8 @@ impl Workspace {
                 spacing,
             );
         }
-        for (_, label, slot) in button_slots(spacing, close.pending.len() > 1) {
-            let mut start = slot.start;
-            for (text, style) in label.spans() {
-                start =
-                    frame.styled_label(area.h - 2, start..slot.end, text, ACCENT, spacing, style);
-            }
+        for button in button_slots(spacing, close.pending.len() > 1, area.w) {
+            frame.button(area.h.saturating_sub(2), &button, ACCENT, spacing);
         }
         self.popup_panel
             .update(cx, |panel, cx| panel.set(frame, cx));

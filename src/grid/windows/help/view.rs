@@ -4,6 +4,8 @@ use super::{
     HelpWindow,
     list::{HelpList, Scope},
 };
+use crate::ui::components::grid_dialog::GridDialog;
+use crate::ui::components::grid_tab_bar::TitleTabs;
 use crate::{
     grid::{
         render::{CursorCell, Frame, Metrics, PromptRow, Rect, SEARCH_ICON},
@@ -42,33 +44,17 @@ pub(in crate::grid) struct HelpFrames {
 
 impl HelpList {
     /// Fit the localized titles and separator into `slot` using their measured `spacing`.
-    fn title_parts(
-        &self,
-        slot: Range<usize>,
-        spacing: &TextSpacing,
-    ) -> [(&'static str, Range<usize>); 3] {
-        let mut start = slot.start;
-        let window = self.has_scope(Scope::Window);
-        let global = self.has_scope(Scope::Global);
-        let parts = [
-            if window { self.window_title() } else { "" },
-            if window && global { " | " } else { "" },
-            if global {
-                i18n::text("help.global_title")
-            } else {
-                ""
-            },
-        ];
-        parts.map(|text| {
-            let available = (slot.end - start) * UNITS_PER_COLUMN;
-            let width = spacing
-                .fitting_cells(text, available)
-                .last()
-                .map_or(0, |cell| cell.end.div_ceil(UNITS_PER_COLUMN));
-            let part = start..start + width;
-            start = part.end;
-            (text, part)
-        })
+    fn titles(&self, slot: Range<usize>, spacing: &TextSpacing) -> TitleTabs<2> {
+        let window = self.has_scope(Scope::Window).then(|| self.window_title());
+        let global = self
+            .has_scope(Scope::Global)
+            .then(|| i18n::text("help.global_title"));
+        TitleTabs::new(
+            slot,
+            [window.unwrap_or_default(), global.unwrap_or_default()],
+            false,
+            spacing,
+        )
     }
 
     /// Place each tab's click target in `area` using the same `metrics` and `spacing` as the title.
@@ -85,9 +71,9 @@ impl HelpList {
         } else {
             None
         };
-        let [(_, window), _, (_, global)] =
-            self.title_parts(area.border_title_columns(controls.as_ref()), spacing);
-        [(Scope::Window, window), (Scope::Global, global)].map(|(scope, slot)| {
+        let titles = self.titles(area.border_title_columns(controls.as_ref()), spacing);
+        [Scope::Window, Scope::Global].map(|scope| {
+            let slot = titles.hit_columns(usize::from(scope == Scope::Global));
             let bounds = Rect {
                 x: area.x + slot.start,
                 y: area.y,
@@ -134,12 +120,12 @@ impl HelpWindow {
         };
         let w = cols.saturating_sub(4).min(width);
         let h = rows.saturating_sub(4).min(height + BORDER_ROWS);
-        Rect {
-            x: (cols - w) / 2,
-            y: (rows - h) / 2,
-            w,
-            h,
-        }
+        GridDialog::new(Rect {
+            w: cols,
+            h: rows,
+            ..Rect::default()
+        })
+        .centered(w, h)
     }
 
     /// Shortcut viewport inside `area`; clip its final row while search occupies that space.
@@ -185,7 +171,7 @@ impl HelpWindow {
     ) -> [Bounds<Pixels>; 2] {
         let bounds = Self::search_bounds(area, metrics);
         let slots = PromptRow::new(SEARCH_TEXT_COLUMN, Self::search_area(area).w, spacing);
-        slots.buttons.map(|slot| {
+        slots.button_columns().map(|slot| {
             Bounds::new(
                 bounds.origin + point(px(slot.start as f32 * metrics.cw), px(0.)),
                 size(px(slot.len() as f32 * metrics.cw), bounds.size.height),
@@ -230,28 +216,34 @@ impl HelpWindow {
                 list_frame(list, body, spacing)
             };
 
-        let mut chrome = Frame::new(area.w, area.h);
         let mut dim_title = Frame::new(area.w, 1);
         let global = list.scope() == Scope::Global;
-        chrome.border_with_title(
+        let chrome = Frame::with_title(
+            area,
             context.selected,
             context.controls_hovered,
-            false,
             |frame, slot, color| {
-                let mut end = slot.start;
-                for ((text, part), selected) in list
-                    .title_parts(slot, spacing)
-                    .into_iter()
-                    .zip([!global, false, global])
-                {
-                    let title = if selected {
+                let start = slot.start;
+                let titles = list.titles(slot, spacing);
+                let mut end = None;
+                for (index, text, part) in titles.visible() {
+                    if let Some(previous) = end {
+                        dim_title.label(
+                            0,
+                            previous..part.start,
+                            titles.separator(),
+                            color,
+                            spacing,
+                        );
+                    }
+                    let title = if index == usize::from(global) {
                         &mut *frame
                     } else {
                         &mut dim_title
                     };
-                    end = title.label(0, part, text, color, spacing);
+                    end = Some(title.label(0, part, text, color, spacing));
                 }
-                end
+                end.unwrap_or(start)
             },
         );
         Some(HelpFrames {

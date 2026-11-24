@@ -4,7 +4,10 @@ mod backend;
 mod backend_exclusions;
 #[cfg(test)]
 mod backend_tests;
+mod compiler_diagnostics;
+mod entry_diagnostics;
 mod frontend_exclusions;
+mod member_diagnostics;
 #[cfg(test)]
 #[path = "rust_analyzer/tests.rs"]
 mod real_server_tests;
@@ -23,7 +26,7 @@ use anyhow::{Context, Result, ensure};
 use nanobug_plugin_sdk::{DocumentSnapshot, document_wire::MAX_DOCUMENT_BYTES};
 use serde_json::{Map, Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -109,6 +112,7 @@ enum QuerySource {
 struct Documents {
     snapshots: Vec<Arc<DocumentSnapshot>>,
     languages: BTreeMap<u64, &'static str>,
+    saves: BTreeMap<u64, u64>,
 }
 
 type Snapshots = Arc<Mutex<Option<Documents>>>;
@@ -196,7 +200,7 @@ impl Analyzer {
     /// Replace the set of open snapshots for this project. Superseded edits can be coalesced.
     #[cfg(test)]
     pub(in crate::plugins) fn sync(&self, documents: Vec<Arc<DocumentSnapshot>>) {
-        self.sync_with_languages(documents, BTreeMap::new());
+        self.sync_with_languages(documents, BTreeMap::new(), BTreeMap::new());
     }
 
     /// Publish `documents` with explicit `languages` keyed by their stable opening IDs.
@@ -204,10 +208,12 @@ impl Analyzer {
         &self,
         documents: Vec<Arc<DocumentSnapshot>>,
         languages: BTreeMap<u64, &'static str>,
+        saves: BTreeMap<u64, u64>,
     ) {
         *self.snapshots.lock().unwrap() = Some(Documents {
             snapshots: documents,
             languages,
+            saves,
         });
     }
 
@@ -278,9 +284,13 @@ struct Open {
     /// LSP language ID sent when this URI was opened.
     language: &'static str,
     version: i32,
+    /// Most recent editor write observed by this server for the opening.
+    save_generation: u64,
     /// Next pull request for this document version, if the server supports pull diagnostics.
     diagnose_at: Option<Instant>,
     semantic_at: Option<Instant>,
+    /// Native reports and resolved-module member lookups for this exact Rust overlay.
+    rust_diagnostics: Option<member_diagnostics::RustDiagnostics>,
 }
 
 /// A diagnostic pull tied to the precise version that was open when it was sent.
@@ -301,11 +311,13 @@ struct Client {
     hover: bool,
     /// Whether changes carry a range for servers using incremental synchronization.
     incremental: bool,
+    /// Whether the server accepts didSave, and whether it requests the saved text.
+    save_text: Option<bool>,
     /// Some servers publish diagnostics only via a client request.
     pull_diagnostics: bool,
     semantic: semantic::Tokens,
     diagnostic_serial: u64,
-    diagnostic_requests: BTreeMap<String, DiagnosticRequest>,
+    diagnostic_requests: BTreeMap<String, (DiagnosticRequest, entry_diagnostics::Check)>,
     writer: SyncSender<Value>,
     documents: BTreeMap<String, Open>,
     /// Global within a server session so old diagnostics cannot match a reopened file.
@@ -313,6 +325,9 @@ struct Client {
     pending: BTreeMap<u64, Query>,
     /// Latest Rust status for presentation since the LSP handshake.
     rust_quiescent: bool,
+    /// Active rust-analyzer Cargo checks may still publish their old results after a save.
+    flychecks: BTreeSet<String>,
+    closed_reports: compiler_diagnostics::ClosedReports,
     workspace: Value,
     options: Value,
     /// Native settings returned to workspace configuration requests.
@@ -495,14 +510,24 @@ fn run(
                 if server.sqlfluff_dialect().is_some() {
                     sql_changes = Some((now + DIAGNOSTIC_IDLE, changed));
                 } else {
-                    client.sync_with_languages(root, changed.snapshots, &changed.languages)?;
+                    client.sync_with_languages(
+                        root,
+                        changed.snapshots,
+                        &changed.languages,
+                        &changed.saves,
+                    )?;
                 }
             }
             // SQLFluff launches a linter for every open notification. Coalesce rapid edits.
             if sql_changes.as_ref().is_some_and(|(due, _)| now >= *due)
                 && let Some((_, documents)) = sql_changes.take()
             {
-                client.sync_with_languages(root, documents.snapshots, &documents.languages)?;
+                client.sync_with_languages(
+                    root,
+                    documents.snapshots,
+                    &documents.languages,
+                    &documents.saves,
+                )?;
             }
             // Rust can answer completion and navigation before it can diagnose the loaded project.
             rust_loaded |= client.rust_quiescent || now.duration_since(started) >= INITIALIZE_WAIT;
@@ -546,13 +571,8 @@ fn run(
 }
 
 /// Initialize an endpoint for `root_uri` with its workspace folders and server `options`.
-/// Enable the Rust diagnostic refresh protocol when `refresh_diagnostics` is set.
-fn initialize(
-    root_uri: String,
-    workspace: &Value,
-    options: &Value,
-    refresh_diagnostics: bool,
-) -> Value {
+/// Advertise diagnostic refreshes and Rust-specific semantic tokens to rust-analyzer.
+fn initialize(root_uri: String, workspace: &Value, options: &Value, rust: bool) -> Value {
     let mut message = json!({
         "jsonrpc": "2.0", "id": 0, "method": "initialize",
         "params": {
@@ -577,9 +597,12 @@ fn initialize(
             }
         }
     });
-    if refresh_diagnostics {
+    if rust {
         message["params"]["capabilities"]["workspace"]["diagnostics"] =
             json!({"refreshSupport": true});
+        let tokens = &mut message["params"]["capabilities"]["textDocument"]["semanticTokens"];
+        tokens["tokenTypes"] = json!([semantic::TYPES, &["unresolvedReference"]].concat());
+        tokens["tokenModifiers"] = json!([semantic::MODIFIERS, semantic::RUST_CONTEXT].concat());
     }
     message
 }
@@ -593,6 +616,7 @@ impl Client {
             definition: false,
             hover: false,
             incremental: false,
+            save_text: None,
             pull_diagnostics: false,
             semantic: Default::default(),
             diagnostic_serial: 0,
@@ -602,6 +626,8 @@ impl Client {
             next_version: 0,
             pending: BTreeMap::new(),
             rust_quiescent: false,
+            flychecks: BTreeSet::new(),
+            closed_reports: Default::default(),
             workspace,
             options,
             configuration: Map::new(),
@@ -634,6 +660,7 @@ impl Client {
             .configure(&capabilities["semanticTokensProvider"]);
         self.hover = advertised(&capabilities["hoverProvider"]);
         let sync = &capabilities["textDocumentSync"];
+        self.save_text = advertised(&sync["save"]).then(|| sync["save"]["includeText"] == true);
         self.incremental = self.server != Server::RustAnalyzer
             && sync.as_u64().or_else(|| sync["change"].as_u64()) == Some(2);
         self.pull_diagnostics = self.server.uses_typescript_diagnostics()
@@ -675,7 +702,7 @@ impl Client {
 
     /// Close missing URIs and send whole-document updates only for new revisions.
     fn sync(&mut self, root: &Path, documents: Vec<Arc<DocumentSnapshot>>) -> Result<()> {
-        self.sync_with_languages(root, documents, &BTreeMap::new())
+        self.sync_with_languages(root, documents, &BTreeMap::new(), &BTreeMap::new())
     }
 
     /// Reopen a URI when its `languages` ID changes and keep its real path.
@@ -684,6 +711,7 @@ impl Client {
         root: &Path,
         documents: Vec<Arc<DocumentSnapshot>>,
         languages: &BTreeMap<u64, &'static str>,
+        saves: &BTreeMap<u64, u64>,
     ) -> Result<()> {
         let sqlfluff = self.server.sqlfluff_dialect().is_some();
         let documents: BTreeMap<_, _> = documents
@@ -714,6 +742,10 @@ impl Client {
                     "textDocument/didClose",
                     json!({"textDocument": {"uri": uri}}),
                 )?;
+                if let Some(rust) = &open.rust_diagnostics {
+                    self.closed_reports
+                        .remember(uri, rust.disk.as_deref(), &rust.compiler);
+                }
             }
         }
         self.documents.retain(|uri, open| {
@@ -723,7 +755,14 @@ impl Client {
         });
         for (uri, (language, snapshot)) in documents {
             let previous = self.documents.get(&uri);
+            let save_generation = saves.get(&snapshot.opening).copied().unwrap_or(0);
+            let saved = save_generation != 0
+                && previous.is_none_or(|open| open.save_generation != save_generation);
             if previous.is_some_and(|open| open.snapshot.revision == snapshot.revision) {
+                if saved {
+                    self.documents.get_mut(&uri).unwrap().save_generation = save_generation;
+                    self.did_save(&uri)?;
+                }
                 continue;
             }
             self.next_version = self
@@ -753,18 +792,64 @@ impl Client {
                     "textDocument": {"uri": uri, "version": version, "languageId": language, "text": snapshot.text}
                 }))?;
             }
+            let rust_diagnostics = (self.server == Server::RustAnalyzer).then(|| {
+                if let Some(previous) = self
+                    .documents
+                    .get_mut(&uri)
+                    .and_then(|open| open.rust_diagnostics.as_mut())
+                {
+                    previous.next_revision()
+                } else {
+                    let mut diagnostics = member_diagnostics::RustDiagnostics::default();
+                    diagnostics.saved(snapshot.path.as_deref().and_then(disk_text));
+                    diagnostics.compiler =
+                        self.closed_reports.take(&uri, diagnostics.disk.as_deref());
+                    diagnostics
+                }
+            });
             self.documents.insert(
-                uri,
+                uri.clone(),
                 Open {
                     snapshot,
                     language,
                     version,
+                    save_generation,
                     semantic_at: Some(Instant::now() + DIAGNOSTIC_IDLE),
+                    rust_diagnostics,
                     diagnose_at: self
                         .pull_diagnostics
                         .then(|| Instant::now() + DIAGNOSTIC_IDLE),
                 },
             );
+            if saved {
+                self.did_save(&uri)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Notify after the overlay update, even when a save did not advance its revision.
+    fn did_save(&mut self, uri: &str) -> Result<()> {
+        let open = self.documents.get_mut(uri).expect("just synchronized");
+        let mut text = None;
+        if open.rust_diagnostics.is_some() || self.save_text == Some(true) {
+            text = open.snapshot.path.as_deref().and_then(disk_text);
+        }
+        let params = self.save_text.map(|include_text| {
+            let mut params = json!({"textDocument":{"uri":uri}});
+            if include_text && let Some(text) = &text {
+                params["text"] = text.as_str().into();
+            }
+            params
+        });
+        if let Some(rust) = &mut open.rust_diagnostics {
+            if rust.disk.as_deref() != text.as_deref() && !self.flychecks.is_empty() {
+                rust.awaiting_check = true;
+            }
+            rust.saved(text);
+        }
+        if let Some(params) = params {
+            self.notify("textDocument/didSave", params)?;
         }
         Ok(())
     }
@@ -825,7 +910,7 @@ impl Client {
         let expired: Vec<_> = self
             .diagnostic_requests
             .iter()
-            .filter(|(_, request)| {
+            .filter(|(_, (request, _))| {
                 now >= request.deadline
                     || self
                         .documents
@@ -846,7 +931,7 @@ impl Client {
                 !self
                     .diagnostic_requests
                     .values()
-                    .any(|request| &request.uri == *uri)
+                    .any(|(request, _)| &request.uri == *uri)
             })
             .filter_map(|(uri, open)| {
                 (open.diagnose_at? <= now).then(|| {
@@ -880,11 +965,14 @@ impl Client {
             }))?;
             self.diagnostic_requests.insert(
                 id,
-                DiagnosticRequest {
-                    uri,
-                    version,
-                    deadline: now + INITIALIZE_WAIT,
-                },
+                (
+                    DiagnosticRequest {
+                        uri,
+                        version,
+                        deadline: now + INITIALIZE_WAIT,
+                    },
+                    entry_diagnostics::Check::Native,
+                ),
             );
         }
         Ok(())
@@ -930,8 +1018,21 @@ impl Client {
                     }
                 }
                 self.answer_server(id, method, &message["params"])?;
+            } else if method == "$/progress" && self.server == Server::RustAnalyzer {
+                self.flycheck_progress(&message["params"]);
             } else if method == "experimental/serverStatus" && self.server == Server::RustAnalyzer {
                 if let Some(quiescent) = message["params"]["quiescent"].as_bool() {
+                    if quiescent && !self.rust_quiescent {
+                        for open in self.documents.values_mut() {
+                            open.semantic_at = Some(Instant::now() + DIAGNOSTIC_IDLE);
+                            if let Some(rust) = &mut open.rust_diagnostics {
+                                rust.binary_root = None;
+                                open.diagnose_at = self
+                                    .pull_diagnostics
+                                    .then(|| Instant::now() + DIAGNOSTIC_IDLE);
+                            }
+                        }
+                    }
                     self.rust_quiescent = quiescent;
                 }
             } else if method == "textDocument/publishDiagnostics" {
@@ -943,19 +1044,41 @@ impl Client {
                     } else {
                         uri_path(uri).as_deref().and_then(file_uri)
                     }
-                    && let Some(open) = self.documents.get(&uri)
-                    && (params["version"].as_i64() == Some(i64::from(open.version))
-                        || sqlfluff && params["version"].is_null())
                     && let Value::Array(mut items) = params["diagnostics"].take()
                 {
                     items.truncate(512);
+                    let Some(open) = self.documents.get_mut(&uri) else {
+                        if self.server == Server::RustAnalyzer && params["version"].is_null() {
+                            self.cache_closed_diagnostics(&uri, items);
+                        }
+                        return Ok(());
+                    };
+                    let versioned = params["version"].as_i64() == Some(i64::from(open.version));
+                    if !(versioned
+                        || params["version"].is_null()
+                            && (sqlfluff || open.rust_diagnostics.is_some()))
+                    {
+                        return Ok(());
+                    }
                     if sqlfluff {
                         sql::diagnostic_positions(&open.snapshot, &mut items);
                     }
-                    event(Event::Diagnostics {
-                        snapshot: open.snapshot.clone(),
-                        items,
-                    });
+                    if let Some(rust) = &mut open.rust_diagnostics {
+                        if !rust.awaiting_check
+                            && items.iter().any(compiler_diagnostics::from_compiler)
+                        {
+                            rust.saved(open.snapshot.path.as_deref().and_then(disk_text));
+                        }
+                        rust.pushed(
+                            items,
+                            self.pull_diagnostics,
+                            versioned,
+                            &open.snapshot,
+                            event,
+                        );
+                    } else {
+                        open.report_diagnostics(items, event);
+                    }
                 }
             }
             return Ok(());
@@ -963,18 +1086,10 @@ impl Client {
         if let Some(id) = message["id"].as_str() {
             self.semantic_response(id, message.get("result"), event);
         }
-        if let Some(id) = message["id"].as_str()
-            && let Some(request) = self.diagnostic_requests.remove(id)
-            && let Some(open) = self.documents.get(&request.uri)
-            && open.version == request.version
-            && Instant::now() < request.deadline
-            && let Some(mut items) = diagnostic_items(self.server, &mut message["result"])
+        if let Some(id) = message["id"].as_str().map(str::to_owned)
+            && let Some((request, check)) = self.diagnostic_requests.remove(&id)
         {
-            items.truncate(512);
-            event(Event::Diagnostics {
-                snapshot: open.snapshot.clone(),
-                items,
-            });
+            self.diagnostic_response(request, check, &mut message["result"], event)?;
         }
         if let Some(id) = message["id"].as_u64()
             && let Some(query) = self.pending.remove(&id)
@@ -1137,6 +1252,14 @@ pub(in crate::plugins) fn uri_path(uri: &str) -> Option<PathBuf> {
     (!path.as_os_str().as_encoded_bytes().contains(&0)).then_some(path)
 }
 
+/// Read a bounded saved baseline using the same UTF-8, BOM and newline conventions as the editor.
+fn disk_text(path: &Path) -> Option<String> {
+    let data = super::super::package::read_limited(path, MAX_DOCUMENT_BYTES as u64 * 2 + 3).ok()?;
+    let text = std::str::from_utf8(&data).ok()?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    Some(text.replace("\r\n", "\n"))
+}
+
 /// Verify the saved text of `document` before calculating a position at `offset` for Rust.
 fn indexed_position(
     document: &DocumentSnapshot,
@@ -1272,7 +1395,12 @@ mod tests {
         assert!(receiver.try_recv().is_err());
         let sync = |client: &mut Client, filetype| {
             let id = Server::Typescript.explicit_language_id(filetype).unwrap();
-            client.sync_with_languages(&root, vec![doc.clone()], &BTreeMap::from([(1, id)]))
+            client.sync_with_languages(
+                &root,
+                vec![doc.clone()],
+                &BTreeMap::from([(1, id)]),
+                &BTreeMap::new(),
+            )
         };
         sync(&mut client, "typescript")?;
         let opened = receiver.try_recv()?;

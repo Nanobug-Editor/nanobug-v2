@@ -1,6 +1,8 @@
 //! Lay out and draw the completion menu alongside a visible editor caret.
 
 use super::EditorWindow;
+use crate::ui::components::grid_list::GridList;
+use crate::ui::components::grid_popover::GridPopover;
 use crate::{
     grid::render::{Metrics, Rect},
     ui::{
@@ -24,7 +26,7 @@ pub(in crate::grid) struct CompletionMenu {
     /// Full bounds of the painted rows, including their horizontal padding.
     bounds: Bounds<Pixels>,
     /// Candidate indices represented by the visible rows.
-    rows: Range<usize>,
+    rows: GridList,
     /// Number of text columns between the padding cells.
     columns: usize,
 }
@@ -48,25 +50,18 @@ impl EditorWindow {
         let body = self.text_area(area).pixels(metrics).intersect(&viewport);
         let caret = metrics.at(x, y);
         let row_height = px(metrics.lh);
-        if !body.contains(&caret) || body.bottom() < caret.y + row_height {
-            return None;
-        }
-
-        let max_rows = labels.len().min(MAX_ROWS);
-        let above = (f32::from(caret.y - body.top()) / metrics.lh).floor() as usize;
-        let below = (f32::from(body.bottom() - caret.y - row_height) / metrics.lh).floor() as usize;
-        let opens_below = below >= max_rows || below >= above;
-        let row_count = max_rows.min(if opens_below { below } else { above });
+        let popover = GridPopover::at_caret(body, caret, row_height)?;
+        let row_count = labels
+            .len()
+            .min(MAX_ROWS)
+            .min((popover.available_height() / metrics.lh).floor() as usize);
         let max_columns = (f32::from(body.size.width) / metrics.cw).floor() as usize;
         let text_limit = max_columns.min(MAX_COLUMNS).saturating_sub(2);
         if row_count == 0 || text_limit == 0 {
             return None;
         }
 
-        let first = selected
-            .saturating_sub(row_count - 1)
-            .min(labels.len() - row_count);
-        let rows = first..first + row_count;
+        let rows = GridList::reveal(labels.len(), row_count, 0, selected);
         // Keep the same width while arrow keys scroll the visible rows.
         let mut columns = 1;
         for label in labels {
@@ -79,14 +74,8 @@ impl EditorWindow {
         }
         let width = px((columns + 2) as f32 * metrics.cw);
         let height = row_height * row_count as f32;
-        let left = caret.x.min(body.right() - width).max(body.left());
-        let top = if opens_below {
-            caret.y + row_height
-        } else {
-            caret.y - height
-        };
         Some(CompletionMenu {
-            bounds: Bounds::new(point(left, top), size(width, height)),
+            bounds: popover.pixel_bounds(body, caret.x, size(width, height)),
             rows,
             columns,
         })
@@ -94,6 +83,22 @@ impl EditorWindow {
 }
 
 impl CompletionMenu {
+    /// Use the same fractional viewport for text, selection and pointer hits.
+    pub(in crate::grid) fn position(&mut self, position: f32) {
+        self.rows = self.rows.at(position);
+    }
+
+    pub(in crate::grid) fn advance(
+        &mut self,
+        scroll: &mut nanobug::animation::scroll::GridScroll,
+        count: usize,
+        selected: usize,
+        now: f64,
+    ) {
+        GridList::follow(scroll, count, self.rows.height(), selected, now);
+        self.position(scroll.position());
+    }
+
     /// Return the window-local cutout used by the editor text layer and pointer hit testing.
     pub(in crate::grid) fn bounds(&self) -> Bounds<Pixels> {
         self.bounds
@@ -104,8 +109,8 @@ impl CompletionMenu {
         if !self.bounds.contains(&position) {
             return None;
         }
-        let row = (f32::from(position.y - self.bounds.top()) / metrics.lh).floor() as usize;
-        (row < self.rows.len()).then_some(self.rows.start + row)
+        self.rows
+            .hit(f32::from(position.y - self.bounds.top()) / metrics.lh)
     }
 
     /// Draw the visible `labels` and `selected` index using the editor's font and color roles.
@@ -117,7 +122,7 @@ impl CompletionMenu {
         metrics: Metrics,
         spacing: &TextSpacing,
     ) -> AnyElement {
-        let visible: Vec<_> = labels[self.rows.clone()]
+        let visible: Vec<_> = labels[self.rows.range()]
             .iter()
             .map(|label| {
                 let source = visible_label(label);
@@ -135,7 +140,8 @@ impl CompletionMenu {
                 (gpui::SharedString::from(label.into_owned()), matches)
             })
             .collect();
-        let selected = selected.saturating_sub(self.rows.start);
+        let first = self.rows.range().start;
+        let fraction = self.rows.position().fract();
         let area = self.bounds;
         canvas(
             |_, _, _| (),
@@ -146,8 +152,9 @@ impl CompletionMenu {
                 let pad = px(metrics.cw);
                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
                     for (index, (label, matches)) in visible.into_iter().enumerate() {
-                        let active = index == selected;
-                        let origin = bounds.origin + point(px(0.), height * index as f32);
+                        let active = first + index == selected;
+                        let origin =
+                            bounds.origin + point(px(0.), height * (index as f32 - fraction));
                         if active {
                             let row = Bounds::new(origin, size(bounds.size.width, height));
                             window.paint_quad(fill(row, rgba(appearance.tint(SELECTION))));
@@ -284,7 +291,7 @@ mod tests {
         assert_eq!(bounds.left(), body.left());
         assert_eq!(bounds.right(), body.right());
         assert_eq!(bounds, first.bounds());
-        assert_eq!(menu.rows, 8..12);
+        assert_eq!(menu.rows.range(), 8..12);
         assert_eq!(
             menu.hit(point(bounds.center().x, bounds.bottom() - px(10.)), metrics),
             Some(11),

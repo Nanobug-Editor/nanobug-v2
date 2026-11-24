@@ -1100,32 +1100,63 @@ fn bracket_navigation_uses_native_keys_and_current_buffer_data() {
     let diagnostics = [13, 6, 6].map(|start| Diagnostic {
         start,
         end: start,
+        severity: if start == 6 {
+            nanobug_plugin_sdk::DiagnosticSeverity::Warning
+        } else {
+            nanobug_plugin_sdk::DiagnosticSeverity::Error
+        },
         message: "fixture".into(),
     });
     editor
         .buffer_mut()
         .set_diagnostics(vec![Arc::new(DocumentDiagnostics {
             version,
-            path,
+            path: Some(path),
             diagnostics: diagnostics.into(),
         })]);
     let Action::BracketDiagnostic {
         forward,
         edge,
         count,
+        severity,
     } = keys(&mut editor, "[", "d")
     else {
         panic!("expected diagnostic navigation");
     };
     assert_eq!(
-        editor.buffer().diagnostic_target(forward, edge, count),
+        editor
+            .buffer()
+            .diagnostic_target(forward, edge, count, severity),
         Some(13)
     );
     editor.jump_to(13);
-    assert_eq!(editor.buffer().diagnostic_target(true, false, 1), Some(6));
-    assert_eq!(editor.buffer().diagnostic_target(false, true, 1), Some(6));
+    assert_eq!(
+        editor.buffer().diagnostic_target(true, false, 1, None),
+        Some(6)
+    );
+    assert_eq!(
+        editor.buffer().diagnostic_target(false, true, 1, None),
+        Some(6)
+    );
+    for (key, expected) in [("e", 13), ("w", 6)] {
+        let Action::BracketDiagnostic {
+            forward,
+            edge,
+            count,
+            severity,
+        } = keys(&mut editor, "]", key)
+        else {
+            panic!("expected severity-filtered navigation");
+        };
+        assert_eq!(
+            editor
+                .buffer()
+                .diagnostic_target(forward, edge, count, severity),
+            Some(expected)
+        );
+    }
     editor.edit(|vim, register| vim.text("x", register));
-    assert_eq!(editor.buffer().diagnostic_target(true, true, 1), None);
+    assert_eq!(editor.buffer().diagnostic_target(true, true, 1, None), None);
 }
 
 /// Preedit uses UTF-16 ranges but does not mutate the document until the single committed edit.

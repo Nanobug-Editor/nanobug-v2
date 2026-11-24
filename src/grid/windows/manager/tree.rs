@@ -1,5 +1,5 @@
 //! Lazily expanded filesystem tree with persistent path-based marks.
-use super::EntryIcon;
+use crate::ui::components::grid_tree::{GridTree, TreeRoots};
 use anyhow::Result;
 use nanobug::filesystem::{DirectoryOptions, read_directory};
 use std::{
@@ -13,23 +13,9 @@ pub struct Entry {
     /// Full filesystem path.
     pub path: PathBuf,
     /// Zero-based nesting depth below the project root.
-    pub depth: usize,
+    depth: usize,
     /// Whether this entry is an actual directory rather than a followed symlink.
     pub directory: bool,
-    /// One bit per depth where this entry or its ancestor has a later visible sibling.
-    continuing_branches: u64,
-}
-
-impl Entry {
-    /// Whether the branch at `depth` continues past this row to a later sibling.
-    pub fn branch_continues(&self, depth: usize) -> bool {
-        self.continuing_branches & (1 << depth) != 0
-    }
-
-    /// Choose this entry's Material icon, using `expanded` for directories.
-    pub(crate) fn icon(&self, expanded: bool) -> crate::ui::icons::Icon {
-        EntryIcon::for_path(&self.path, self.directory, expanded).image()
-    }
 }
 
 /// Project tree state, retained while focus moves into the editor.
@@ -38,6 +24,8 @@ pub struct Explorer {
     pub root: PathBuf,
     /// Flattened visible tree, sorted with directories first.
     pub entries: Vec<Entry>,
+    /// Row geometry derived from the same successful directory scan as the entries.
+    pub(super) visible: GridTree,
     /// Selected visible entry.
     pub selected: usize,
     /// Files and directories marked for a batch operation, including collapsed descendants.
@@ -82,6 +70,7 @@ impl Explorer {
         Self {
             root,
             entries: Vec::new(),
+            visible: GridTree::from_preorder(TreeRoots::Connected, []),
             selected: 0,
             marked: HashSet::new(),
             expanded: HashSet::new(),
@@ -93,6 +82,13 @@ impl Explorer {
         let selected = self.entries.get(self.selected).map(|e| e.path.clone());
         let mut entries = Vec::new();
         self.walk(&self.root, 0, &mut entries, false, &|_| true)?;
+        self.visible = GridTree::from_preorder(
+            TreeRoots::Connected,
+            entries
+                .iter()
+                .enumerate()
+                .map(|(id, entry)| (id, entry.depth)),
+        );
         self.entries = entries;
         self.selected = selected
             .and_then(|p| self.entries.iter().position(|e| e.path == p))
@@ -141,22 +137,15 @@ impl Explorer {
             },
             include_file,
         )?;
-        let mut branch_start = output.len();
         for nanobug::filesystem::DirectoryEntry { path, directory } in children {
             if output.len() >= 10_000 {
                 break;
             }
-            // The previous sibling's guide continues only if this sibling fits in the tree.
-            for entry in &mut output[branch_start..] {
-                entry.continuing_branches |= 1 << depth;
-            }
-            branch_start = output.len();
             let open = directory && self.expanded.contains(&path);
             output.push(Entry {
                 path: path.clone(),
                 depth,
                 directory,
-                continuing_branches: 0,
             });
             if open {
                 let _ = self.walk(
@@ -223,9 +212,17 @@ mod tests {
         );
         explorer.refresh()?;
         let rows = |tree: &Explorer| {
-            tree.entries
-                .iter()
-                .map(|entry| (entry.depth, entry.continuing_branches))
+            tree.visible
+                .visible_rows(0, tree.entries.len())
+                .map(|(_, row)| {
+                    let mut continuations = 0;
+                    row.guides(row.control_column(), |column, continues, _| {
+                        if continues {
+                            continuations |= 1 << ((column - 1) / 2);
+                        }
+                    });
+                    (tree.entries[row.id()].depth, continuations)
+                })
                 .collect::<Vec<_>>()
         };
         assert_eq!(

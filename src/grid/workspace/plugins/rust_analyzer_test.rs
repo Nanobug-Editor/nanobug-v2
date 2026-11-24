@@ -14,7 +14,7 @@ use nanobug::plugins::{
     package::{InstallStore, Provider},
     session::{Action, Key, LanguageServerPhase, Session, State},
 };
-use nanobug_plugin_sdk::{Instance, PluginEvent};
+use nanobug_plugin_sdk::{DiagnosticSeverity, Instance, PluginEvent};
 use std::{
     fs,
     path::PathBuf,
@@ -393,20 +393,19 @@ fn native_rust_analyzer_status_changes_in_footer() -> Result<()> {
                     let wrong = "\"unsaved\"";
                     let start = doc.text.find(wrong).context("Retained editor overlay")?;
                     ensure!(fs::read_to_string(&source)?.contains("let _wrong: u32 = 0;"));
-                    Ok(workspace
-                        .plugins
-                        .view
-                        .document_diagnostics
-                        .iter()
-                        .any(|(key, data)| {
+                    Ok(workspace.plugins.view.document_diagnostics.iter().any(
+                        |((key, opening), data)| {
                             key.instance.project == scope
+                                && *opening == doc.opening
                                 && data.version == (doc.opening, doc.revision)
                                 && data.diagnostics.iter().any(|diagnostic| {
                                     diagnostic.start == start
                                         && diagnostic.end == start + wrong.len()
+                                        && diagnostic.severity == DiagnosticSeverity::Error
                                         && diagnostic.message.contains("expected u32")
                                 })
-                        }))
+                        },
+                    ))
                 },
             )
             .await?;
@@ -444,7 +443,8 @@ fn native_rust_analyzer_status_changes_in_footer() -> Result<()> {
                         .any(|(key, error)| {
                             key.instance.project == scope && error.contains("rust.toml")
                         }),
-                    "Expected the launch error to identify the malformed project config"
+                    "Expected the launch error to identify the malformed project config: {:?}",
+                    workspace.plugins.view.analyzer_errors
                 );
                 Ok(())
             })?;
@@ -1203,7 +1203,7 @@ fn native_rust_analyzer_jumps_again_from_an_external_definition() -> Result<()> 
     )
 }
 
-/// Exercise the Cargo rule, project permission, and real server without any Rust buffer open.
+/// Exercise Cargo prelaunch and retain a working server when switching authorized Rust buffers.
 #[test]
 #[ignore = "requires Windows GPUI, matching runtime, rust-analyzer on PATH, and NANOBUG_RUST_PLUGIN_ZIP"]
 fn native_rust_analyzer_starts_on_authorized_cargo_project_open() -> Result<()> {
@@ -1221,8 +1221,18 @@ fn native_rust_analyzer_starts_on_authorized_cargo_project_open() -> Result<()> 
     )?;
     fs::write(
         project.join("src/lib.rs"),
-        "pub fn answer() -> u32 { 42 }\n",
+        concat!(
+            "mod helper;\n",
+            "pub const ANSWER: u32 = 42;\n",
+            "pub fn answer() -> u32 { helper::value() + ANSWER }\n",
+        ),
     )?;
+    fs::write(
+        project.join("src/helper.rs"),
+        "pub fn value() -> u32 { super::ANSWER }\n",
+    )?;
+    let source = project.join("src/lib.rs").canonicalize()?;
+    let helper = project.join("src/helper.rs").canonicalize()?;
     let standalone = temp.path().join("standalone");
     fs::create_dir(&standalone)?;
     fs::write(standalone.join("README.md"), "Non-Cargo project.\n")?;
@@ -1285,6 +1295,15 @@ fn native_rust_analyzer_starts_on_authorized_cargo_project_open() -> Result<()> 
                 window,
                 "rust-analyzer ready from the Cargo rule",
                 |workspace| {
+                    let view = &workspace.plugins.view;
+                    ensure!(
+                        !view
+                            .analyzer_errors
+                            .keys()
+                            .any(|key| key.instance.project == scope),
+                        "rust-analyzer failed during project startup: {:?}",
+                        view.analyzer_errors,
+                    );
                     Ok(workspace
                         .plugins
                         .view
@@ -1298,7 +1317,7 @@ fn native_rust_analyzer_starts_on_authorized_cargo_project_open() -> Result<()> 
                 },
             )
             .await?;
-            step(app, window, |workspace, native, cx| {
+            step(app, window, |workspace, _, _| {
                 let editor = &workspace.projects.active().editor;
                 ensure!(
                     editor
@@ -1308,6 +1327,88 @@ fn native_rust_analyzer_starts_on_authorized_cargo_project_open() -> Result<()> 
                         .starts_with("Cargo project before opening Rust.")
                 );
                 ensure!(editor.buffers().len() == 1);
+                Ok(())
+            })?;
+            // A desktop-launched editor may inherit PATH before Rust was added to Windows.
+            // The caller runs this same workflow with only persisted Rust paths available.
+            for path in [&source, &helper, &source] {
+                let version = step(app, window, |workspace, native, cx| {
+                    workspace.open(path.clone(), native, cx);
+                    workspace.sync(native, cx);
+                    let doc = &workspace.projects.active().editor.vim().doc;
+                    Ok((doc.opening, doc.revision))
+                })?;
+                until(
+                    app,
+                    window,
+                    "Rust server after switching source buffers",
+                    |workspace| {
+                        let view = &workspace.plugins.view;
+                        ensure!(
+                            !view
+                                .analyzer_errors
+                                .keys()
+                                .any(|key| key.instance.project == scope),
+                            "rust-analyzer failed after opening {}: {:?}",
+                            path.display(),
+                            view.analyzer_errors,
+                        );
+                        let status = view.language_servers.get(&scope);
+                        ensure!(
+                            status.is_none_or(|status| status.phase != LanguageServerPhase::Failed),
+                            "rust-analyzer stopped after opening {}",
+                            path.display(),
+                        );
+                        Ok(status.is_some_and(|status| {
+                            status.name == "rust-analyzer"
+                                && status.phase == LanguageServerPhase::Ready
+                                && status.document.as_ref().is_some_and(|(actual, current)| {
+                                    *actual == version.0 && current == path
+                                })
+                        }))
+                    },
+                )
+                .await?;
+                let reply = step(app, window, |workspace, _, _| {
+                    let doc = &workspace.projects.active().editor.vim().doc;
+                    let offset = doc
+                        .text
+                        .rfind("ANSWER")
+                        .context("Rust definition reference")?;
+                    let (send, reply) = async_channel::bounded(1);
+                    workspace
+                        .plugins
+                        .session
+                        .as_ref()
+                        .context("Rust definition session")?
+                        .send(Action::Invoke {
+                            key: Key {
+                                namespace: namespace.clone(),
+                                instance: Instance {
+                                    project: scope,
+                                    module: "complete".into(),
+                                },
+                            },
+                            event: PluginEvent::Definition { offset },
+                            reply: Some(send),
+                            timeout: Duration::from_secs(4),
+                        })?;
+                    Ok(reply)
+                })?;
+                let result = reply.recv().await?.map_err(anyhow::Error::msg)?;
+                ensure!(result.version == Some(version));
+                ensure!(
+                    result
+                        .output
+                        .definitions
+                        .iter()
+                        .any(|item| { item.path.canonicalize().is_ok_and(|path| path == source) }),
+                    "Rust definition failed after switching to {}: {:?}",
+                    path.display(),
+                    result.output.definitions,
+                );
+            }
+            step(app, window, |workspace, native, cx| {
                 workspace.request_close(CloseTarget::Tab, native, cx);
                 Ok(())
             })?;
@@ -1482,6 +1583,8 @@ fn native_rust_analyzer_completes_diagnoses_and_navigates_unsaved_rust() -> Resu
     fs::write(&helpers, "pub(crate) fn next_value() -> u32 { 2 }\n")?;
     let saved = "mod helpers;\nstruct Widget { disk_field: u32 }\n";
     fs::write(&source, saved)?;
+    let binary = project.join("src/main.rs");
+    fs::write(&binary, "fn main() {}\n")?;
 
     let archive = std::env::var_os("NANOBUG_RUST_PLUGIN_ZIP")
         .map(PathBuf::from)
@@ -1537,6 +1640,64 @@ fn native_rust_analyzer_completes_diagnoses_and_navigates_unsaved_rust() -> Resu
             })
             .await?;
 
+            step(app, window, |workspace, native, cx| {
+                workspace.open(binary.clone(), native, cx);
+                workspace
+                    .projects
+                    .active_mut()
+                    .editor
+                    .buffer_mut()
+                    .vim
+                    .set_cursor(6);
+                keys(workspace, &["x"], native, cx);
+                ensure!(workspace.projects.active().editor.vim().doc.text == "fn mai() {}\n");
+                Ok(())
+            })?;
+            until(
+                app,
+                window,
+                "missing main on the unsaved declaration",
+                |workspace| {
+                    Ok(workspace.diagnostic_entries(None).iter().any(|entry| {
+                        entry.column == 3
+                            && entry.severity == DiagnosticSeverity::Error
+                            && entry.message.contains("main")
+                            && entry.message.contains("binary crate")
+                    }))
+                },
+            )
+            .await?;
+            step(app, window, |workspace, native, cx| {
+                ensure!(fs::read_to_string(&binary)? == "fn main() {}\n");
+                workspace.run_vim(
+                    |vim, register| vim.execute_ex_line("w", register),
+                    native,
+                    cx,
+                );
+                workspace.sync(native, cx);
+                Ok(())
+            })?;
+            until(app, window, "cargo check after :w", |workspace| {
+                Ok(workspace.diagnostic_entries(None).iter().any(|entry| {
+                    entry.severity == DiagnosticSeverity::Error
+                        && entry.message.contains("main")
+                        && entry.message.contains("ra_fixture")
+                }))
+            })
+            .await?;
+            step(app, window, |workspace, native, cx| {
+                ensure!(fs::read_to_string(&binary)? == "fn mai() {}\n");
+                keys(workspace, &["u"], native, cx);
+                ensure!(workspace.projects.active().editor.vim().doc.text == "fn main() {}\n");
+                workspace.run_vim(
+                    |vim, register| vim.execute_ex_line("w", register),
+                    native,
+                    cx,
+                );
+                workspace.open(source.clone(), native, cx);
+                Ok(())
+            })?;
+
             let prefix = "editor_only_";
             let field = "editor_only_field";
             let unsaved = concat!(
@@ -1548,8 +1709,13 @@ fn native_rust_analyzer_completes_diagnoses_and_navigates_unsaved_rust() -> Resu
                 "    let _marker = \"😀\"; widget.editor_only_ + helpers::next_value()\n",
                 "}\n",
                 "pub fn standard_result() -> Result<(), ()> { Ok(()) }\n",
+                "pub fn typo() { helpers::next_valu(); }\n",
             );
             let wrong = "\"bad\"";
+            let typo = "next_valu";
+            let typo_start = unsaved
+                .find("next_valu()")
+                .context("Misspelled module member")?;
             let wrong_start = unsaved.find(wrong).context("Unsaved type mismatch")?;
             let wrong_end = wrong_start + wrong.len();
             let field_start = unsaved.rfind(prefix).context("Unsaved field prefix")?;
@@ -1561,27 +1727,33 @@ fn native_rust_analyzer_completes_diagnoses_and_navigates_unsaved_rust() -> Resu
                 workspace.sync(native, cx);
                 Ok(())
             })?;
-            let diagnostics =
-                until(
-                    app,
-                    window,
-                    "live diagnostics for the unsaved type mismatch",
-                    |workspace| {
-                        let doc = &workspace.projects.active().editor.vim().doc;
-                        Ok(workspace.plugins.view.document_diagnostics.iter().any(
-                            |(key, result)| {
-                                key.instance.project == scope
-                                    && result.version == (doc.opening, doc.revision)
-                                    && result.diagnostics.iter().any(|diagnostic| {
-                                        diagnostic.start == wrong_start
-                                            && diagnostic.end == wrong_end
-                                            && diagnostic.message.contains("expected u32")
-                                    })
-                            },
-                        ))
-                    },
-                )
-                .await;
+            let diagnostics = until(
+                app,
+                window,
+                "live diagnostics for the unsaved type mismatch and misspelled function",
+                |workspace| {
+                    let doc = &workspace.projects.active().editor.vim().doc;
+                    Ok(workspace.plugins.view.document_diagnostics.iter().any(
+                        |((key, opening), result)| {
+                            key.instance.project == scope
+                                && *opening == doc.opening
+                                && result.version == (doc.opening, doc.revision)
+                                && result.diagnostics.iter().any(|diagnostic| {
+                                    diagnostic.start == wrong_start
+                                        && diagnostic.end == wrong_end
+                                        && diagnostic.severity == DiagnosticSeverity::Error
+                                        && diagnostic.message.contains("expected u32")
+                                })
+                                && result.diagnostics.iter().any(|diagnostic| {
+                                    diagnostic.start == typo_start
+                                        && diagnostic.end == typo_start + typo.len()
+                                        && diagnostic.severity == DiagnosticSeverity::Error
+                                })
+                        },
+                    ))
+                },
+            )
+            .await;
             if let Err(error) = diagnostics {
                 return step(app, window, |workspace, _, _| {
                     let project = workspace.projects.active();
@@ -1607,16 +1779,31 @@ fn native_rust_analyzer_completes_diagnoses_and_navigates_unsaved_rust() -> Resu
 
             step(app, window, |workspace, native, cx| {
                 workspace.refresh_document_presentation();
-                let editor = &mut workspace.projects.active_mut().editor;
-                let buffer = editor.buffer_mut();
-                buffer.vim.set_cursor(wrong_start);
+                workspace
+                    .projects
+                    .active_mut()
+                    .editor
+                    .buffer_mut()
+                    .vim
+                    .set_cursor(wrong_start);
+                workspace.refresh_footer(cx);
+                let labels = workspace.footer_panel.read(cx).row_labels(0);
+                let relative = PathBuf::from("src").join("lib.rs");
                 ensure!(
-                    buffer
-                        .caret_diagnostic()
-                        .is_some_and(|message| message.contains("expected u32"))
+                    labels
+                        .iter()
+                        .any(|label| label == relative.to_string_lossy().as_ref())
+                        && !labels.iter().any(|label| label.contains("expected u32")),
+                    "footer on a Rust type error: {labels:?}"
                 );
                 keys(workspace, &["ctrl-w", "d"], native, cx);
-                ensure!(workspace.projects.active().status.contains("expected u32"));
+                ensure!(
+                    workspace
+                        .definition_hover_text()
+                        .is_some_and(|message| message.contains("expected u32"))
+                );
+                ensure!(workspace.definition_hover_popup(native, cx).is_some());
+                keys(workspace, &["escape"], native, cx);
                 workspace
                     .projects
                     .active_mut()
@@ -1832,19 +2019,17 @@ fn native_rust_analyzer_completes_diagnoses_and_navigates_unsaved_rust() -> Resu
                 "live diagnostics to clear after correcting the type mismatch",
                 |workspace| {
                     let doc = &workspace.projects.active().editor.vim().doc;
-                    Ok(workspace
-                        .plugins
-                        .view
-                        .document_diagnostics
-                        .iter()
-                        .any(|(key, result)| {
+                    Ok(workspace.plugins.view.document_diagnostics.iter().any(
+                        |((key, opening), result)| {
                             key.instance.project == scope
+                                && *opening == doc.opening
                                 && result.version == (doc.opening, doc.revision)
                                 && !result
                                     .diagnostics
                                     .iter()
                                     .any(|diagnostic| diagnostic.message.contains("expected u32"))
-                        }))
+                        },
+                    ))
                 },
             )
             .await?;

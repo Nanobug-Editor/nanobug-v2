@@ -1,11 +1,42 @@
-//! Cross-window regressions using actual filesystem transfers and editor-owned buffers.
+//! Cross-window regressions covering pane geometry, filesystem transfers and editor-owned buffers.
 
 use super::{
     editor::EditorWindow,
     manager::{ManagerCommand, ManagerWindow},
 };
+use crate::grid::render::Rect;
 use nanobug::document::Document;
 use std::{fs, path::Path};
+
+/// Both windows start inside the border, with one additional fixed root row in the file manager.
+#[test]
+fn editor_and_manager_keep_their_first_scrollable_row() {
+    let area = Rect {
+        x: 5,
+        y: 7,
+        w: 18,
+        h: 8,
+    };
+    let editor_body = Rect {
+        x: 6,
+        y: 8,
+        w: 16,
+        h: 6,
+    };
+    assert_eq!(EditorWindow::body(area), editor_body);
+    assert_eq!(
+        ManagerWindow::body(area),
+        Rect {
+            y: 9,
+            h: 5,
+            ..editor_body
+        }
+    );
+
+    let short = Rect { h: 3, ..area };
+    assert_eq!(EditorWindow::body(short).h, 1);
+    assert_eq!(ManagerWindow::body(short).h, 0);
+}
 
 /// Select a manager entry by `path`, avoiding assumptions about filesystem enumeration order.
 fn select(manager: &mut ManagerWindow, path: &Path) {

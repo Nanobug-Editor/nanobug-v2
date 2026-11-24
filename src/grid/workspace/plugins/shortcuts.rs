@@ -411,7 +411,8 @@ mod tests {
                             );
                             workspace.plugins.manager.help = true;
                             ensure!(
-                                workspace.plugin_manager_view().manager_frame(area) == expected
+                                workspace.plugin_manager_view().manager_frame(area)
+                                    == (expected, None)
                             );
                             workspace.plugins.manager.help = false;
 

@@ -182,6 +182,10 @@ pub(super) fn use_session(workspace: &mut Workspace, session: Session) {
     workspace.sync_plugin_projects();
 }
 
+/// Diagnostic lists exercise the same guest and workspace fixtures as other editing commands.
+#[path = "native_editing_tests/diagnostic_lists.rs"]
+mod diagnostic_lists;
+
 /// Install a guest that returns its exact last UI input and callback count on Diagnose.
 fn install_underline_guest(root: &Path, profile: &Path) -> Result<Identity> {
     use nanobug::plugins::package::{HostCompatibility, UI_CONTRACT};
@@ -828,6 +832,239 @@ fn native_plugin_composition_and_paste_survive_a_worker_exit() -> Result<()> {
                 ensure!(fs::read_to_string(document)? == "saved正文\n");
                 Ok(())
             })
+        },
+    )
+}
+
+/// A WASM diagnostic provider updates both views of one buffer before any explicit command.
+#[test]
+#[ignore = "requires Windows native GPUI and the bundled plugin runtime"]
+fn native_plugin_diagnostic_waves_follow_shared_buffer_revisions() -> Result<()> {
+    use crate::{
+        grid::{render::Rect, windows::WindowFrame},
+        ui::theme::{
+            AppearanceSettings, ERROR_UNDERLINE, ThemeChoice, ThemeComponent, WARNING_UNDERLINE,
+            style,
+        },
+    };
+    use gpui::{AppContext as _, EntityInputHandler};
+
+    let temp = tempfile::tempdir()?;
+    let project = temp.path().join("workspace");
+    let profile = temp.path().join("profile");
+    let path = project.join("sample.txt");
+    fs::create_dir(&project)?;
+    fs::write(&path, "warn bad safe\n")?;
+    let owner = install(
+        temp.path(),
+        &profile,
+        Fixture {
+            id: "underlines",
+            event: "diagnose",
+            reply: Some(json!({"diagnostics": [
+                {"start": 0, "end": 4, "message": "warning", "severity": "warning"},
+                {"start": 5, "end": 8, "message": "error 错误", "severity": "error"}
+            ]})),
+            selected: None,
+            iterations: 0,
+            active: true,
+            change_files: false,
+        },
+    )?;
+    native_test::run_async_visible(
+        project.clone(),
+        options(&project, &profile)?,
+        |_| {},
+        async move |window, app| {
+            until(app, window, "space for a second pane", |workspace| {
+                Ok(workspace.layout.visible_cols >= 60)
+            })
+            .await?;
+            step(app, window, |workspace, native, cx| {
+                workspace.open(path.clone(), native, cx);
+                workspace.open_editor_split(false, None, native, cx);
+                ensure!(workspace.projects.active().page_editors().count() == 2);
+                Ok(())
+            })?;
+
+            // Compare paint against an unaffected letter in the same row and pane.
+            let matches = |workspace: &Workspace, marked: bool| -> Result<bool> {
+                ensure!(!workspace.plugins.open);
+                let context = WindowFrame {
+                    area: Rect {
+                        w: 32,
+                        h: 6,
+                        ..Default::default()
+                    },
+                    selected: false,
+                    modal_open: false,
+                    controls_hovered: false,
+                    spacing: &workspace.spacing,
+                };
+                for (_, editor) in workspace.projects.active().page_editors() {
+                    let text = editor.content_frames(context, |_| None).1;
+                    let plain = text.cell_paint_at(0, 9);
+                    for column in 0..13 {
+                        let expected = match (marked, column) {
+                            (true, 0..=3) => plain.with_undercurl(WARNING_UNDERLINE),
+                            (true, 5..=7) => plain.with_undercurl(ERROR_UNDERLINE),
+                            _ => plain,
+                        };
+                        if text.cell_paint_at(0, column) != expected {
+                            return Ok(false);
+                        }
+                    }
+                }
+                Ok(true)
+            };
+            until(
+                app,
+                window,
+                "WASM diagnostic waves in both panes",
+                |workspace| matches(workspace, true),
+            )
+            .await?;
+            for choice in [ThemeChoice::Dark, ThemeChoice::Light] {
+                let samples = step(app, window, |workspace, native, cx| {
+                    workspace.apply_appearance(
+                        AppearanceSettings {
+                            theme: choice,
+                            ..workspace.appearance
+                        },
+                        native,
+                        cx,
+                    );
+                    let theme = style(cx).for_component(ThemeComponent::Editor);
+                    let text = workspace
+                        .projects
+                        .active()
+                        .editor
+                        .text_area(workspace.active_editor_area());
+                    let scale = native.scale_factor();
+                    Ok([(0, 4, WARNING_UNDERLINE), (5, 3, ERROR_UNDERLINE)].map(
+                        |(col, width, role)| {
+                            let region = Rect {
+                                x: text.x + col,
+                                y: text.y,
+                                w: width,
+                                h: 1,
+                            }
+                            .pixels(workspace.metrics);
+                            let x = (f32::from(region.left()) * scale).floor() as u32
+                                ..(f32::from(region.right()) * scale).ceil() as u32;
+                            let y = (f32::from(region.top()) * scale).floor() as u32
+                                ..(f32::from(region.bottom()) * scale).ceil() as u32;
+                            (x, y, theme.foreground(role).to_be_bytes())
+                        },
+                    ))
+                })?;
+                let image = app.update_window(window.into(), |_, native, cx| {
+                    native.draw(cx).clear(cx);
+                    native.render_to_image()
+                })??;
+                for (columns, rows, rgb) in samples {
+                    let painted_rows = rows
+                        .filter(|&y| {
+                            columns.clone().any(|x| {
+                                image.get_pixel(x, y).0[..3]
+                                    .iter()
+                                    .zip(&rgb[1..])
+                                    .all(|(a, b)| a.abs_diff(*b) <= 16)
+                            })
+                        })
+                        .count();
+                    ensure!(
+                        painted_rows >= 2,
+                        "missing {choice:?} native wave in color {rgb:?}"
+                    );
+                }
+            }
+            step(app, window, |workspace, native, cx| {
+                use diagnostic_lists::press;
+                let last = workspace
+                    .projects
+                    .active()
+                    .editor
+                    .vim()
+                    .doc
+                    .text
+                    .find("safe")
+                    .unwrap();
+                workspace.projects.active_mut().editor.jump_to(last);
+                for keys in [["ctrl-w", "d"].as_slice(), &["space", "c", "d"]] {
+                    press(workspace, keys, native, cx)?;
+                    let text = workspace
+                        .definition_hover_text()
+                        .context("line diagnostic float")?;
+                    ensure!(
+                        text.contains("warning") && text.contains("error"),
+                        "all messages on the caret line"
+                    );
+                    ensure!(workspace.definition_hover_popup(native, cx).is_some());
+                    press(workspace, &["escape"], native, cx)?;
+                }
+                for marked in [false, true] {
+                    press(workspace, &["space", "u", "d"], native, cx)?;
+                    ensure!(
+                        matches(workspace, marked)?,
+                        "diagnostic display must follow the toggle in both panes"
+                    );
+                    ensure!(
+                        workspace.diagnostic_entries(None).len() == 2,
+                        "hidden decorations keep list entries"
+                    );
+                }
+                press(workspace, &["space", "s", "d"], native, cx)?;
+                ensure!(
+                    workspace.projects.active().editor.vim().mode == nanobug::vim::Mode::Search
+                );
+                ensure!(workspace.accepts_native_text());
+                workspace.replace_and_mark_text_in_range(None, "cuowu", Some(5..5), native, cx);
+                ensure!(workspace.marked_text_range(native, cx) == Some(0..5));
+                workspace.replace_text_in_range(None, "错误", native, cx);
+                press(workspace, &["enter"], native, cx)?;
+                ensure!(!workspace.accepts_native_text());
+                press(workspace, &["enter"], native, cx)?;
+                let editor = &workspace.projects.active().editor;
+                ensure!(
+                    editor.buffer().list_owner().is_none() && editor.vim().doc.cursor == 5,
+                    "result search jumps to the error"
+                );
+                press(workspace, &["space", "x", "x"], native, cx)?;
+                Ok(())
+            })?;
+            step(app, window, |workspace, native, cx| {
+                let doc = &mut workspace.projects.active_mut().editor.buffer_mut().vim.doc;
+                doc.replace(13..13, "!", true);
+                workspace.sync(native, cx);
+                ensure!(
+                    matches(workspace, false)?,
+                    "stale revision is still underlined"
+                );
+                Ok(())
+            })?;
+            until(
+                app,
+                window,
+                "diagnostics for the unsaved revision",
+                |workspace| matches(workspace, true),
+            )
+            .await?;
+            step(app, window, |workspace, _, _| {
+                workspace
+                    .plugins
+                    .session
+                    .as_ref()
+                    .context("plugin session")?
+                    .send(Action::SetEnabled(owner.namespace(), false))
+            })?;
+            until(
+                app,
+                window,
+                "disabled provider waves to clear",
+                |workspace| matches(workspace, false),
+            )
+            .await
         },
     )
 }

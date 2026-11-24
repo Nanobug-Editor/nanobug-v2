@@ -9,8 +9,7 @@ mod view;
 
 pub(in crate::grid) use input::ListTabClose;
 pub(in crate::grid) use layout::{
-    ListLayout, MIN_HEIGHT, SEARCH_BUTTONS, prompt_button_at, secondary_description,
-    secondary_list_entries,
+    SEARCH_BUTTONS, prompt_button_at, secondary_description, secondary_list_entries,
 };
 use nanobug::{
     i18n,
@@ -90,8 +89,21 @@ pub(in crate::grid) enum Prompt {
 
 /// Plain footer text; credential prompts retain their secret separately in zeroizing storage.
 pub(in crate::grid) struct Input {
+    /// Selection in the editable single-line search or development path.
+    pub(in crate::grid) field: crate::ui::components::grid_text_field::GridTextField,
     pub(in crate::grid) kind: Prompt,
     pub(in crate::grid) value: String,
+}
+
+impl Input {
+    /// Open a prompt with its caret at the end of the initial value.
+    pub(in crate::grid) fn new(kind: Prompt, value: String) -> Self {
+        Self {
+            kind,
+            value,
+            field: Default::default(),
+        }
+    }
 }
 
 /// Local navigation and review state, separate from the session's published package data.
@@ -108,6 +120,8 @@ pub(in crate::grid) struct ManagerWindow {
     pub(in crate::grid) selection: usize,
     pub(in crate::grid) list_selection: usize,
     pub(in crate::grid) offset: usize,
+    /// Visual position of the entries between the fixed header and description.
+    pub(in crate::grid) list_scroll: nanobug::animation::scroll::GridScroll,
     pub(in crate::grid) search: String,
     pub(in crate::grid) prompt: Option<Input>,
     pub(in crate::grid) help: bool,

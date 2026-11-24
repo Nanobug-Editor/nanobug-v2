@@ -158,10 +158,11 @@ mod tests {
         }
         let diagnostics = DocumentDiagnostics {
             version: (doc.opening, doc.revision),
-            path: doc.path.clone().unwrap(),
+            path: doc.path.clone(),
             diagnostics: vec![Diagnostic {
                 start: 0,
                 end: 2,
+                severity: nanobug_plugin_sdk::DiagnosticSeverity::Warning,
                 message: "diagnostic".into(),
             }],
         };

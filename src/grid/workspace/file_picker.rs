@@ -1,16 +1,20 @@
 //! Connect the picker to workspace tabs, native input, and background filesystem work.
 
 mod focused;
+#[cfg(all(test, windows))]
+mod native_tests;
 mod operations;
 
 use super::{
     Workspace,
     layout::{FOOTER_ROWS, ShellWindow},
 };
+use crate::ui::components::grid_confirm::GridConfirm;
+use crate::ui::components::grid_toast::GridToast;
 use crate::{
     grid::{
         PreviewHighlighter,
-        render::{GridLayer, MessageLevel, Metrics, Panel, Rect},
+        render::{Frame, GridLayer, MessageLevel, Metrics, Panel, Rect},
         windows::{
             PathChange,
             editor::EditorWindow,
@@ -32,16 +36,14 @@ use operations::Operation;
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 /// One floating message, with its panel bounds and a dismissal canceled on replacement.
 struct PickerMessage {
-    /// Controls the border and text colors for the feedback.
-    level: MessageLevel,
-    text: String,
+    /// Message content, severity and dismissal timer.
+    toast: GridToast,
+    /// Current placement used to clip the layers below the message.
     area: Rect,
-    _dismiss: Task<()>,
 }
 
 /// How the workspace uses the entry activated in one picker session.
@@ -372,7 +374,8 @@ impl Workspace {
                 .update(cx, |panel, cx| panel.set(frame, cx));
         }
         if let Some(message) = &mut session.message {
-            let (area, frame) = layout.message_frame(message.level, &message.text, &self.spacing);
+            let (area, frame) =
+                Frame::toast(&message.toast, layout.area, layout.preview.w, &self.spacing);
             message.area = area;
             session
                 .message_panel
@@ -545,28 +548,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let session = self.file_picker.as_mut().expect("active picker");
-        let text = message.replace(['\r', '\n', '\t'], " ");
-        if text.trim().is_empty() {
-            session.message = None;
-            return;
-        }
-        let delay = cx.background_executor().timer(Duration::from_secs(2));
-        let dismiss = cx.spawn_in(window, async move |view, cx| {
-            delay.await;
-            let _ = cx.update(|_, cx| {
-                let _ = view.update(cx, |workspace, cx| {
-                    if let Some(session) = &mut workspace.file_picker {
-                        session.message = None;
-                        cx.notify();
-                    }
-                });
-            });
-        });
-        session.message = Some(PickerMessage {
-            level,
-            text,
+        session.message = GridToast::show(level, message, window, cx, |workspace, cx| {
+            if let Some(session) = &mut workspace.file_picker {
+                session.message = None;
+                cx.notify();
+            }
+        })
+        .map(|toast| PickerMessage {
+            toast,
             area: Rect::default(),
-            _dismiss: dismiss,
         });
     }
 
@@ -601,20 +591,11 @@ impl Workspace {
             if !session.state.composition.is_empty() || modifiers.alt || modifiers.function {
                 return false;
             }
-            if (modifiers.control || modifiers.platform) && raw == "a" {
-                session
-                    .state
-                    .prompt
-                    .as_mut()
-                    .expect("prompt")
-                    .edit("select-all");
-                self.sync(window, cx);
-                return true;
-            }
-            if modifiers.control || modifiers.platform || modifiers.shift {
-                return false;
-            }
-            if matches!(raw, "enter" | "escape") {
+            if !modifiers.control
+                && !modifiers.platform
+                && !modifiers.shift
+                && matches!(raw, "enter" | "escape")
+            {
                 if !event.is_held {
                     self.finish_picker_prompt(raw == "escape", window, cx);
                 }
@@ -622,7 +603,7 @@ impl Workspace {
             }
             let preferred = session.state.entry().map(|entry| entry.path.clone());
             let prompt = session.state.prompt.as_mut().expect("prompt");
-            if !prompt.edit(raw) {
+            if !prompt.edit(key) {
                 return false;
             }
             session.state.update_prompt_matches(preferred.as_deref());
@@ -659,9 +640,7 @@ impl Workspace {
                 let confirm = match raw {
                     "enter" => Some(true),
                     "escape" => Some(false),
-                    _ => delete_buttons()
-                        .into_iter()
-                        .find_map(|(confirm, label)| label.matches(raw).then_some(confirm)),
+                    _ => GridConfirm::new(delete_buttons()).key(raw),
                 };
                 if let Some(confirm) = confirm {
                     self.confirm_picker_delete(confirm, window, cx);
@@ -1198,6 +1177,14 @@ impl Workspace {
             return;
         }
         if session.state.prompt.is_some() {
+            session.state.press_prompt(
+                layout,
+                event.position,
+                self.metrics,
+                &self.spacing,
+                event.modifiers.shift,
+            );
+            self.sync(window, cx);
             return;
         }
         session.state.goto = false;

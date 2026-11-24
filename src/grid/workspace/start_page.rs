@@ -2,7 +2,7 @@
 
 use super::{Workspace, editor_close::CloseTarget};
 use crate::grid::{
-    render::Rect,
+    render::{GridLayer, Rect},
     windows::{
         manager::{Entry, Explorer},
         start::{
@@ -51,13 +51,67 @@ impl Workspace {
             let frame = page.frame(
                 layout,
                 self.recent_projects.error.as_deref(),
-                preview,
                 StartPage::content_metrics(self.metrics),
                 &self.spacing,
             );
+            if let StartLayout::Projects(area) = layout
+                && let Some(picker) = &page.picker
+            {
+                for (panel, body) in
+                    self.start_bodies
+                        .iter()
+                        .zip(picker.bodies(area, preview, &self.spacing))
+                {
+                    if let Some(body) = body {
+                        panel.update(cx, |panel, cx| panel.set(body, cx));
+                    }
+                }
+            }
             self.start_panel
                 .update(cx, |panel, cx| panel.set(frame, cx));
         }
+    }
+
+    /// Sample both picker scroll offsets before drawing or resolving its next pointer event.
+    pub(super) fn advance_start_lists(&mut self) {
+        let Some(StartLayout::Projects(layout)) = self.start_layout() else {
+            return;
+        };
+        let count = self
+            .start_preview
+            .as_ref()
+            .and_then(|p| p.rows.as_ref()?.as_ref().ok())
+            .map_or(0, Vec::len);
+        if let Some(picker) = self.projects.start_mut().and_then(|p| p.picker.as_mut()) {
+            picker.track(
+                layout.project_rows(),
+                layout.preview_rows(),
+                count,
+                self.scroll_epoch.elapsed().as_secs_f64(),
+            );
+        }
+    }
+    /// Fixed chrome followed by the clipped bodies that belong to this start tab.
+    pub(super) fn start_layers(&self, layout: Option<StartLayout>) -> Vec<GridLayer> {
+        let Some(layout) = layout else {
+            return Vec::new();
+        };
+        let metrics = StartPage::content_metrics(self.metrics);
+        let mut layers = vec![GridLayer {
+            panel: self.start_panel.clone(),
+            bounds: layout.frame_area().pixels(metrics),
+            clip: None,
+        }];
+        if let StartLayout::Projects(area) = layout
+            && let Some(picker) = self.projects.start().and_then(|p| p.picker.as_ref())
+        {
+            for (panel, viewport) in self.start_bodies.iter().zip(picker.body_viewports(area)) {
+                if let Some((rect, fraction)) = viewport {
+                    layers.push(GridLayer::scrolled(panel, rect, fraction, metrics));
+                }
+            }
+        }
+        layers
     }
 
     /// Scan the visible selection off the UI thread, replacing stale preview requests.
@@ -295,7 +349,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (x, y) = StartPage::content_metrics(self.metrics).cell(event.position);
+        let metrics = StartPage::content_metrics(self.metrics);
+        let (x, _) = metrics.cell(event.position);
+        let y = f32::from(event.position.y - metrics.origin.y) / metrics.lh;
         let Some(layout) = self.start_layout() else {
             return;
         };
@@ -305,20 +361,26 @@ impl Workspace {
             .expect("start layout belongs to a start page");
         match (layout, layout.hit(page, x, y), event.click_count) {
             (_, Some(StartHit::Menu(action)), 1) => self.start_action(action, window, cx),
-            (StartLayout::Projects(_), Some(StartHit::Filter), 1) => {
+            (StartLayout::Projects(layout), Some(StartHit::Filter), 1) => {
                 page.picker
                     .as_mut()
                     .expect("visible project picker")
-                    .focus_filter();
+                    .press_filter(
+                        layout,
+                        event.position,
+                        StartPage::content_metrics(self.metrics),
+                        &self.spacing,
+                        event.modifiers.shift,
+                    );
                 self.sync(window, cx);
             }
-            (StartLayout::Projects(layout), Some(StartHit::Project(index)), count @ (1 | 2)) => {
+            (StartLayout::Projects(_), Some(StartHit::Project(index)), count @ (1 | 2)) => {
                 let picker = page.picker.as_mut().expect("visible project picker");
                 picker.focus_list();
                 if count == 2 && picker.selected() == Some(index) {
                     self.open_selected_project(window, cx);
                 } else {
-                    picker.select(index, layout.project_rows());
+                    picker.select(index);
                     page.status.clear();
                     self.sync(window, cx);
                 }
@@ -351,9 +413,14 @@ impl Workspace {
                 .and_then(|preview| preview.rows.as_ref())
                 .and_then(|result| result.as_ref().ok())
                 .map_or(0, Vec::len);
-            picker.scroll_preview(offset, count, projects.preview_rows());
+            picker.scroll_preview(
+                offset,
+                count,
+                projects.preview_rows(),
+                self.scroll_epoch.elapsed().as_secs_f64(),
+            );
         } else if projects.over_list(x, y) {
-            picker.move_selection(offset, projects.project_rows());
+            picker.move_selection(offset);
         } else {
             return;
         }

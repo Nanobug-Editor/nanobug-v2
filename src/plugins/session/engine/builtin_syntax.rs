@@ -1,13 +1,15 @@
-//! Coalesce native syntax jobs for formats without an installable language provider.
+//! Schedule lexical Tree-sitter highlighting for visible editor documents.
+
 use super::{Backoff, Engine, ResultEvent};
 use crate::plugins::session::{DocumentSyntax, builtin_syntax_grammar};
 use nanobug_plugin_sdk::{
     DocumentSnapshot,
+    document_wire::MAX_DOCUMENT_BYTES,
     language::{DocumentFeatures, HIGHLIGHT_QUERY_PREFIX, SyntaxQuery},
 };
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Instant};
 
-/// Path and explicit grammar are part of the identity even when the contents do not change.
+/// Path and grammar distinguish snapshots even if the text revision does not change.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Stamp {
     project: u64,
@@ -16,109 +18,155 @@ pub(super) struct Stamp {
     grammar: &'static str,
 }
 
-/// Only one native job occupies the worker queue; typing replaces the desired revision.
+impl Stamp {
+    fn key(&self) -> (u64, u64) {
+        (self.project, self.version.0)
+    }
+
+    fn matches(&self, syntax: &DocumentSyntax) -> bool {
+        self.version == syntax.version
+            && self.path == syntax.path
+            && syntax.grammar == Some(self.grammar)
+    }
+}
+
+/// Track the latest visible snapshots while at most one lexical job uses the syntax worker.
 #[derive(Default)]
 pub(super) struct State {
+    pub(super) visible: Vec<Arc<DocumentSnapshot>>,
     running: bool,
-    last: Option<Stamp>,
-    /// A transient worker failure retries the same revision on the session's bounded schedule.
-    retry: Backoff,
+    retries: BTreeMap<(u64, u64), (Stamp, Backoff)>,
+    /// Give another visible pane a turn if the last request was superseded while typing.
+    last_started: Option<(u64, u64)>,
 }
 
 impl Engine {
-    fn builtin_document(&self) -> Option<(u64, &Arc<DocumentSnapshot>, &'static str)> {
-        let project = self.active?;
-        let doc = self.projects.get(&project)?.document.as_ref()?;
-        if doc.text.len() > 120 * 1024 {
+    /// Select a bundled grammar for a named, bounded buffer in the active project.
+    fn builtin_stamp(&self, project: u64, doc: &DocumentSnapshot) -> Option<Stamp> {
+        if doc.text.len() > MAX_DOCUMENT_BYTES {
             return None;
         }
-        let grammar = builtin_syntax_grammar(
-            doc.path.as_deref(),
-            self.document_filetype(project, doc.opening),
-        )?;
-        Some((project, doc, grammar))
-    }
-
-    pub(super) fn sync_builtin_syntax(&mut self) {
-        let Some((project, doc, grammar)) = self.builtin_document() else {
-            self.builtin_syntax.last = None;
-            self.changed |= self.view.builtin_syntax.take().is_some();
-            return;
-        };
-        let version = (doc.opening, doc.revision);
-        let Some(path) = &doc.path else { return };
-        let same = self.builtin_syntax.last.as_ref().is_some_and(|s| {
-            s.project == project && s.version == version && s.grammar == grammar && &s.path == path
-        });
-        if same
-            && (self.builtin_syntax.retry.resume.is_none()
-                || !self.builtin_syntax.retry.ready(Instant::now()))
-        {
-            return;
-        }
-        let stamp = Stamp {
+        let path = doc.path.as_ref()?;
+        let grammar =
+            builtin_syntax_grammar(Some(path), self.document_filetype(project, doc.opening))?;
+        Some(Stamp {
             project,
-            version,
+            version: (doc.opening, doc.revision),
             path: path.clone(),
             grammar,
-        };
-        let doc = Arc::clone(doc);
-        self.changed |= self.view.builtin_syntax.take().is_some();
+        })
+    }
+
+    /// Keep current results and coalesce incoming edits before choosing the next outstanding pane.
+    pub(super) fn sync_builtin_syntax(&mut self) {
+        let mut desired = BTreeMap::new();
+        if let Some(project) = self.active.and_then(|id| self.projects.get(&id)) {
+            for doc in project.document.iter().chain(&self.builtin_syntax.visible) {
+                if let Some(stamp) = self.builtin_stamp(project.id, doc) {
+                    desired.entry(stamp.key()).or_insert((stamp, doc));
+                }
+            }
+        }
+        let before = self.view.builtin_syntax.len();
+        self.view.builtin_syntax.retain(|key, syntax| {
+            desired
+                .get(key)
+                .is_some_and(|(stamp, _)| stamp.matches(syntax))
+        });
+        self.changed |= self.view.builtin_syntax.len() != before;
+        self.builtin_syntax.retries.retain(|key, (previous, _)| {
+            desired.get(key).is_some_and(|(stamp, _)| stamp == previous)
+        });
         if self.builtin_syntax.running {
             return;
         }
-        let started = stamp.clone();
+        let focused = self.active.and_then(|id| {
+            self.projects
+                .get(&id)?
+                .document
+                .as_ref()
+                .map(|doc| (id, doc.opening))
+        });
+        let now = Instant::now();
+        let Some((stamp, doc)) = desired
+            .into_values()
+            .filter(|(stamp, _)| {
+                let key = stamp.key();
+                !self.view.builtin_syntax.contains_key(&key)
+                    && self
+                        .builtin_syntax
+                        .retries
+                        .get(&key)
+                        .is_none_or(|(_, retry)| retry.ready(now))
+            })
+            .min_by_key(|(stamp, _)| {
+                let key = Some(stamp.key());
+                (key == self.builtin_syntax.last_started, key != focused)
+            })
+        else {
+            return;
+        };
+        let doc = Arc::clone(doc);
+        let key = stamp.key();
         let id = self.next();
         let worker = Arc::clone(&self.syntax);
         let finish = self.finish.clone();
         if self.syntax_io.submit(move || {
-            let result = worker
+            let data = worker
                 .lock()
                 .unwrap()
                 .parse(
                     id,
-                    grammar.into(),
+                    stamp.grammar.into(),
                     doc.as_ref().clone(),
                     Some(HIGHLIGHT_QUERY_PREFIX.into()),
                 )
                 .ok()
                 .and_then(|value| serde_json::from_value::<SyntaxQuery>(value).ok())
-                .filter(|query| (query.opening, query.revision) == version)
+                .filter(|query| (query.opening, query.revision) == stamp.version)
                 .map(|query| DocumentSyntax {
-                    grammar: Some(grammar),
-                    version,
-                    path: started.path.clone(),
+                    grammar: Some(stamp.grammar),
+                    version: stamp.version,
+                    path: stamp.path.clone(),
                     highlights: DocumentFeatures::from_captures(&doc.text, query.captures)
                         .highlights,
                 });
-            let _ = finish.send(ResultEvent::BuiltinSyntax(started, result));
+            let _ = finish.send(ResultEvent::BuiltinSyntax(stamp, data));
         }) {
-            if !same {
-                self.builtin_syntax.retry = Backoff::default();
-            }
-            self.builtin_syntax.last = Some(stamp);
             self.builtin_syntax.running = true;
+            self.builtin_syntax.last_started = Some(key);
         }
     }
 
+    /// Publish only if the exact snapshot still belongs to a visible pane.
     pub(super) fn finish_builtin_syntax(&mut self, stamp: Stamp, data: Option<DocumentSyntax>) {
         self.builtin_syntax.running = false;
-        if self
-            .builtin_document()
-            .is_some_and(|(project, doc, grammar)| {
-                project == stamp.project
-                    && grammar == stamp.grammar
-                    && (doc.opening, doc.revision) == stamp.version
-                    && doc.path.as_ref() == Some(&stamp.path)
+        let key = stamp.key();
+        if self.active != Some(stamp.project)
+            || !self.projects.get(&stamp.project).is_some_and(|project| {
+                project
+                    .document
+                    .iter()
+                    .chain(&self.builtin_syntax.visible)
+                    .any(|doc| {
+                        doc.opening == stamp.version.0
+                            && self.builtin_stamp(stamp.project, doc).as_ref() == Some(&stamp)
+                    })
             })
         {
-            if data.is_some() {
-                self.builtin_syntax.retry = Backoff::default();
-            } else {
-                self.builtin_syntax.retry.failed(Instant::now());
-            }
-            self.view.builtin_syntax = data.map(|d| (stamp.project, Arc::new(d)));
+            return;
+        }
+        if let Some(data) = data {
+            self.builtin_syntax.retries.remove(&key);
+            self.view.builtin_syntax.insert(key, Arc::new(data));
             self.changed = true;
+        } else {
+            self.builtin_syntax
+                .retries
+                .entry(key)
+                .or_insert((stamp, Backoff::default()))
+                .1
+                .failed(Instant::now());
         }
     }
 }

@@ -142,6 +142,35 @@ struct SnippetLayoutKey {
 }
 
 impl MarkdownSnippet {
+    /// Keep a plain message's line breaks and punctuation literal in the embedded popup layout.
+    pub(in crate::grid) fn plain(text: String) -> Self {
+        use parser::{AlignedText, Block, Inline, LocatedBlock};
+        let mut inlines = Vec::new();
+        for (row, line) in text.lines().enumerate() {
+            if row > 0 {
+                inlines.push(Inline::Break);
+            }
+            inlines.push(Inline::Text {
+                content: line.to_owned(),
+                style: Default::default(),
+            });
+        }
+        Self {
+            parsed: parser::Markdown {
+                blocks: vec![LocatedBlock {
+                    block: Block::Paragraph(AlignedText {
+                        inlines,
+                        alignment: Default::default(),
+                    }),
+                    source_row: Some(0),
+                }],
+                source_rows: text.lines().count(),
+            },
+            text,
+            layout: RefCell::new(None),
+        }
+    }
+
     /// Parse the provider's Markdown `text` once and defer shaping until the panel is fitted.
     pub(in crate::grid) fn new(text: String) -> Self {
         Self {

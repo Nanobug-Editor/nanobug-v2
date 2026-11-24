@@ -387,6 +387,9 @@ impl Vim {
         let (begin, matches) = if let Some(end) = trimmed.find(char::is_whitespace) {
             let (name, remainder) = trimmed.split_at(end);
             let option = remainder.trim_start();
+            if let Some((prefix, matches)) = super::ex_diagnostics::completion(name, option) {
+                return (!matches.is_empty()).then_some((head.len() - prefix.len(), matches));
+            }
             if let Some((prefix, matches)) =
                 super::ex_sign::completion(name, remainder, register, |prefix| {
                     path_candidates(self.completion_directory(), prefix)
@@ -537,6 +540,7 @@ impl Vim {
             candidates.extend(super::mappings::ex_candidates(trimmed).map(str::to_owned));
             candidates.extend(super::menu::ex_candidates(trimmed));
             candidates.extend(super::ex_batch::candidates(trimmed).map(str::to_owned));
+            candidates.extend(super::ex_quickfix::candidates(trimmed).map(str::to_owned));
             candidates.extend(
                 super::ex_files::NAMES
                     .iter()
@@ -546,6 +550,8 @@ impl Vim {
                     .chain(super::ex_echo_highlight::NAMES)
                     .chain(super::ex_history::NAMES)
                     .chain(super::ex_languages::NAMES)
+                    .chain(super::ex_list_filter::NAMES)
+                    .chain(["Trouble", "lua"].iter())
                     .chain(super::ex_match::NAMES)
                     .chain(super::ex_message_modifiers::NAMES)
                     .chain(super::ex_recovery::NAMES)

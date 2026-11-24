@@ -10,6 +10,20 @@ use unicode_segmentation::UnicodeSegmentation;
 pub enum Action {
     /// Change the Session buffer list or the current window's argument list.
     BufferLifecycle(super::BufferCommand),
+    /// Operate on the session's quickfix list or the invoking window's location list.
+    Quickfix {
+        /// Select the location list when true.
+        location: bool,
+        /// The list operation, with any count or address supplied by the user.
+        command: super::QuickfixCommand,
+    },
+    /// Derive a new quickfix or location list from the current snapshot.
+    FilterList {
+        /// Select the invoking window's location list when true.
+        location: bool,
+        /// Compiled Vim search expression and whether to reject matches.
+        filter: super::ListFilter,
+    },
     /// Manage a local recovery file without writing the backing document.
     Recovery(super::RecoveryCommand),
     /// Query or rerun buffer filetype detection in the workspace.
@@ -246,6 +260,8 @@ pub enum Action {
     },
     /// Jump to a version-matched diagnostic in the active buffer.
     BracketDiagnostic {
+        /// Restrict LazyVim error and warning motions to the requested severity.
+        severity: Option<nanobug_plugin_sdk::DiagnosticSeverity>,
         /// Move forward or select the last diagnostic.
         forward: bool,
         /// Select the requested endpoint rather than wrapping around the buffer.
@@ -326,6 +342,8 @@ pub enum Action {
         reverse: bool,
     },
     PluginDiagnose,
+    /// A supported Neovim diagnostic call or Trouble list command.
+    Diagnostic(super::DiagnosticCommand),
     /// Find the definition of the symbol at the cursor.
     PluginDefinition,
     /// Show the signature, type and documentation for the symbol at the cursor.
@@ -1066,6 +1084,9 @@ impl Vim {
             .or_else(|| self.ex_state_command(text, register))
             .or_else(|| self.ex_catalog_command(text))
             .or_else(|| self.ex_language_command(text))
+            .or_else(|| self.ex_diagnostic_command(text))
+            .or_else(|| self.ex_quickfix_command(text))
+            .or_else(|| self.ex_list_filter(text, register))
             .or_else(|| self.ex_recovery_command(text))
             .or_else(|| self.ex_history_command(text, register, resolve_screen))
             .or_else(|| self.ex_buffer_lifecycle(text))

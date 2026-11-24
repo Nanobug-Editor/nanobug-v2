@@ -1,12 +1,12 @@
 //! Compose retained panels, the cursor and workspace overlays.
 
 use crate::grid::windows::manager::ManagerWindow;
+use crate::ui::components::grid_dialog::DialogBackdrop;
 
-use crate::grid::render::{GridLayer, Panel, Rect, exposed_regions, popup_outline};
+use crate::grid::render::{GridLayer, Panel, Rect, dialog_backdrop, exposed_regions};
 use crate::grid::windows::{
     editor::{CompletionMenu, DefinitionHoverPopup},
     help::HelpWindow,
-    start::StartPage,
 };
 
 use super::{
@@ -43,6 +43,82 @@ fn divider_cursor(axis: SplitAxis) -> CursorStyle {
     match axis {
         SplitAxis::Columns => CursorStyle::ResizeLeftRight,
         SplitAxis::Rows => CursorStyle::ResizeUpDown,
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use crate::grid::workspace::layout::Focus;
+    use anyhow::{Context as _, ensure};
+    use gpui::AppContext;
+    use nanobug::plugins::session::Options;
+
+    /// Compare rendered pixels across the Explorer edge, including the covered border.
+    #[test]
+    #[ignore = "requires Windows DirectWrite and DirectX"]
+    fn native_overflowing_tree_name_has_a_continuous_background() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project)?;
+        let filename = format!("{}.txt", "long-file-name-".repeat(7));
+        std::fs::write(project.join(filename), "")?;
+        let options = Options::take(
+            &mut vec![
+                "--plugin-profile".into(),
+                temp.path().join("profile").into_os_string(),
+                "--no-plugins".into(),
+            ],
+            temp.path(),
+        )?;
+        super::super::native_test::run_async(
+            project,
+            options,
+            |workspace| workspace.projects.active_mut().focus_pane(Focus::Manager),
+            async move |handle, app| {
+                let _keep_project = temp;
+                app.update_window(handle.into(), |_, window, _| {
+                    window.resize(size(px(920.), px(580.)))
+                })?;
+                app.background_executor()
+                    .timer(std::time::Duration::from_millis(60))
+                    .await;
+                let (left, right, y) = app.update(|app| {
+                    handle.update(app, |workspace, window, cx| -> anyhow::Result<_> {
+                        workspace.sync(window, cx);
+                        let preview = workspace
+                            .tree_name_preview_layer()
+                            .context("long name preview")?;
+                        let row = preview.clip.context("visible selection row")?;
+                        let edge = ManagerWindow::body(workspace.layout.tree)
+                            .pixels(workspace.metrics)
+                            .right();
+                        let distance = px(workspace.metrics.cw);
+                        ensure!(row.left() < edge - distance && row.right() > edge + distance);
+                        let device =
+                            |value| (f32::from(value) * window.scale_factor()).round() as u32;
+                        let left = device(edge - distance);
+                        let right = device(edge + distance);
+                        let y = device(row.top()) + 1;
+                        Ok((left, right, y))
+                    })
+                })??;
+                let image = app.update_window(handle.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.render_to_image()
+                })??;
+                ensure!(right < image.width() && y < image.height());
+                let expected = image.get_pixel(left, y);
+                for x in left + 1..=right {
+                    ensure!(
+                        image.get_pixel(x, y) == expected,
+                        "background changes at x={x}: {expected:?} vs {:?}",
+                        image.get_pixel(x, y),
+                    );
+                }
+                Ok(())
+            },
+        )
     }
 }
 
@@ -111,7 +187,7 @@ impl Workspace {
         let (labels, selected) = self.completion_items()?;
         let editor = &self.projects.active_project()?.editor;
         let viewport = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
-        let menu = editor.completion_menu(
+        let mut menu = editor.completion_menu(
             self.active_editor_area(),
             self.metrics,
             &self.spacing,
@@ -119,6 +195,7 @@ impl Workspace {
             &labels,
             selected,
         )?;
+        self.position_completion_menu(&mut menu, labels.len(), selected, false);
         Some((menu, labels, selected))
     }
 
@@ -136,19 +213,19 @@ impl Workspace {
         let [numbers, text] = project.editor.content_layers(
             editor_area,
             self.metrics,
-            &self.bodies[1],
-            &self.bodies[2],
+            &self.editor_panels.numbers,
+            &self.editor_panels.text,
         );
         let mut layers = vec![
-            fixed(&self.panels[0], self.layout.tree),
-            fixed(&self.panels[1], editor_area),
+            fixed(&self.manager_chrome, self.layout.tree),
+            fixed(&self.editor_panels.chrome, editor_area),
             GridLayer {
-                panel: self.panels[2].clone(),
+                panel: self.footer_panel.clone(),
                 bounds: self.footer_bounds(),
                 clip: None,
             },
             scrolled(
-                &self.bodies[0],
+                &self.manager_body,
                 ManagerWindow::body(self.layout.tree),
                 project
                     .manager
@@ -169,20 +246,24 @@ impl Workspace {
             let Some(editor) = project.editor_by_id(pane) else {
                 continue;
             };
-            let [chrome, numbers, text] = &panels.layers;
-            layers.push(fixed(chrome, area));
-            layers.extend(editor.content_layers(area, self.metrics, numbers, text));
+            layers.push(fixed(&panels.layers.chrome, area));
+            layers.extend(editor.content_layers(
+                area,
+                self.metrics,
+                &panels.layers.numbers,
+                &panels.layers.text,
+            ));
         }
         Some(layers)
     }
 
     /// Match source text panels that must clip around an inline popup.
     fn is_editor_text_panel(&self, panel: &Entity<Panel>) -> bool {
-        panel == &self.bodies[2]
+        panel == &self.editor_panels.text
             || self
                 .inactive_editor_panels
                 .iter()
-                .any(|editor| panel == &editor.layers[2])
+                .any(|editor| panel == &editor.layers.text)
     }
 
     /// Position the preview over its scrolled tree row, clipping vertically to the tree body.
@@ -214,7 +295,7 @@ pub(super) fn positioned(bounds: Bounds<Pixels>) -> StyleRefinement {
 }
 
 /// Draw a retained `layer`, with an independent fixed clip for scrollable content.
-fn layer_element(
+pub(super) fn layer_element(
     GridLayer {
         panel,
         bounds,
@@ -397,13 +478,7 @@ impl Render for Workspace {
             .is_none()
             .then(|| self.start_layout())
             .flatten();
-        let start = start_layout.map(|layout| GridLayer {
-            panel: self.start_panel.clone(),
-            bounds: layout
-                .frame_area()
-                .pixels(StartPage::content_metrics(self.metrics)),
-            clip: None,
-        });
+        let start = self.start_layers(start_layout);
         let confirmation = self
             .editor_close_area()
             .or_else(|| self.remove_recent_project_area());
@@ -438,7 +513,8 @@ impl Render for Workspace {
         let message_bounds = message.as_ref().map(|layer| layer.bounds);
         let (completion_bounds, completion) =
             self.completion_menu(window)
-                .map_or((None, None), |(menu, labels, selected)| {
+                .map_or((None, None), |(mut menu, labels, selected)| {
+                    self.position_completion_menu(&mut menu, labels.len(), selected, true);
                     let bounds = menu.bounds();
                     let element = menu.element(
                         &labels,
@@ -449,6 +525,9 @@ impl Render for Workspace {
                     );
                     (Some(bounds), Some(element))
                 });
+        if self.completion_scrolling() {
+            self.schedule_scroll(window, cx);
+        }
         let hover = if small_popup.is_none() && plugin_popup.is_none() {
             self.definition_hover_popup(window, cx)
         } else {
@@ -463,8 +542,13 @@ impl Render for Workspace {
                 Vec::new()
             };
         if let Some(area) = plugin_popup {
-            let outline = popup_outline(area.pixels(self.metrics), self.metrics);
-            root = root.child(self.popup_backdrop.element(
+            let outline = DialogBackdrop::outline(
+                area.pixels(self.metrics),
+                self.metrics.cw,
+                self.metrics.lh,
+            );
+            root = root.child(dialog_backdrop(
+                &mut self.dialog_backdrop,
                 layers.iter().flatten().chain(&start),
                 outline,
                 self.glyphs.as_ref(),
@@ -474,7 +558,7 @@ impl Render for Workspace {
         } else if let Some(list) = &self.help.list {
             let area = self.help_layout();
             let grid = area.pixels(self.metrics);
-            let outline = popup_outline(grid, self.metrics);
+            let outline = DialogBackdrop::outline(grid, self.metrics.cw, self.metrics.lh);
             let filtering = list.is_filtering();
             let body = GridLayer::scrolled(
                 &self.help.body,
@@ -492,7 +576,8 @@ impl Render for Workspace {
                 &self.spacing,
                 self.hovered_controls == Some(ShellWindow::ShortcutHelp),
             );
-            let backdrop = self.popup_backdrop.element(
+            let backdrop = dialog_backdrop(
+                &mut self.dialog_backdrop,
                 layers.iter().flatten(),
                 outline,
                 self.glyphs.as_ref(),
@@ -564,14 +649,25 @@ impl Render for Workspace {
                 }
             }
         } else {
-            self.popup_backdrop.release(window);
+            self.dialog_backdrop.release(window);
             let preview = if self.file_picker.is_none() && layers.is_some() {
                 self.tree_name_preview_layer()
             } else {
                 None
             };
-            if small_popup_bounds.is_some() || message_bounds.is_some() || settings_bounds.is_some()
-            {
+            let preview_extension = preview.as_ref().and_then(|preview| {
+                let clip = preview.clip?;
+                let tree_edge = ManagerWindow::body(self.layout.tree)
+                    .pixels(self.metrics)
+                    .right();
+                (clip.right() > tree_edge).then(|| {
+                    Bounds::from_corners(point(tree_edge, clip.top()), clip.bottom_right())
+                })
+            });
+            let clip_popups = small_popup_bounds.is_some()
+                || message_bounds.is_some()
+                || settings_bounds.is_some();
+            if clip_popups || preview_extension.is_some() {
                 let viewport = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
                 let popup_cuts = leader_bounds
                     .into_iter()
@@ -581,26 +677,41 @@ impl Render for Workspace {
                 let regions = visible_regions(viewport, popup_cuts.chain(message_bounds));
                 // Give each clip its own cached-view scope for the shared panels and cursor.
                 for (index, region) in regions.into_iter().enumerate() {
-                    let visible = layers
-                        .iter()
-                        .flatten()
-                        .chain(&start)
-                        .chain(&preview)
-                        .filter_map(|layer| {
-                            let clip = region.intersect(&layer.clip.unwrap_or(layer.bounds));
-                            if clip.is_empty() {
-                                return None;
-                            }
-                            let layer = GridLayer {
-                                panel: layer.panel.clone(),
-                                bounds: layer.bounds,
-                                clip: Some(clip),
-                            };
-                            if self.is_editor_text_panel(&layer.panel) {
-                                layer_around_popup(layer, inline_popup_bounds, window)
-                            } else {
-                                layer_element(layer, window)
-                            }
+                    // Expose the window material under the extension so it composites like the tree row.
+                    let base = visible_regions(region, preview_extension)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(strip, region)| {
+                            let visible =
+                                layers.iter().flatten().chain(&start).filter_map(|layer| {
+                                    let clip =
+                                        region.intersect(&layer.clip.unwrap_or(layer.bounds));
+                                    if clip.is_empty() {
+                                        return None;
+                                    }
+                                    let layer = GridLayer {
+                                        panel: layer.panel.clone(),
+                                        bounds: layer.bounds,
+                                        clip: Some(clip),
+                                    };
+                                    if self.is_editor_text_panel(&layer.panel) {
+                                        layer_around_popup(layer, inline_popup_bounds, window)
+                                    } else {
+                                        layer_element(layer, window)
+                                    }
+                                });
+                            div()
+                                .id(("popup-underlay-strip", strip))
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .size_full()
+                                .children(visible)
+                                .children(
+                                    markdown
+                                        .iter()
+                                        .filter_map(|(_, preview)| preview.element(Some(region))),
+                                )
                         });
                     let mut underlay = div()
                         .id(("popup-underlay", index))
@@ -608,13 +719,15 @@ impl Render for Workspace {
                         .left_0()
                         .top_0()
                         .size_full()
-                        .children(visible)
-                        .children(
-                            markdown
-                                .iter()
-                                .filter_map(|(_, preview)| preview.element(Some(region))),
-                        );
-                    if !self.small_modal_open()
+                        .children(base)
+                        .children(preview.iter().filter_map(|preview| {
+                            let clip = region.intersect(&preview.clip.unwrap_or(preview.bounds));
+                            (!clip.is_empty()).then(|| {
+                                clipped_entity(preview.panel.clone(), preview.bounds, clip, window)
+                            })
+                        }));
+                    if clip_popups
+                        && !self.small_modal_open()
                         && picker_prompt.is_none()
                         && document_results.is_none()
                     {

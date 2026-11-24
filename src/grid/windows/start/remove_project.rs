@@ -1,19 +1,18 @@
 //! Layout and input for removing a project from the recent list.
 
 use super::projects::display_path;
+use crate::ui::components::grid_confirm::{ButtonAlign, ConfirmButton, GridConfirm};
 use crate::{
-    grid::{
-        mnemonic::Mnemonic,
-        render::{Frame, MessageLevel, Rect},
-    },
+    grid::render::{Frame, MessageLevel, Rect},
     ui::{
+        mnemonic::Mnemonic,
         text::TextSpacing,
         theme::{MUTED, TEXT},
     },
 };
 use gpui::{KeyDownEvent, Modifiers};
 use nanobug::i18n;
-use std::{ops::Range, path::PathBuf};
+use std::path::PathBuf;
 
 /// Maximum dialog width in workspace columns.
 const COLUMNS: usize = 54;
@@ -37,26 +36,8 @@ fn buttons() -> [(bool, Mnemonic); 2] {
 }
 
 /// Center the choices in `width` columns using their measured `spacing`.
-fn button_slots(width: usize, spacing: &TextSpacing) -> [(bool, Mnemonic, Range<usize>); 2] {
-    let buttons = buttons().map(|(confirm, label)| {
-        let columns: usize = label
-            .spans()
-            .into_iter()
-            .map(|(text, _)| spacing.columns(text))
-            .sum();
-        (confirm, label, columns)
-    });
-    let total = buttons
-        .iter()
-        .map(|&(_, _, columns)| columns)
-        .sum::<usize>()
-        + BUTTON_GAP;
-    let mut start = width.saturating_sub(total) / 2;
-    buttons.map(|(confirm, label, columns)| {
-        let slot = start..start + columns;
-        start = slot.end + BUTTON_GAP;
-        (confirm, label, slot)
-    })
+fn button_slots(width: usize, spacing: &TextSpacing) -> Vec<ConfirmButton<bool>> {
+    GridConfirm::new(buttons()).slots(0..width, ButtonAlign::Center, BUTTON_GAP, spacing)
 }
 
 impl RemoveProject {
@@ -82,7 +63,7 @@ impl RemoveProject {
 
         let path = display_path(&self.root);
         let name = self.root.file_name().map(|name| name.to_string_lossy());
-        let slot = 3..area.w - 3;
+        let slot = 3..area.w.saturating_sub(3);
         frame.label(
             DETAILS_ROW,
             slot.clone(),
@@ -101,12 +82,11 @@ impl RemoveProject {
         }
 
         let row = area.h - 1;
-        for (_, label, slot) in button_slots(area.w, spacing) {
-            frame.outline_footer_gap(slot.start - 1..slot.end + 1);
-            let mut start = slot.start;
-            for (text, style) in label.spans() {
-                start =
-                    frame.styled_label(row, start..slot.end, text, button_color, spacing, style);
+        for button in button_slots(area.w, spacing) {
+            let slot = &button.columns;
+            if !slot.is_empty() {
+                frame.outline_footer_gap(slot.start.saturating_sub(1)..slot.end + 1);
+                frame.button(row, &button, button_color, spacing);
             }
         }
         frame
@@ -122,9 +102,7 @@ impl RemoveProject {
         if key.key == "escape" && mods == Modifiers::default() {
             return Some(false);
         }
-        buttons()
-            .into_iter()
-            .find_map(|(confirm, label)| label.matches(&key.key).then_some(confirm))
+        GridConfirm::new(buttons()).key(&key.key)
     }
 
     /// Resolve cell `(x, y)` inside `area` against the drawn choices measured by `spacing`.
@@ -136,9 +114,7 @@ impl RemoveProject {
         if !area.contains(x, y) || y != area.y + area.h - 1 {
             return None;
         }
-        button_slots(area.w, spacing)
-            .into_iter()
-            .find_map(|(confirm, _, slot)| slot.contains(&(x - area.x)).then_some(confirm))
+        GridConfirm::hit(&button_slots(area.w, spacing), x - area.x)
     }
 }
 
@@ -185,7 +161,15 @@ mod tests {
         }
         .area(90, 32);
         let row = area.y + area.h - 1;
-        for ((confirm, label, slot), (caption, key)) in button_slots(area.w, &spacing)
+        for (
+            ConfirmButton {
+                action: confirm,
+                caption: label,
+                columns: slot,
+                ..
+            },
+            (caption, key),
+        ) in button_slots(area.w, &spacing)
             .into_iter()
             .zip(captions.into_iter().zip(["y", "n"]))
         {

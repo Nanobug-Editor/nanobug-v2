@@ -1,9 +1,6 @@
 //! Keep editor appearance, retained panel geometry and pointer coordinates in sync.
 
-use super::{
-    Workspace,
-    layout::{OUTER_INSET_Y, PANE_GAP_Y},
-};
+use super::{Workspace, layout::OUTER_INSET_Y};
 use crate::{
     grid::{render::Metrics, windows::start::StartPage},
     ui::{
@@ -37,7 +34,7 @@ pub(super) fn measure(
         cw: (advance * scale).round().max(1.) / scale,
         lh: (height * scale).ceil() / scale,
         font_size,
-        origin: point(px(14.), px(OUTER_INSET_Y + PANE_GAP_Y)),
+        origin: point(px(14.), px(OUTER_INSET_Y)),
     };
     let chinese = system.resolve_font(&GRID_CHINESE_FONT);
     let spacing = TextSpacing::new(glyphs.clone(), chinese, font_size, metrics.cw);
@@ -53,7 +50,7 @@ impl Workspace {
         }
         self.display_scale = scale;
         self.last_cursor_space = None;
-        self.popup_backdrop.invalidate();
+        self.dialog_backdrop.invalidate();
         self.refresh_grid_appearance(window, cx, true);
         true
     }
@@ -79,7 +76,7 @@ impl Workspace {
             updated.update_ex_highlight_palette(&self.input_mappings);
         }
         if current != updated || layout_changed {
-            self.popup_backdrop.invalidate();
+            self.dialog_backdrop.invalidate();
             self.invalidate_plugin_appearance();
             if layout_changed {
                 self.last_cursor_space = None;
@@ -115,17 +112,20 @@ impl Workspace {
             history.set_appearance(metrics, cx);
         }
         self.tabs.set_metrics(metrics, remeasure, cx);
-        self.start_panel.update(cx, |panel, cx| {
-            panel.set_appearance(StartPage::content_metrics(metrics), cx)
-        });
+        for panel in std::iter::once(&self.start_panel).chain(&self.start_bodies) {
+            panel.update(cx, |panel, cx| {
+                panel.set_appearance(StartPage::content_metrics(metrics), cx)
+            });
+        }
         for panel in self
-            .panels
-            .iter()
-            .chain(&self.bodies)
+            .editor_panels
+            .all()
+            .into_iter()
+            .chain([&self.manager_chrome, &self.manager_body, &self.footer_panel])
             .chain(
                 self.inactive_editor_panels
                     .iter()
-                    .flat_map(|editor| &editor.layers),
+                    .flat_map(|editor| editor.layers.all()),
             )
             .chain([
                 &self.tree_name_preview,
@@ -136,6 +136,7 @@ impl Workspace {
                 &self.help.dim_title,
                 &self.help.search,
                 self.plugin_panel(),
+                &self.plugins.list_panel,
             ])
             .chain(
                 self.file_picker

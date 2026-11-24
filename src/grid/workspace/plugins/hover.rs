@@ -16,7 +16,7 @@ use nanobug::{
     },
     vim::Mode,
 };
-use nanobug_plugin_sdk::PluginEvent;
+use nanobug_plugin_sdk::{DiagnosticSeverity, PluginEvent};
 use std::{path::PathBuf, time::Duration};
 
 /// Number of editor rows moved by a single page key in the hover popup.
@@ -38,8 +38,16 @@ pub(super) struct DefinitionHover {
     scroll: GridScroll,
     /// Fractional wheel rows retained independently of the editor's wheel input.
     wheel_rows: f32,
-    /// Owning the task keeps its receiver active until dismissal.
-    _reply: Task<()>,
+    /// Owner of the request for this popup, or the publication displayed for a local diagnostic.
+    source: PopupSource,
+}
+
+/// Source-specific validity of the details beside the editor caret.
+enum PopupSource {
+    /// Keep an in-flight definition reply active until the popup is dismissed.
+    Definition { _task: Task<()> },
+    /// Diagnostics are valid while the buffer has the same publication.
+    Diagnostics(u64),
 }
 
 impl Workspace {
@@ -63,6 +71,12 @@ impl Workspace {
             && hover.opening == doc.opening
             && hover.revision == doc.revision
             && hover.path == doc.path
+            && match hover.source {
+                PopupSource::Diagnostics(epoch) => {
+                    self.projects.active().editor.buffer().diagnostic_epoch() == epoch
+                }
+                PopupSource::Definition { .. } => true,
+            }
             && hover.caret == doc.cursor)
             .then_some(hover)
     }
@@ -256,6 +270,7 @@ impl Workspace {
                 workspace.update(cx, |workspace, cx| {
                     if workspace
                         .current_definition_hover()
+                        .filter(|hover| matches!(hover.source, PopupSource::Definition { .. }))
                         .map(|hover| hover.request)
                         != Some(request)
                     {
@@ -298,7 +313,110 @@ impl Workspace {
             content: None,
             scroll: GridScroll::default(),
             wheel_rows: 0.,
-            _reply: task,
+            source: PopupSource::Definition { _task: task },
         });
+    }
+
+    /// Show every diagnostic on the current editor line in a scrollable popup at the caret.
+    pub(in crate::grid::workspace) fn show_line_diagnostics(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_definition_hover(cx);
+        let Some((scope, doc)) = self.definition_hover_target() else {
+            return;
+        };
+        let buffer = self.projects.active().editor.buffer();
+        let mut items = buffer
+            .line_diagnostics(buffer.cursor_row())
+            .collect::<Vec<_>>();
+        items.sort_by_key(|item| (item.severity as u8, item.start));
+        if items.is_empty() {
+            self.set_status(i18n::text("editor.no_diagnostics").into());
+            self.sync(window, cx);
+            return;
+        }
+        let text = items
+            .iter()
+            .map(|item| {
+                let label = i18n::text(match item.severity {
+                    DiagnosticSeverity::Error => "message.error",
+                    DiagnosticSeverity::Warning => "message.warning",
+                    DiagnosticSeverity::Information => "editor.diagnostic_info",
+                    DiagnosticSeverity::Hint => "editor.diagnostic_hint",
+                });
+                format!("{label} · {}", item.message)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let epoch = buffer.diagnostic_epoch();
+        let hover = DefinitionHover {
+            request: self.plugins.request_id,
+            scope,
+            opening: doc.opening,
+            revision: doc.revision,
+            path: doc.path.clone(),
+            caret: doc.cursor,
+            content: Some(DefinitionHoverContent::plain(text)),
+            scroll: GridScroll::default(),
+            wheel_rows: 0.,
+            source: PopupSource::Diagnostics(epoch),
+        };
+        self.plugins.definition_hover = Some(hover);
+        cx.notify();
+    }
+
+    /// Move to a current diagnostic matching `severity` and show its line's messages.
+    pub(in crate::grid::workspace) fn jump_diagnostic(
+        &mut self,
+        forward: bool,
+        edge: bool,
+        count: usize,
+        severity: Option<DiagnosticSeverity>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let project = self.projects.active_mut();
+        if let Some(offset) = project
+            .editor
+            .buffer()
+            .diagnostic_target(forward, edge, count, severity)
+        {
+            project.editor.jump_to(offset);
+            project.status.clear();
+            self.show_line_diagnostics(window, cx);
+        } else {
+            self.set_status(i18n::text("editor.no_diagnostics").into());
+        }
+    }
+
+    /// Set the workspace diagnostic display to `enabled`, preserving data for manual queries.
+    pub(in crate::grid::workspace) fn set_diagnostic_display(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.plugins.diagnostic_marks = enabled;
+        self.dismiss_definition_hover(cx);
+        self.set_status(
+            i18n::text(if enabled {
+                "editor.diagnostics_shown"
+            } else {
+                "editor.diagnostics_hidden"
+            })
+            .into(),
+        );
+        self.sync(window, cx);
+    }
+
+    /// Toggle diagnostic decorations in every editor pane.
+    pub(in crate::grid::workspace) fn toggle_diagnostic_display(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_diagnostic_display(!self.plugins.diagnostic_marks, window, cx);
     }
 }

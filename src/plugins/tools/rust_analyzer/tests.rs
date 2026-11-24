@@ -1,7 +1,236 @@
-//! Optional process-level smoke tests against installed npm language servers.
+//! Optional process-level tests against installed language servers.
 
 use super::*;
 use std::{env, fs};
+
+/// A binary target needs a main function even when the renamed declaration still parses.
+#[test]
+#[ignore = "requires rust-analyzer and Cargo on PATH"]
+fn real_rust_missing_main_diagnostic() -> Result<()> {
+    let project = tempfile::tempdir()?;
+    fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname='entry_fixture'\nversion='0.1.0'\nedition='2021'\n[[bin]]\nname='tool'\npath='src/entry.rs'\n",
+    )?;
+    fs::create_dir(project.path().join("src"))?;
+    let path = project.path().join("src/entry.rs");
+    let valid = "mod child;\nfn main() {}\n";
+    let typo = "mod child;\nfn mai() {}\n";
+    fs::write(&path, valid)?;
+    let others = ["lib.rs", "child.rs"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| -> Result<_> {
+            let path = project.path().join("src").join(name);
+            fs::write(&path, "pub fn main() {}\n")?;
+            Ok(Arc::new(DocumentSnapshot {
+                opening: index as u64 + 2,
+                revision: 1,
+                path: Some(path),
+                text: "pub fn mai() {}\n".into(),
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (send, events) = mpsc::channel();
+    let analyzer = Analyzer::start(
+        Server::RustAnalyzer,
+        project.path().to_owned(),
+        None,
+        Arc::new(AtomicBool::new(false)),
+        move |event| {
+            let _ = send.send(event);
+        },
+    )?;
+    let check = |revision,
+                 text: &str,
+                 saved: u64,
+                 expected: &str,
+                 matches: &dyn Fn(&[Value]) -> bool|
+     -> Result<Vec<Value>> {
+        let mut documents = others.clone();
+        documents.push(Arc::new(DocumentSnapshot {
+            opening: 1,
+            revision,
+            path: Some(path.clone()),
+            text: text.into(),
+        }));
+        analyzer.sync_with_languages(documents, BTreeMap::new(), BTreeMap::from([(1, saved)]));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut last = Vec::new();
+        while let Ok(event) =
+            events.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            match event {
+                Event::Diagnostics { snapshot, items } if snapshot.opening != 1 => {
+                    assert!(
+                        !items.iter().any(|item| item["code"] == "E0601"),
+                        "library or child module {:?}",
+                        snapshot.path
+                    );
+                }
+                Event::Diagnostics { snapshot, items } if snapshot.revision == revision => {
+                    if matches(&items) {
+                        return Ok(items);
+                    }
+                    last = items;
+                }
+                Event::Failed(error) => anyhow::bail!("{error}"),
+                _ => {}
+            }
+        }
+        anyhow::bail!("revision {revision}, expected {expected}, received {last:?}");
+    };
+    let no_entry_error = |items: &[Value]| !items.iter().any(|item| item["code"] == "E0601");
+    check(0, valid, 0, "valid program", &no_entry_error)?;
+    let items = check(1, typo, 0, "unsaved entry rename", &|items| {
+        items
+            .iter()
+            .any(|i| i["code"] == "E0601" && i["source"] == "nanobug")
+    })?;
+    let entry = items.iter().find(|i| i["code"] == "E0601").unwrap();
+    assert_eq!(entry["severity"], 1);
+    let start = offset_at(typo, &entry["range"]["start"]).unwrap();
+    let end = offset_at(typo, &entry["range"]["end"]).unwrap();
+    assert_eq!(&typo[start..end], "mai");
+    assert_eq!(fs::read_to_string(&path)?, valid);
+    fs::write(&path, typo)?;
+    check(1, typo, 1, "rustc E0601 after saving", &|items| {
+        items
+            .iter()
+            .any(|i| i["code"] == "E0601" && i["source"] == "rustc")
+    })?;
+    let repaired = "fn main() { let unused_variable = 1; }\n";
+    check(2, repaired, 1, "unsaved repair", &no_entry_error)?;
+    assert_eq!(fs::read_to_string(&path)?, typo);
+    fs::write(&path, repaired)?;
+    check(
+        2,
+        repaired,
+        2,
+        "fresh compiler warning after the next save",
+        &|items| {
+            no_entry_error(items)
+                && items
+                    .iter()
+                    .any(|i| i["code"] == "unused_variables" && i["source"] == "rustc")
+        },
+    )?;
+    Ok(())
+}
+
+/// Exercise both typos on an unsaved buffer while Cargo sees a valid program on disk.
+#[test]
+#[ignore = "requires rust-analyzer and Cargo on PATH"]
+fn real_rust_analyzer_reports_misspelled_module_and_call() -> Result<()> {
+    let project = tempfile::tempdir()?;
+    let src = project.path().join("src");
+    fs::create_dir(&src)?;
+    fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = 'diagnostics_fixture'\nversion = '0.1.0'\nedition = '2021'\n",
+    )?;
+    let path = src.join("main.rs");
+    let clean = concat!(
+        "mod app;\nmod ui;\n",
+        "fn main() { let _ = \"🌱 app::rn()\"; app::run(); }\n",
+        "#[cfg(any())]\nfn disabled() { app::missing(); }\n",
+    );
+    fs::write(&path, clean)?;
+    fs::write(src.join("ui.rs"), "")?;
+    fs::write(src.join("app.rs"), "pub fn run() {}\n")?;
+
+    let (send, events) = mpsc::channel();
+    let analyzer = Analyzer::start(
+        Server::RustAnalyzer,
+        project.path().to_owned(),
+        None,
+        Arc::new(AtomicBool::new(false)),
+        move |event| {
+            let _ = send.send(event);
+        },
+    )?;
+    let check = |revision,
+                 text: &str,
+                 app: Option<Arc<DocumentSnapshot>>,
+                 expected: &[&str]|
+     -> Result<()> {
+        let mut documents = vec![Arc::new(DocumentSnapshot {
+            opening: 1,
+            revision,
+            path: Some(path.clone()),
+            text: text.into(),
+        })];
+        documents.extend(app);
+        analyzer.sync(documents);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut errors = None;
+        let mut semantic = false;
+        while let Ok(event) =
+            events.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            match event {
+                Event::Diagnostics { snapshot, items }
+                    if snapshot.opening == 1 && snapshot.revision == revision =>
+                {
+                    let mut labels = Vec::new();
+                    for item in items.iter().filter(|item| item["severity"] == 1) {
+                        let range = &item["range"];
+                        let start = offset_at(text, &range["start"]).context("invalid start")?;
+                        let end = offset_at(text, &range["end"]).context("invalid end")?;
+                        labels.push(text.get(start..end).context("invalid diagnostic range")?);
+                    }
+                    labels.sort_unstable();
+                    errors = Some(labels);
+                }
+                Event::Semantic { snapshot, .. }
+                    if snapshot.opening == 1 && snapshot.revision == revision =>
+                {
+                    semantic = true
+                }
+                Event::Failed(error) => anyhow::bail!("{error}"),
+                _ => {}
+            }
+            if semantic && errors.as_deref() == Some(expected) {
+                return Ok(());
+            }
+        }
+        anyhow::bail!(
+            "revision {revision} expected {expected:?}, received {errors:?}, semantic reply {semantic}"
+        )
+    };
+    let misspelled = clean.replace("app::run();", "app::rn();");
+    check(0, clean, None, &[])?;
+    check(1, &misspelled, None, &["rn"])?;
+    check(
+        2,
+        &misspelled.replace("mod ui;", "mod u;"),
+        None,
+        &["mod u;", "rn"],
+    )?;
+    check(3, &clean.replace("mod ui;", "mod u;"), None, &["mod u;"])?;
+    check(
+        4,
+        &misspelled.replace(
+            "app::rn();",
+            "use app as local; local /* ns */ :: /* item */ rn();",
+        ),
+        None,
+        &["rn"],
+    )?;
+    check(5, &misspelled, None, &["rn"])?;
+    // A definition in a second unsaved document can fix the call without editing main.rs.
+    let app = Arc::new(DocumentSnapshot {
+        opening: 2,
+        revision: 1,
+        path: Some(src.join("app.rs")),
+        text: "pub fn run() {}\npub fn rn() {}\n".into(),
+    });
+    check(5, &misspelled, Some(app), &[])?;
+    check(5, &misspelled, None, &["rn"])?;
+    check(6, clean, None, &[])?;
+    assert_eq!(fs::read_to_string(path)?, clean);
+    Ok(())
+}
 
 /// One fixture edits a known-good on-disk file through two unsaved document snapshots.
 struct Fixture {

@@ -101,7 +101,10 @@ fn scan_path(root: &Path, plugin_id: &str) -> Result<PathBuf> {
 
 fn read_scan_document(path: &Path) -> Result<Option<toml_edit::DocumentMut>> {
     match read_limited(path, 64 * 1024) {
-        Ok(bytes) => Ok(Some(std::str::from_utf8(&bytes)?.parse()?)),
+        Ok(bytes) => std::str::from_utf8(&bytes)?
+            .parse()
+            .map(Some)
+            .with_context(|| format!("Invalid TOML in {}", path.display())),
         Err(error)
             if error
                 .downcast_ref::<io::Error>()

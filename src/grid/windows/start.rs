@@ -17,8 +17,6 @@ use crate::{
 use gpui::{Bounds, point, px, size};
 use nanobug::i18n;
 
-use self::projects::PreviewRows;
-
 /// Pixel-art wordmark and mascot on the workspace material.
 const LOGO: Icon = Icon::new(include_bytes!("../../../assets/icons/start-logo.svg"), 5.);
 /// Wordmark width in columns and height in start-page rows.
@@ -198,7 +196,7 @@ impl StartPage {
         spacing: &TextSpacing,
     ) -> (CursorCell, f32) {
         let area = layout.area();
-        let (column, row, width) = match layout {
+        let (column, row, fraction, width) = match layout {
             StartLayout::Menu(_) => {
                 let caption = i18n::text(ACTIONS[self.menu_selection].caption);
                 let width = spacing
@@ -208,6 +206,7 @@ impl StartPage {
                 (
                     CAPTION_COLUMN as f32,
                     MENU_TOP + self.menu_selection * MENU_STEP,
+                    0.,
                     width,
                 )
             }
@@ -217,14 +216,14 @@ impl StartPage {
                     .as_ref()
                     .expect("project layout belongs to the picker");
                 let (column, row) = picker.caret(layout, spacing);
-                (column, row, 1.)
+                (column, row, picker.list_fraction(), 1.)
             }
         };
         (
             CursorCell {
                 row,
                 column,
-                origin: metrics.at(area.x as f32 + column, (area.y + row) as f32),
+                origin: metrics.at(area.x as f32 + column, (area.y + row) as f32 - fraction),
             },
             width,
         )
@@ -250,7 +249,6 @@ impl StartPage {
         &self,
         layout: StartLayout,
         history_error: Option<&str>,
-        preview: PreviewRows<'_>,
         metrics: Metrics,
         spacing: &TextSpacing,
     ) -> Frame {
@@ -261,7 +259,7 @@ impl StartPage {
                     .picker
                     .as_ref()
                     .expect("project layout belongs to the picker");
-                picker.frame(area, preview, &self.status, history_error, spacing)
+                picker.frame(area, &self.status, history_error, spacing)
             }
         }
     }
@@ -323,8 +321,14 @@ impl StartLayout {
     }
 
     /// Identify the visible item pressed at `(x, y)` in `page`'s current view.
-    pub(in crate::grid) fn hit(self, page: &StartPage, x: usize, y: usize) -> Option<StartHit> {
+    pub(in crate::grid) fn hit(
+        self,
+        page: &StartPage,
+        x: usize,
+        visual_y: f32,
+    ) -> Option<StartHit> {
         let area = self.area();
+        let y = visual_y.floor() as usize;
         if !area.contains(x, y) {
             return None;
         }
@@ -333,7 +337,7 @@ impl StartLayout {
             Self::Projects(layout) => page
                 .picker
                 .as_ref()?
-                .hit(layout, x, y)
+                .hit(layout, x, visual_y)
                 .map(StartHit::Project),
             Self::Menu(_) => {
                 let item = (y - area.y).checked_sub(MENU_TOP)?;
@@ -388,7 +392,11 @@ mod tests {
                 Some(item.action)
             );
             assert_eq!(
-                layout.hit(&page, area.x + 3, area.y + MENU_TOP + index * MENU_STEP),
+                layout.hit(
+                    &page,
+                    area.x + 3,
+                    (area.y + MENU_TOP + index * MENU_STEP) as f32
+                ),
                 Some(StartHit::Menu(item.action))
             );
         }

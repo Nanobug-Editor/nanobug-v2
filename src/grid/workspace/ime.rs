@@ -125,12 +125,12 @@ impl Workspace {
                 .accepts_native_text()
                 .then(|| self.projects.active_mut().editor.composition_mut());
         }
-        if let Some(history) = &mut self.command_window {
-            return history
-                .editor
+        if self.command_window.is_some() {
+            let editor = &mut self.command_window.as_mut()?.editor;
+            return editor
                 .vim()
                 .accepts_text()
-                .then(|| history.editor.composition_mut());
+                .then(|| editor.composition_mut());
         }
         if self.plugins.owns_input() {
             return self

@@ -1,10 +1,10 @@
 //! Host-owned state, input layout and drawing for plugin-provided windows.
 
 pub(in crate::grid) mod canvas;
-use crate::grid::text_field as field;
 pub(in crate::grid) mod native_field;
 mod view;
 
+use crate::ui::components::grid_text_field::GridTextField;
 use nanobug::plugins::session::{Key, Surface};
 use nanobug_plugin_sdk::{Instance, canvas::Viewport};
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,7 @@ pub(in crate::grid) struct SurfaceWindow {
     /// Host-confirmed text, preserved across replacement scenes and worker restarts.
     pub(in crate::grid) draft: String,
     /// Grapheme caret, selection and pointer interaction within the draft.
-    pub(in crate::grid) field: field::Field,
+    pub(in crate::grid) field: GridTextField,
     /// Shaped text cache for the current scene, font and draft.
     pub(in crate::grid) native_field: Option<Rc<native_field::NativeField>>,
     /// Latest submitted draft awaiting acknowledgement in the published session view.
