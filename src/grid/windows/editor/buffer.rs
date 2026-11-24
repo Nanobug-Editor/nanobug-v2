@@ -143,7 +143,7 @@ pub(in crate::grid) struct Buffer {
     /// Native grammar and language-server spans, independently bound to a text snapshot.
     pub(super) syntax_layers: [Option<Arc<nanobug::plugins::session::DocumentSyntax>>; 2],
     /// Native Markdown syntax cached independently of optional language providers.
-    markdown_highlights: MarkdownHighlights,
+    pub(super) markdown_highlights: MarkdownHighlights,
     /// Styles captured with the text of an immutable Ex message listing.
     message_spans: Vec<ExMessageSpan>,
     /// Latest diagnostic sets received for this buffer from live language providers.

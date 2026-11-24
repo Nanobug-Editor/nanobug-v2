@@ -382,7 +382,8 @@ impl EditorWindow {
 }
 
 impl Buffer {
-    /// Resolve the caret's visual row and segment-local extent using `rows`, `spacing` and `composition`.
+    /// Resolve the caret's visual row and horizontal span, including any list padding.
+    /// Use the measured `rows` and `spacing` for the line with the current `composition`.
     pub(super) fn visual_caret(
         &self,
         rows: &VisualRows<'_>,
@@ -400,13 +401,11 @@ impl Buffer {
             byte = suffix.closing_byte;
         }
         let row = rows.row_for_byte(line, byte);
-        let start = rows
-            .row(row)
-            .and_then(|row| row.segment)
-            .map_or(0, |segment| segment.start_units);
-        (
-            row,
-            span.start.saturating_sub(start)..span.end.saturating_sub(start),
-        )
+        let Some(segment) = rows.row(row).and_then(|row| row.segment) else {
+            return (row, span);
+        };
+        let position =
+            |units: usize| units.saturating_sub(segment.start_units) + segment.indent_units;
+        (row, position(span.start)..position(span.end))
     }
 }

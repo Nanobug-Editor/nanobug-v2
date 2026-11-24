@@ -37,7 +37,7 @@ impl LineSource<'_> {
             let end = painted
                 .fold_suffix
                 .map_or(painted.text.len(), |suffix| suffix.start_byte);
-            let units = visual_x * UNITS_PER_COLUMN as f64;
+            let units = (visual_x * UNITS_PER_COLUMN as f64 - segment.indent_units as f64).max(0.);
             let cells = spacing.buffer_cells(
                 &painted.text[segment.bytes.clone()],
                 segment.bytes.start,
@@ -114,7 +114,10 @@ impl EditorWindow {
             let dots = buffer.fold_ellipsis_span(row, &line, spacing);
             let local_units = f64::from(x - gutter as f32) * UNITS_PER_COLUMN as f64;
             let units = if let Some(segment) = segment {
-                let units = segment.start_units as f64 + local_units;
+                if local_units < segment.indent_units as f64 {
+                    return false;
+                }
+                let units = segment.start_units as f64 + local_units - segment.indent_units as f64;
                 // Space after a wrapped segment cannot hit a suffix on its continuation.
                 if units >= segment.end_units as f64 {
                     return false;
@@ -308,13 +311,9 @@ mod tests {
             ),
             4,
         );
+        // The following English word fits on a fresh row, so it stays together.
         assert_eq!(
-            editor.offset(
-                metrics.at(x + advance + 1.25, y + 0.5),
-                area,
-                metrics,
-                &spacing,
-            ),
+            editor.offset(metrics.at(x + 1.25, y + 1.5), area, metrics, &spacing,),
             5,
         );
         assert_eq!(editor.vim().doc.text, "abcdEFGH");

@@ -17,7 +17,7 @@ static HTML_MARKUP: LazyLock<Regex> = LazyLock::new(|| {
         .expect("static HTML markup pattern")
 });
 
-/// Retain native Markdown highlights until the document contents change.
+/// Retain Markdown source highlights and list body positions until the document changes.
 #[derive(Default)]
 pub(in crate::grid::windows::editor) struct MarkdownHighlights(RefCell<CachedHighlights>);
 
@@ -28,26 +28,42 @@ struct CachedHighlights {
     version: Option<(u64, u64)>,
     /// Syntax spans sorted by source byte offset.
     spans: Vec<Highlight>,
+    /// Source offsets after each Markdown list marker and its separating whitespace.
+    list_bodies: Vec<usize>,
 }
 
 impl MarkdownHighlights {
     /// Return the syntax for `doc`, reusing it across repaints and transient IME composition.
     pub(in crate::grid::windows::editor) fn get(&self, doc: &Document) -> Ref<'_, [Highlight]> {
+        self.refresh(doc);
+        Ref::map(self.0.borrow(), |cached| cached.spans.as_slice())
+    }
+
+    /// Return the list body starts on marker lines in `doc`, in source order.
+    pub(in crate::grid::windows::editor) fn list_bodies(&self, doc: &Document) -> Ref<'_, [usize]> {
+        self.refresh(doc);
+        Ref::map(self.0.borrow(), |cached| cached.list_bodies.as_slice())
+    }
+
+    /// Parse the source markup once per opening and revision of `doc`.
+    fn refresh(&self, doc: &Document) {
         let version = Some((doc.opening, doc.revision));
         if self.0.borrow().version != version {
+            let (spans, list_bodies) = parse(&doc.text);
             self.0.replace(CachedHighlights {
                 version,
-                spans: parse(&doc.text),
+                spans,
+                list_bodies,
             });
         }
-        Ref::map(self.0.borrow(), |cached| cached.spans.as_slice())
     }
 }
 
-/// Derive syntax highlights from the same Markdown dialect as the rendered preview.
-fn parse(source: &str) -> Vec<Highlight> {
+/// Derive syntax highlights and list body positions from the Markdown `source`.
+fn parse(source: &str) -> (Vec<Highlight>, Vec<usize>) {
     let parser = Parser::new_ext(source, MARKDOWN_OPTIONS);
     let mut regions = Vec::new();
+    let mut list_bodies = Vec::new();
     for (_, definition) in parser.reference_definitions().iter() {
         let range = definition.span.clone();
         add(&mut regions, range.clone(), SyntaxKind::MarkupLink);
@@ -93,6 +109,13 @@ fn parse(source: &str) -> Vec<Highlight> {
                 let start = range.end - item.len();
                 let marker = item.find(char::is_whitespace).unwrap_or(item.len());
                 add(&mut regions, start..start + marker, SyntaxKind::MarkupList);
+                let first_line = item.split('\n').next().unwrap_or(item);
+                let body =
+                    first_line[marker.min(first_line.len())..].trim_start_matches([' ', '\t']);
+                let body = task_body(body);
+                if !body.is_empty() {
+                    list_bodies.push(start + first_line.len() - body.len());
+                }
                 continue;
             }
             Event::Start(Tag::FootnoteDefinition(_)) => {
@@ -124,7 +147,17 @@ fn parse(source: &str) -> Vec<Highlight> {
         };
         add(&mut regions, range, kind);
     }
-    Highlight::flatten(regions)
+    list_bodies.sort_unstable();
+    (Highlight::flatten(regions), list_bodies)
+}
+
+/// Resolve the text after an optional task checkbox at the start of a list `body`.
+fn task_body(body: &str) -> &str {
+    body.strip_prefix("[ ]")
+        .or_else(|| body.strip_prefix("[x]"))
+        .or_else(|| body.strip_prefix("[X]"))
+        .filter(|tail| tail.starts_with([' ', '\t']))
+        .map_or(body, |tail| tail.trim_start_matches([' ', '\t']))
 }
 
 /// Record a nonempty source `range` and its theme `kind` in `spans`.
@@ -210,7 +243,7 @@ mod tests {
             "```rust\nfn main() {}\n```\n\n",
             "| 标头 |\n| --- |\n| 内容 |\n"
         );
-        let spans = parse(text);
+        let (spans, _) = parse(text);
         for (token, expected) in [
             ("# 标题", Some(SyntaxKind::MarkupHeading)),
             ("**强调**", Some(SyntaxKind::MarkupStrong)),

@@ -137,8 +137,13 @@ impl EditorWindow {
         let buffer = &mut self.buffers[self.active];
         buffer.apply_input(|buffer| {
             if wrapped {
-                let mut resolve =
-                    wrap::motion_resolver(&buffer.wraps, width, spacing, &self.composition.text);
+                let mut resolve = wrap::motion_resolver(
+                    &buffer.wraps,
+                    &buffer.markdown_highlights,
+                    width,
+                    spacing,
+                    &self.composition.text,
+                );
                 buffer
                     .vim
                     .activate_menu(&mut self.register, path, &mut resolve)
@@ -161,8 +166,13 @@ impl EditorWindow {
         let buffer = &mut self.buffers[self.active];
         buffer.apply_input(|buffer| {
             if wrapped {
-                let mut resolve =
-                    wrap::motion_resolver(&buffer.wraps, width, spacing, &self.composition.text);
+                let mut resolve = wrap::motion_resolver(
+                    &buffer.wraps,
+                    &buffer.markdown_highlights,
+                    width,
+                    spacing,
+                    &self.composition.text,
+                );
                 buffer
                     .vim
                     .finish_mapping_timeout(&mut self.register, &mut resolve)
@@ -185,8 +195,13 @@ impl EditorWindow {
         let buffer = &mut self.buffers[self.active];
         buffer.apply_input(|buffer| {
             if wrapped {
-                let mut resolve =
-                    wrap::motion_resolver(&buffer.wraps, width, spacing, &self.composition.text);
+                let mut resolve = wrap::motion_resolver(
+                    &buffer.wraps,
+                    &buffer.markdown_highlights,
+                    width,
+                    spacing,
+                    &self.composition.text,
+                );
                 buffer.vim.resume_sleep(&mut self.register, &mut resolve)
             } else {
                 buffer
@@ -209,8 +224,13 @@ impl EditorWindow {
         let buffer = &mut self.buffers[self.active];
         buffer.apply_input(|buffer| {
             if wrapped {
-                let mut resolve =
-                    wrap::motion_resolver(&buffer.wraps, width, spacing, &self.composition.text);
+                let mut resolve = wrap::motion_resolver(
+                    &buffer.wraps,
+                    &buffer.markdown_highlights,
+                    width,
+                    spacing,
+                    &self.composition.text,
+                );
                 buffer.vim.apply_syntax_selection_with_screen_rows(
                     version,
                     nodes,
@@ -468,8 +488,13 @@ impl EditorWindow {
         buffer.vim.set_alternate_file(alternate_path);
         let edit = buffer.apply_input(|buffer| {
             if wrapped {
-                let mut resolve =
-                    wrap::motion_resolver(&buffer.wraps, width, spacing, &self.composition.text);
+                let mut resolve = wrap::motion_resolver(
+                    &buffer.wraps,
+                    &buffer.markdown_highlights,
+                    width,
+                    spacing,
+                    &self.composition.text,
+                );
                 buffer
                     .vim
                     .key_with_screen_rows(&key, &mut self.register, &mut resolve)

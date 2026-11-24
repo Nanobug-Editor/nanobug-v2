@@ -101,6 +101,23 @@ fn native_markdown_source_clips_only_whole_graphemes() -> Result<()> {
                 next_row != blank_row,
                 "Han grapheme did not paint on the continuation"
             );
+            let list = fixture.join("list.md");
+            fs::write(&list, format!("\n10. {}\n", "中".repeat(columns * 2)))?;
+            let list_left = source_crop(handle, app, list.clone(), continuation)?;
+            ensure!(
+                list_left == blank_row,
+                "the list continuation painted before its body"
+            );
+            let body = Bounds::new(
+                continuation.origin + point(continuation.size.width * 2., px(0.)),
+                continuation.size,
+            );
+            let list_body = source_crop(handle, app, list, body)?;
+            let blank_body = source_crop(handle, app, fixture.join("blank.md"), body)?;
+            ensure!(
+                list_body != blank_body,
+                "the indented list body did not paint"
+            );
             let blank_line = fixture.join("blank.md");
             let highlighted = source_crop(handle, app, blank_line, highlight_crop)?;
             let half_row = highlighted.height() / 4;

@@ -718,18 +718,19 @@ impl Frame {
         tint: u32,
         mut style: impl FnMut(usize) -> (u32, u32, bool),
     ) {
-        self.styled_viewport_line(y, cells, viewport, tint, |byte| {
+        self.styled_viewport_line(y, cells, viewport, 0, tint, |byte| {
             let (fg, bg, dimmed) = style(byte);
             CellPaint::new(fg, bg, dimmed)
         });
     }
 
-    /// Retain the full painting of measured graphemes intersecting the viewport.
+    /// Retain `cells` in row `y` with `indent_units` of leading padding before their measured positions.
     pub(in crate::grid) fn styled_viewport_line<'a>(
         &mut self,
         y: usize,
         cells: impl Iterator<Item = TextCell<'a>>,
         viewport: Range<usize>,
+        indent_units: usize,
         tint: u32,
         mut style: impl FnMut(usize) -> CellPaint,
     ) {
@@ -737,10 +738,30 @@ impl Frame {
         let left = viewport.start * UNITS_PER_COLUMN;
         let right = viewport.end * UNITS_PER_COLUMN;
         let mut column = 0;
-        for cell in cells
-            .skip_while(|cell| cell.end <= left)
-            .take_while(|cell| cell.start < right)
-        {
+        let leading = indent_units.min(right).saturating_sub(left);
+        if leading > 0 {
+            column = row.place(
+                0,
+                TextCell {
+                    byte: 0,
+                    text: "\t",
+                    columns: leading.div_ceil(UNITS_PER_COLUMN),
+                    start: left,
+                    end: left + leading,
+                },
+                left,
+                CellPaint::new(TEXT, tint, false),
+            );
+        }
+        for mut cell in cells {
+            cell.start += indent_units;
+            cell.end += indent_units;
+            if cell.start >= right {
+                break;
+            }
+            if cell.end <= left {
+                continue;
+            }
             let appearance = style(cell.byte);
             column = row.place(column, cell, left, appearance);
         }

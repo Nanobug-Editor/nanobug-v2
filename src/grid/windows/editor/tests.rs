@@ -500,6 +500,132 @@ fn markdown_source_wraps_retained_text_at_grapheme_boundaries() {
     assert!(text == expected_text);
 }
 
+/// Fill Markdown rows through Chinese text while keeping complete English words where they fit.
+#[test]
+fn markdown_source_wrap_uses_breaks_between_chinese_characters_and_english_words() {
+    let spacing = TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 6.4);
+    let cases: &[(&str, usize, &[&str])] = &[
+        (
+            "1. 作为用户我希望插件尽快可用",
+            9,
+            &["1. 作为用户", "我希望插", "件尽快可", "用"],
+        ),
+        ("按 Apply 后再生效", 12, &["按 Apply 后再", "生效"]),
+        ("中文Nanobug编辑", 9, &["中文", "Nanobug编", "辑"]),
+        ("  2) Operator", 10, &["  2) Opera", "tor"]),
+        ("中文abcdefghijklmnop", 8, &["中文abcde", "fghijklm", "nop"]),
+    ];
+    for &(text, columns, expected) in cases {
+        let mut doc = Document::new(text);
+        doc.path = Some("wrapped.md".into());
+        let editor = EditorWindow::new(doc);
+        let rows = editor.visual_rows(columns, &spacing);
+        let fragments = (0..rows.len())
+            .map(|index| &text[rows.row(index).unwrap().segment.unwrap().bytes])
+            .collect::<Vec<_>>();
+        assert_eq!(fragments, expected, "{text}");
+    }
+}
+
+/// Use the list body column for wrapping, drawing, caret movement, and pointer placement.
+#[test]
+fn markdown_list_continuations_share_the_body_column() {
+    use crate::{
+        grid::{render::Metrics, windows::WindowFrame},
+        ui::theme::GOLD,
+    };
+    use gpui::{point, px};
+
+    let source = "10. 甲乙丙丁戊己庚辛壬癸";
+    let caret = source.find('戊').unwrap();
+    let mut doc = Document::new(source);
+    doc.path = Some("list.md".into());
+    doc.cursor = caret;
+    let mut editor = EditorWindow::new(doc);
+    assert!(editor.set_markdown_view_mode(super::MarkdownViewMode::Edit));
+    let area = Rect {
+        w: 16,
+        h: 7,
+        ..Rect::default()
+    };
+    let metrics = Metrics {
+        cw: 6.4,
+        lh: 20.,
+        font_size: 16.,
+        origin: point(px(0.), px(0.)),
+    };
+    let spacing = TextSpacing::new(
+        Arc::new(NoopTextSystem::new()),
+        FontId(0),
+        metrics.font_size,
+        metrics.cw,
+    );
+    let body = editor.text_area(area);
+    assert_eq!(body.w, 10);
+    let x = body.x as f32 + 4.;
+    let y = body.y as f32 + 1.;
+    let (caret_x, caret_y, _, _, visible) = editor.body_caret(area, &spacing);
+    assert!(visible);
+    assert_eq!((caret_x, caret_y), (x, y));
+    assert_eq!(
+        editor.offset(metrics.at(x + 0.25, y + 0.5), area, metrics, &spacing),
+        caret,
+    );
+    assert_eq!(
+        editor.offset(metrics.at(x + 2., y + 0.5), area, metrics, &spacing),
+        source.find('己').unwrap(),
+    );
+
+    let context = WindowFrame {
+        area,
+        selected: true,
+        modal_open: false,
+        controls_hovered: false,
+        spacing: &spacing,
+    };
+    let (_, text) = editor.content_frames(context, |byte| (byte == caret).then_some(GOLD));
+    assert_eq!(text.cell_paint_at(1, 4).foreground, GOLD);
+    assert_ne!(text.cell_paint_at(1, 3).foreground, GOLD);
+
+    for key in ["g", "k"] {
+        fold_test_key(&mut editor, key, area, &spacing);
+    }
+    assert_eq!(editor.vim().doc.cursor, source.find('甲').unwrap());
+    for key in ["g", "j"] {
+        fold_test_key(&mut editor, key, area, &spacing);
+    }
+    assert_eq!(editor.vim().doc.cursor, caret);
+    assert_eq!(editor.vim().doc.text, source);
+}
+
+/// Use measured list prefixes including tabs, checkbox markers and nested item indentation.
+#[test]
+fn markdown_list_continuation_measures_the_actual_prefix() {
+    use crate::ui::text::UNITS_PER_COLUMN;
+
+    let spacing = TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 6.4);
+    for (source, line, width, glyph, indent) in [
+        ("1.\t甲乙丙丁戊己庚辛", 0, 10, '戊', 4),
+        ("1. 父\n   - [x] 甲乙丙丁戊己庚辛", 1, 14, '丁', 9),
+        ("4. abcd efgh", 0, 7, ' ', 2),
+        ("```\n10. 甲乙丙丁戊己庚辛\n```", 1, 10, '戊', 0),
+        ("10. 甲乙丙丁戊己庚辛", 0, 5, '甲', 0),
+    ] {
+        let mut doc = Document::new(source);
+        doc.path = Some("list.md".into());
+        let editor = EditorWindow::new(doc);
+        let rows = editor.visual_rows(width, &spacing);
+        let continuation = rows.row(rows.first_row(line) + 1).unwrap();
+        assert_eq!(continuation.line, line, "{source}");
+        let segment = continuation.segment.unwrap();
+        assert_eq!(segment.indent_units, indent * UNITS_PER_COLUMN, "{source}");
+        assert!(
+            editor.vim().doc.line(line)[segment.bytes].starts_with(glyph),
+            "{source}"
+        );
+    }
+}
+
 /// An ordinary source pane can opt into wrapping, hide digits and measure its own tabs.
 #[test]
 fn local_display_options_control_source_layout() {

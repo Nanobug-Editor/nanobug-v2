@@ -1,13 +1,18 @@
 //! Project Markdown source lines onto width-dependent editor rows.
 
-use super::{Buffer, EditorWindow, MarkdownViewMode, buffer::LineSource};
-use crate::ui::text::{TextSpacing, UNITS_PER_COLUMN};
+use super::{
+    Buffer, EditorWindow, MarkdownViewMode,
+    buffer::LineSource,
+    markdown::{MarkdownHighlights, is_markdown},
+};
+use crate::ui::text::{TextCell, TextSpacing, UNITS_PER_COLUMN};
 use gpui::FontId;
 use nanobug::{
     document::Document,
     vim::{ScreenMotion, Vim},
 };
 use std::{cell::RefCell, ops::Range, sync::Arc};
+use unicode_linebreak::linebreaks;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// One visible row with its source line and optional wrapped span.
@@ -30,6 +35,8 @@ pub(super) struct WrapSegment {
     pub(super) end_units: usize,
     /// Logical column at the fragment start for preserving tab stops.
     pub(super) tab_column: usize,
+    /// Visual padding in spacing units before a list continuation's source text.
+    pub(super) indent_units: usize,
 }
 
 /// Inputs that affect the bytes and measured width of the visible source rows.
@@ -41,6 +48,8 @@ struct WrapKey {
     hidden: Vec<Range<usize>>,
     /// Available text columns.
     columns: usize,
+    /// Prefer Unicode line breaks for Markdown source.
+    markdown: bool,
     /// Width of tabs. It can change without a text revision.
     tabstop: usize,
     /// Font identity and fixed-point scale of CJK measurements.
@@ -103,6 +112,7 @@ impl Buffer {
         measured_rows(
             LineSource(&self.vim),
             &self.wraps,
+            &self.markdown_highlights,
             columns,
             spacing,
             composition,
@@ -120,6 +130,7 @@ impl Buffer {
                 cache.key.columns == columns
                     && cache.key.version == (doc.opening, doc.revision)
                     && cache.key.hidden == doc.hidden_rows()
+                    && cache.key.markdown == uses_markdown_breaks(&self.vim)
             })
             .map(|cache| cache.rows.clone());
         VisualRows { doc, wrapped }
@@ -134,10 +145,16 @@ impl Buffer {
     }
 }
 
+/// Whether the editable `vim` document uses Markdown's mixed-script wrap rules.
+fn uses_markdown_breaks(vim: &Vim) -> bool {
+    !vim.is_read_only() && vim.doc.path.as_deref().is_some_and(is_markdown)
+}
+
 /// Measure the same rows from the live buffer or from intermediate Vim state during replay.
 fn measured_rows<'a>(
     source: LineSource<'a>,
     wraps: &RefCell<Option<WrappedRows>>,
+    markdown: &MarkdownHighlights,
     columns: usize,
     spacing: &TextSpacing,
     composition: &str,
@@ -156,6 +173,7 @@ fn measured_rows<'a>(
         version: (doc.opening, doc.revision),
         hidden: doc.hidden_rows().to_owned(),
         columns,
+        markdown: uses_markdown_breaks(vim),
         tabstop: doc.tabstop(),
         metrics: spacing.metric_key(),
         composition: (!composition.is_empty() && (insert || vim.awaits_literal_argument()))
@@ -165,17 +183,34 @@ fn measured_rows<'a>(
     };
     let mut cache = wraps.borrow_mut();
     if cache.as_ref().is_none_or(|cache| cache.key != key) {
+        let list_bodies = key.markdown.then(|| markdown.list_bodies(doc));
         let mut rows = Vec::new();
         let mut line = 0;
         while line < doc.starts.len() {
             let painted = source.painted_line(line, composition);
+            let list_body = list_bodies.as_deref().and_then(|bodies| {
+                let range = doc.line_range(line);
+                let index = bodies.partition_point(|&byte| byte < range.end);
+                let start = bodies
+                    .get(index.checked_sub(1)?)?
+                    .checked_sub(range.start)?;
+                let preedit_len = painted
+                    .preedit
+                    .as_ref()
+                    .filter(|mark| mark.start < start)
+                    .map_or(0, Range::len);
+                Some(start + preedit_len)
+            });
+            let breaks = key
+                .markdown
+                .then(|| markdown_breaks(&painted.text, list_body));
             append_wrapped_line(
                 &mut rows,
                 line,
-                &painted.text,
+                spacing.buffer_cells(&painted.text, 0, 0, key.tabstop),
                 columns * UNITS_PER_COLUMN,
-                spacing,
-                key.tabstop,
+                breaks,
+                list_body,
                 key.end_caret == Some(line) && painted.preedit.is_none(),
             );
             line = doc.folded_end_row(line).unwrap_or(line) + 1;
@@ -194,6 +229,7 @@ fn measured_rows<'a>(
 /// Resolve a motion in measured rows, preserving the target column across vertical moves.
 pub(super) fn motion_resolver<'a>(
     wraps: &'a RefCell<Option<WrappedRows>>,
+    markdown: &'a MarkdownHighlights,
     columns: usize,
     spacing: &'a TextSpacing,
     composition: &'a str,
@@ -201,7 +237,7 @@ pub(super) fn motion_resolver<'a>(
     move |vim, motion, count, column| {
         let source = LineSource(vim);
         let doc = &vim.doc;
-        let rows = measured_rows(source, wraps, columns, spacing, composition);
+        let rows = measured_rows(source, wraps, markdown, columns, spacing, composition);
         let line = doc.starts.partition_point(|&start| start <= doc.cursor) - 1;
         let painted = source.painted_line(line, composition);
         let mut byte = doc.cursor - doc.starts[line];
@@ -264,15 +300,16 @@ pub(super) fn motion_resolver<'a>(
             return Some((offset.min(end), 0));
         }
         let column = column.unwrap_or_else(|| {
-            spacing
-                .buffer_cells(
-                    &painted.text[segment.bytes.clone()],
-                    segment.bytes.start,
-                    segment.tab_column,
-                    doc.tabstop(),
-                )
-                .find(|cell| cell.byte >= byte)
-                .map_or(segment.end_units - segment.start_units, |cell| cell.start)
+            segment.indent_units
+                + spacing
+                    .buffer_cells(
+                        &painted.text[segment.bytes.clone()],
+                        segment.bytes.start,
+                        segment.tab_column,
+                        doc.tabstop(),
+                    )
+                    .find(|cell| cell.byte >= byte)
+                    .map_or(segment.end_units - segment.start_units, |cell| cell.start)
         });
         let down = motion == ScreenMotion::Down;
         let available = if down {
@@ -424,21 +461,44 @@ struct WrapBoundary {
     column: usize,
 }
 
-/// Append grapheme-aligned rows of `text` for file `line` up to `width` spacing units.
-/// Use `spacing` for mixed-width text and retain a cell for a full-width insertion `end_caret`.
-fn append_wrapped_line(
+/// Yield Unicode break offsets in Markdown `text`, keeping the marker before `list_body` together
+/// with its first grapheme when they fit.
+fn markdown_breaks(text: &str, list_body: Option<usize>) -> impl Iterator<Item = usize> + '_ {
+    let body_start = list_body.unwrap_or_else(|| {
+        let marker = text.trim_start_matches([' ', '\t']);
+        let digits = marker.bytes().take_while(u8::is_ascii_digit).count();
+        marker[digits..]
+            .strip_prefix(['.', ')'])
+            .filter(|tail| (1..=9).contains(&digits) && tail.starts_with([' ', '\t']))
+            .map_or(0, |tail| {
+                text.len() - tail.trim_start_matches([' ', '\t']).len()
+            })
+    });
+    linebreaks(text)
+        .map(|(byte, _)| byte)
+        .filter(move |&byte| byte > body_start)
+}
+
+/// Pack measured `cells` for file `line` into rows up to `width` spacing units.
+/// Prefer offsets from `breaks` for Markdown or whitespace for ordinary wrapped text.
+/// Align continuations to the measured position of the `list_body` byte.
+/// Keep whole graphemes and reserve a row when a full-width insertion `end_caret` needs one.
+fn append_wrapped_line<'a>(
     rows: &mut Vec<VisualRow>,
     line: usize,
-    text: &str,
+    mut cells: impl Iterator<Item = TextCell<'a>> + Clone,
     width: usize,
-    spacing: &TextSpacing,
-    tabstop: usize,
+    breaks: Option<impl Iterator<Item = usize>>,
+    list_body: Option<usize>,
     end_caret: bool,
 ) {
+    let mut breaks = breaks.map(Iterator::peekable);
     let mut start = WrapBoundary::default();
     let mut end = start;
     let mut word_break = start;
-    let mut push = |start: WrapBoundary, end: WrapBoundary| {
+    let mut continuation_indent = 0;
+    let mut indent = 0;
+    let mut push = |start: WrapBoundary, end: WrapBoundary, indent_units| {
         rows.push(VisualRow {
             line,
             segment: Some(WrapSegment {
@@ -446,18 +506,59 @@ fn append_wrapped_line(
                 start_units: start.units,
                 end_units: end.units,
                 tab_column: start.column,
+                indent_units,
             }),
         });
     };
-    for cell in spacing.buffer_cells(text, 0, 0, tabstop) {
-        if cell.end - start.units > width && end.byte > start.byte {
-            if word_break.byte > start.byte {
-                push(start, word_break);
-                start = word_break;
+    while let Some(cell) = cells.next() {
+        // Keep room for a wide glyph in panes narrower than the list prefix and two columns.
+        if list_body == Some(cell.byte) && width.saturating_sub(cell.start) >= 2 * UNITS_PER_COLUMN
+        {
+            continuation_indent = cell.start;
+        }
+        if let Some(breaks) = &mut breaks {
+            // Ignore opportunities inside a measured grapheme.
+            while let Some(byte) = breaks.next_if(|&byte| byte <= end.byte) {
+                if byte == end.byte {
+                    word_break = end;
+                }
             }
-            if end.byte > start.byte && cell.end - start.units > width {
-                push(start, end);
+        }
+        if cell.end - start.units > width - indent && end.byte > start.byte {
+            if word_break.byte > start.byte
+                && word_break.byte < end.byte
+                && breaks.as_mut().is_none_or(|breaks| {
+                    let next_break = breaks.peek().copied().unwrap_or(usize::MAX);
+                    following_word_fits(
+                        &cell,
+                        cells.clone(),
+                        next_break,
+                        word_break.units,
+                        width - continuation_indent,
+                    )
+                })
+            {
+                push(start, word_break, indent);
+                start = word_break;
+                indent = continuation_indent;
+            }
+            if end.byte > start.byte && cell.end - start.units > width - indent {
+                push(start, end, indent);
                 start = end;
+                indent = continuation_indent;
+                if indent > 0 && matches!(cell.text, " " | "\t") {
+                    // A separator carried over from the preceding row already supplies part of the indent.
+                    indent = indent.saturating_sub(cell.end - cell.start);
+                    for blank in cells
+                        .clone()
+                        .take_while(|cell| matches!(cell.text, " " | "\t"))
+                    {
+                        if indent == 0 {
+                            break;
+                        }
+                        indent = indent.saturating_sub(blank.end - blank.start);
+                    }
+                }
             }
         }
         end = WrapBoundary {
@@ -465,12 +566,30 @@ fn append_wrapped_line(
             units: cell.end,
             column: end.column + cell.columns,
         };
-        if cell.text == " " || cell.text == "\t" {
+        if breaks.is_none() && matches!(cell.text, " " | "\t") {
             word_break = end;
         }
     }
-    push(start, end);
-    if end_caret && end.units - start.units >= width {
-        push(end, end);
+    push(start, end, indent);
+    if end_caret && end.units - start.units >= width - indent {
+        push(end, end, continuation_indent);
     }
+}
+
+/// Check whether the word containing the overflowing `cell` can fit on an empty row.
+/// Measure through `next_break` from `word_start` using `remaining` and the row's `width`.
+fn following_word_fits<'a>(
+    cell: &TextCell<'_>,
+    remaining: impl Iterator<Item = TextCell<'a>>,
+    next_break: usize,
+    word_start: usize,
+    width: usize,
+) -> bool {
+    // A separator that spills onto the next row can leave the completed word in place.
+    !matches!(cell.text, " " | "\t")
+        && cell.end - word_start <= width
+        && remaining
+            .take_while(|cell| cell.byte < next_break)
+            .filter(|cell| !matches!(cell.text, " " | "\t"))
+            .all(|cell| cell.end - word_start <= width)
 }

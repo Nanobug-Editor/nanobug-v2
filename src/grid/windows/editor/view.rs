@@ -408,12 +408,17 @@ impl EditorWindow {
                     }
                 }
             }
-            let (fragment, byte_start, tab_column) =
+            let (fragment, byte_start, tab_column, indent_units) =
                 visual_row
                     .segment
-                    .map_or((painted.text.as_ref(), 0, 0), |segment| {
+                    .map_or((painted.text.as_ref(), 0, 0, 0), |segment| {
                         let byte_start = segment.bytes.start;
-                        (&painted.text[segment.bytes], byte_start, segment.tab_column)
+                        (
+                            &painted.text[segment.bytes],
+                            byte_start,
+                            segment.tab_column,
+                            segment.indent_units,
+                        )
                     });
             let tint = if current { CURRENT } else { normal.background };
             let tint = signs_on_line.line.map_or(tint, |style| {
@@ -432,6 +437,7 @@ impl EditorWindow {
                     .spacing
                     .buffer_cells(fragment, byte_start, tab_column, tabstop),
                 left..right,
+                indent_units,
                 tint,
                 |byte| {
                     if let Some(suffix) = painted
