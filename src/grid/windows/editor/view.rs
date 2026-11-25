@@ -13,7 +13,10 @@ use crate::{
     ui::{
         components::grid_window::GridWindow,
         icons::Icon,
-        theme::{CURRENT, GOLD, MUTED, PREEDIT, TEXT, ThemeComponent, WARNING_TEXT, syntax_color},
+        theme::{
+            CURRENT, FOLDED, FOLDED_CURRENT, GOLD, MUTED, PREEDIT, TEXT, ThemeComponent,
+            WARNING_TEXT, syntax_color,
+        },
     },
 };
 use nanobug::vim::InputMappings;
@@ -144,7 +147,7 @@ impl EditorWindow {
 
     /// Draw text and line numbers for `context`, using `color_at` for optional syntax colors by byte offset.
     /// Built-in Markdown colors fill gaps left by the provider and `color_at`.
-    /// Show line numbers on the first visual row of each line and highlight the caret's visual row.
+    /// Show line numbers on the first visual row of each line, tinting folded lines and the active row.
     pub(in crate::grid) fn content_frames(
         &self,
         context: WindowFrame<'_>,
@@ -343,12 +346,15 @@ impl EditorWindow {
             };
             let line = visual_row.line;
             let current = display_row == caret_display_row && active;
-            if current {
-                numbers.tint(visible, 0, gutter.width, CURRENT);
-                if divider_padding > 0 {
-                    // The left outline is centered in its border cell. Match its half-column gap.
-                    text.extend_row_tint(visible, CURRENT);
-                }
+            let folded = doc.folded_at(line);
+            let row_tint = match (folded, current) {
+                (true, true) => FOLDED_CURRENT,
+                (true, false) => FOLDED,
+                (false, true) => CURRENT,
+                (false, false) => 0,
+            };
+            if row_tint != 0 {
+                numbers.tint(visible, 0, gutter.width, row_tint);
             }
             // Several adjacent visual rows can share one composed or folded line.
             if painted_line
@@ -407,7 +413,7 @@ impl EditorWindow {
                     if diagnostic && let Some(diagnostic_column) = gutter.diagnostic {
                         numbers.text(diagnostic_column, visible, "!", WARNING_TEXT, 1);
                     }
-                    if vim.doc.folded_at(line) {
+                    if folded {
                         let icon = if diagnostic && gutter.diagnostic.is_none() {
                             DIAGNOSTIC_FOLD_ARROW
                         } else {
@@ -431,12 +437,20 @@ impl EditorWindow {
                             segment.indent_units,
                         )
                     });
-            let tint = if current { CURRENT } else { normal.background };
+            let tint = if row_tint == 0 {
+                normal.background
+            } else {
+                row_tint
+            };
             let tint = signs_on_line.line.map_or(tint, |style| {
                 CellPaint::new(TEXT, tint, false)
                     .with_highlight(style)
                     .background
             });
+            if row_tint != 0 && divider_padding > 0 {
+                // Match the half-column gap between the left outline and the gutter tint.
+                text.extend_row_tint(visible, tint);
+            }
             let decorate = |paint: CellPaint| {
                 signs_on_line
                     .line

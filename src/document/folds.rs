@@ -4,17 +4,28 @@ use super::Document;
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-/// One manual or language-provider fold, including its visible header.
+/// One retained fold, including the header that stays visible when it closes.
 #[derive(Clone)]
 struct Fold {
     /// Half-open range of document lines.
     rows: Range<usize>,
-    /// Whether the range came from a language provider.
-    provided: bool,
+    /// How its range was defined, which controls replacement and deletion.
+    source: FoldSource,
     /// An explicit open/closed override of the configured fold level.
     closed: Option<bool>,
     /// Whether a search hit temporarily shows this fold's contents.
     search_open: bool,
+}
+
+/// The source that owns a fold definition.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FoldSource {
+    /// An explicit range created by the user.
+    Manual,
+    /// A range published by a language plugin.
+    Provider,
+    /// A range derived by the editor from the document's content.
+    Builtin,
 }
 
 impl Fold {
@@ -220,7 +231,7 @@ impl Folds {
                 fold.rows.end = fold.rows.end.saturating_add_signed(delta);
                 return true;
             }
-            if fold.provided {
+            if fold.source != FoldSource::Manual {
                 return false;
             }
             if fold.rows.start >= first && fold.rows.end <= last {
@@ -248,7 +259,7 @@ impl Document {
             .iter()
             .enumerate()
             .filter_map(|(index, fold)| {
-                if fold.provided {
+                if fold.source != FoldSource::Manual {
                     return None;
                 }
                 let depth = self.folds.definitions[..index]
@@ -270,23 +281,38 @@ impl Document {
     }
 
     /// Set the validated provider fold `ranges`, retaining explicit state for matching ranges.
-    pub fn set_provider_folds(&mut self, mut ranges: Vec<Range<usize>>, retain_state: bool) {
+    pub fn set_provider_folds(&mut self, ranges: Vec<Range<usize>>, retain_state: bool) {
+        self.replace_automatic_folds(ranges, FoldSource::Provider, retain_state);
+    }
+
+    /// Set built-in fold `ranges`, retaining the state of matching built-in ranges.
+    pub fn set_builtin_folds(&mut self, ranges: Vec<Range<usize>>) {
+        self.replace_automatic_folds(ranges, FoldSource::Builtin, true);
+    }
+
+    /// Replace automatic fold `ranges` with the given `source`, retaining matching state when requested.
+    fn replace_automatic_folds(
+        &mut self,
+        mut ranges: Vec<Range<usize>>,
+        source: FoldSource,
+        retain_state: bool,
+    ) {
         ranges.retain(|rows| rows.len() > 1 && rows.end <= self.starts.len());
         ranges.sort_by_key(|rows| (rows.start, std::cmp::Reverse(rows.end)));
         ranges.dedup();
         let mut states = BTreeMap::new();
         self.folds.definitions.retain(|fold| {
-            if fold.provided && retain_state {
+            if fold.source == source && retain_state {
                 states.insert(
                     (fold.rows.start, fold.rows.end),
                     (fold.closed, fold.search_open),
                 );
             }
-            !fold.provided
+            fold.source == FoldSource::Manual
         });
-        // Retained manual ranges form a hierarchy. Keep provider ranges that can
-        // coexist with it, then reject crossings among the remaining provider ranges.
-        let mut provider = Vec::new();
+        // Retained manual ranges form a hierarchy. Keep automatic ranges that fit
+        // within it, then reject crossings among the remaining candidates.
+        let mut automatic = Vec::new();
         let mut nesting = Vec::new();
         for rows in ranges {
             if self.folds.complete_range(rows.clone()) != rows {
@@ -303,14 +329,14 @@ impl Document {
                 .get(&(rows.start, rows.end))
                 .copied()
                 .unwrap_or((Some(false), false));
-            provider.push(Fold {
+            automatic.push(Fold {
                 rows,
-                provided: true,
+                source,
                 closed,
                 search_open,
             });
         }
-        self.folds.definitions.extend(provider);
+        self.folds.definitions.extend(automatic);
         self.folds.refresh();
     }
 
@@ -466,7 +492,9 @@ impl Document {
         if self.folds.definitions.is_empty() {
             return;
         }
-        self.folds.definitions.retain(|fold| !fold.provided);
+        self.folds
+            .definitions
+            .retain(|fold| fold.source == FoldSource::Manual);
         let start = self
             .text
             .bytes()
@@ -493,7 +521,7 @@ impl Document {
         }
         self.folds.definitions.push(Fold {
             rows: self.folds.complete_range(rows),
-            provided: false,
+            source: FoldSource::Manual,
             closed: Some(true),
             search_open: false,
         });
@@ -511,7 +539,7 @@ impl Document {
         recursive: bool,
     ) -> bool {
         let enabled = self.folds.enabled;
-        let containing = self.folds.containing(row).collect::<Vec<_>>();
+        let mut containing = self.folds.containing(row).collect::<Vec<_>>();
         let close = match change {
             FoldChange::Open => false,
             FoldChange::Close => true,
@@ -520,6 +548,18 @@ impl Document {
         // An already-closed outer level blocks further single-level closing.
         if close && enabled && containing.first().is_some_and(|&(_, closed)| closed) {
             return false;
+        }
+        // On a built-in header, close that block before any enclosing section.
+        if close
+            && count == 1
+            && let Some(header) = containing.iter().position(|&(index, closed)| {
+                let fold = &self.folds.definitions[index];
+                (!enabled || !closed)
+                    && fold.rows.start == row
+                    && fold.source == FoldSource::Builtin
+            })
+        {
+            containing.rotate_left(header);
         }
         let mut selected = containing
             .into_iter()
@@ -658,17 +698,16 @@ impl Document {
 
     /// Delete one enclosing manual fold at `row`, recursively when requested.
     fn delete_fold(&mut self, row: usize, recursive: bool) -> bool {
-        let selected = self
-            .folds
-            .containing(row)
-            .find_map(|(index, _)| (!self.folds.definitions[index].provided).then_some(index));
+        let selected = self.folds.containing(row).find_map(|(index, _)| {
+            (self.folds.definitions[index].source == FoldSource::Manual).then_some(index)
+        });
         let Some(index) = selected else { return false };
         let removed = self.folds.definitions.remove(index);
         if recursive {
             let mut at = 0;
             self.folds.definitions.retain(|fold| {
                 let keep = at < index
-                    || fold.provided
+                    || fold.source != FoldSource::Manual
                     || fold.rows.start >= removed.rows.end
                     || fold.rows.end > removed.rows.end;
                 at += 1;
@@ -690,7 +729,9 @@ impl Document {
 
     /// Delete all manual folds in this buffer.
     pub(crate) fn delete_folds(&mut self) {
-        self.folds.definitions.retain(|fold| fold.provided);
+        self.folds
+            .definitions
+            .retain(|fold| fold.source != FoldSource::Manual);
         self.folds.refresh();
     }
 

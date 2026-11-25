@@ -65,6 +65,8 @@ color_roles! {
     SYNTAX_ATTRIBUTE: "syntax_attribute", 6;
     WARNING_UNDERLINE: "warning_underline", 6;
     ERROR_UNDERLINE: "error_underline", 6;
+    FOLDED: "folded", 8;
+    FOLDED_CURRENT: "folded_current", 8;
 }
 
 /// An independently themed region, ordered for indexing into `Palette::components`.

@@ -2,6 +2,7 @@
 
 mod alignment;
 mod dimensions;
+mod folds;
 mod graphemes;
 mod links;
 mod scroll_sync;

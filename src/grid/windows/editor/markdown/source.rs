@@ -1,6 +1,6 @@
-//! Match Markdown syntax to the source byte ranges used by the editor.
+//! Cache the Markdown source ranges used for coloring, wrapping and folding.
 
-use super::MARKDOWN_OPTIONS;
+use super::{MARKDOWN_OPTIONS, folds::SourceFolds};
 use nanobug::document::Document;
 use nanobug_plugin_sdk::language::{ByteRange, Highlight, SyntaxKind};
 use pulldown_cmark::{Event, LinkType, Parser, Tag};
@@ -17,24 +17,29 @@ static HTML_MARKUP: LazyLock<Regex> = LazyLock::new(|| {
         .expect("static HTML markup pattern")
 });
 
-/// Retain Markdown source highlights and list body positions until the document changes.
+/// Retain analysis of the editable Markdown source until the document changes.
 #[derive(Default)]
-pub(in crate::grid::windows::editor) struct MarkdownHighlights(RefCell<CachedHighlights>);
+pub(in crate::grid::windows::editor) struct MarkdownSource(RefCell<SourceMarkup>);
 
-/// Non-overlapping syntax ranges produced for one revision of an open document.
+/// Markdown markup positions produced by parsing one revision of an open document.
 #[derive(Default)]
-struct CachedHighlights {
-    /// Opening identity and content revision represented by `spans`.
+struct SourceMarkup {
+    /// Opening identity and content revision represented by these ranges.
     version: Option<(u64, u64)>,
     /// Syntax spans sorted by source byte offset.
     spans: Vec<Highlight>,
     /// Source offsets after each Markdown list marker and its separating whitespace.
     list_bodies: Vec<usize>,
+    /// Half-open byte ranges of sections and blocks, including their opening lines.
+    folds: Vec<Range<usize>>,
 }
 
-impl MarkdownHighlights {
+impl MarkdownSource {
     /// Return the syntax for `doc`, reusing it across repaints and transient IME composition.
-    pub(in crate::grid::windows::editor) fn get(&self, doc: &Document) -> Ref<'_, [Highlight]> {
+    pub(in crate::grid::windows::editor) fn highlights(
+        &self,
+        doc: &Document,
+    ) -> Ref<'_, [Highlight]> {
         self.refresh(doc);
         Ref::map(self.0.borrow(), |cached| cached.spans.as_slice())
     }
@@ -45,23 +50,30 @@ impl MarkdownHighlights {
         Ref::map(self.0.borrow(), |cached| cached.list_bodies.as_slice())
     }
 
+    /// Return foldable source intervals for `doc`, ready to be projected onto physical lines.
+    pub(in crate::grid::windows::editor) fn folds(
+        &self,
+        doc: &Document,
+    ) -> Ref<'_, [Range<usize>]> {
+        self.refresh(doc);
+        Ref::map(self.0.borrow(), |cached| cached.folds.as_slice())
+    }
+
     /// Parse the source markup once per opening and revision of `doc`.
     fn refresh(&self, doc: &Document) {
         let version = Some((doc.opening, doc.revision));
         if self.0.borrow().version != version {
-            let (spans, list_bodies) = parse(&doc.text);
-            self.0.replace(CachedHighlights {
-                version,
-                spans,
-                list_bodies,
-            });
+            let mut markup = parse(&doc.text);
+            markup.version = version;
+            self.0.replace(markup);
         }
     }
 }
 
-/// Derive syntax highlights and list body positions from the Markdown `source`.
-fn parse(source: &str) -> (Vec<Highlight>, Vec<usize>) {
+/// Derive markup positions from the same Markdown `source` dialect as the preview.
+fn parse(source: &str) -> SourceMarkup {
     let parser = Parser::new_ext(source, MARKDOWN_OPTIONS);
+    let mut folds = SourceFolds::new(source);
     let mut regions = Vec::new();
     let mut list_bodies = Vec::new();
     for (_, definition) in parser.reference_definitions().iter() {
@@ -72,6 +84,7 @@ fn parse(source: &str) -> (Vec<Highlight>, Vec<usize>) {
         }
     }
     for (event, range) in parser.into_offset_iter() {
+        folds.observe(&event, &range);
         let kind = match event {
             Event::Start(Tag::Heading { .. }) => SyntaxKind::MarkupHeading,
             Event::Start(Tag::Emphasis) => SyntaxKind::MarkupEmphasis,
@@ -148,7 +161,12 @@ fn parse(source: &str) -> (Vec<Highlight>, Vec<usize>) {
         add(&mut regions, range, kind);
     }
     list_bodies.sort_unstable();
-    (Highlight::flatten(regions), list_bodies)
+    SourceMarkup {
+        version: None,
+        spans: Highlight::flatten(regions),
+        list_bodies,
+        folds: folds.finish(),
+    }
 }
 
 /// Resolve the text after an optional task checkbox at the start of a list `body`.
@@ -243,7 +261,7 @@ mod tests {
             "```rust\nfn main() {}\n```\n\n",
             "| 标头 |\n| --- |\n| 内容 |\n"
         );
-        let (spans, _) = parse(text);
+        let spans = parse(text).spans;
         for (token, expected) in [
             ("# 标题", Some(SyntaxKind::MarkupHeading)),
             ("**强调**", Some(SyntaxKind::MarkupStrong)),
@@ -279,10 +297,10 @@ mod tests {
     #[test]
     fn builtin_markdown_highlight_cache_follows_document_revision() {
         let mut doc = Document::new("# Heading");
-        let cached = MarkdownHighlights::default();
-        assert_eq!(cached.get(&doc)[0].kind, SyntaxKind::MarkupHeading);
+        let cached = MarkdownSource::default();
+        assert_eq!(cached.highlights(&doc)[0].kind, SyntaxKind::MarkupHeading);
         doc.replace(0..2, "", true);
-        assert!(cached.get(&doc).is_empty());
+        assert!(cached.highlights(&doc).is_empty());
     }
 
     /// Check that built-in syntax reaches the source frame and explicit provider colors win.

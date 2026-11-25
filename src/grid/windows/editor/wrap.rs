@@ -3,7 +3,7 @@
 use super::{
     Buffer, EditorWindow, MarkdownViewMode,
     buffer::LineSource,
-    markdown::{MarkdownHighlights, is_markdown},
+    markdown::{MarkdownSource, is_markdown},
 };
 use crate::ui::text::{TextCell, TextSpacing, UNITS_PER_COLUMN};
 use gpui::FontId;
@@ -112,7 +112,7 @@ impl Buffer {
         measured_rows(
             LineSource(&self.vim),
             &self.wraps,
-            &self.markdown_highlights,
+            &self.markdown_source,
             columns,
             spacing,
             composition,
@@ -154,7 +154,7 @@ fn uses_markdown_breaks(vim: &Vim) -> bool {
 fn measured_rows<'a>(
     source: LineSource<'a>,
     wraps: &RefCell<Option<WrappedRows>>,
-    markdown: &MarkdownHighlights,
+    markdown: &MarkdownSource,
     columns: usize,
     spacing: &TextSpacing,
     composition: &str,
@@ -229,7 +229,7 @@ fn measured_rows<'a>(
 /// Resolve a motion in measured rows, preserving the target column across vertical moves.
 pub(super) fn motion_resolver<'a>(
     wraps: &'a RefCell<Option<WrappedRows>>,
-    markdown: &'a MarkdownHighlights,
+    markdown: &'a MarkdownSource,
     columns: usize,
     spacing: &'a TextSpacing,
     composition: &'a str,

@@ -102,6 +102,7 @@ impl Buffer {
         let action = input(self);
         let changed =
             self.vim.doc.revision != before && !self.vim.doc.metadata_revised_since(before);
+        self.refresh_markdown_folds();
         if changed {
             self.vim.acknowledge_ex_options_editor_edit();
         }
@@ -139,7 +140,7 @@ impl EditorWindow {
             if wrapped {
                 let mut resolve = wrap::motion_resolver(
                     &buffer.wraps,
-                    &buffer.markdown_highlights,
+                    &buffer.markdown_source,
                     width,
                     spacing,
                     &self.composition.text,
@@ -168,7 +169,7 @@ impl EditorWindow {
             if wrapped {
                 let mut resolve = wrap::motion_resolver(
                     &buffer.wraps,
-                    &buffer.markdown_highlights,
+                    &buffer.markdown_source,
                     width,
                     spacing,
                     &self.composition.text,
@@ -197,7 +198,7 @@ impl EditorWindow {
             if wrapped {
                 let mut resolve = wrap::motion_resolver(
                     &buffer.wraps,
-                    &buffer.markdown_highlights,
+                    &buffer.markdown_source,
                     width,
                     spacing,
                     &self.composition.text,
@@ -226,7 +227,7 @@ impl EditorWindow {
             if wrapped {
                 let mut resolve = wrap::motion_resolver(
                     &buffer.wraps,
-                    &buffer.markdown_highlights,
+                    &buffer.markdown_source,
                     width,
                     spacing,
                     &self.composition.text,
@@ -490,7 +491,7 @@ impl EditorWindow {
             if wrapped {
                 let mut resolve = wrap::motion_resolver(
                     &buffer.wraps,
-                    &buffer.markdown_highlights,
+                    &buffer.markdown_source,
                     width,
                     spacing,
                     &self.composition.text,

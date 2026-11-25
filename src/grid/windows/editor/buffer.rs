@@ -1,6 +1,6 @@
 //! One retained document viewport, including IME display text and measured caret positions.
 
-use super::markdown::{MarkdownHighlights, MarkdownViewport, is_markdown};
+use super::markdown::{MarkdownSource, MarkdownViewport, is_markdown};
 use crate::{
     grid::windows::terminal::Terminal,
     ui::text::{TextSpacing, UNITS_PER_COLUMN},
@@ -27,6 +27,13 @@ use std::{
 
 /// Workspace-wide buffer identity, retained when a buffer moves to another tab.
 static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Project a half-open byte `range` onto physical rows indexed by `lines`.
+fn fold_rows(lines: &[usize], range: Range<usize>) -> Range<usize> {
+    let first = lines.partition_point(|&start| start <= range.start) - 1;
+    let end = lines.partition_point(|&start| start < range.end);
+    first..end
+}
 
 #[cfg(test)]
 mod highlight_tests {
@@ -144,8 +151,10 @@ pub(in crate::grid) struct Buffer {
     retained_highlights: Option<(u64, Vec<Highlight>)>,
     /// Native grammar and language-server spans, independently bound to a text snapshot.
     pub(super) syntax_layers: [Option<Arc<nanobug::plugins::session::DocumentSyntax>>; 2],
-    /// Native Markdown syntax cached independently of optional language providers.
-    pub(super) markdown_highlights: MarkdownHighlights,
+    /// Native Markdown markup cached independently of optional language providers.
+    pub(super) markdown_source: MarkdownSource,
+    /// Opening and revision whose built-in Markdown folds are installed in the document.
+    markdown_fold_version: Option<(u64, u64)>,
     /// Styles captured with the text of an immutable Ex message listing.
     message_spans: Vec<ExMessageSpan>,
     /// Latest diagnostic sets received for this buffer from live language providers.
@@ -234,6 +243,7 @@ impl Buffer {
         if self.vim.refresh_shared_document() {
             self.set_presentation(None);
         }
+        self.refresh_markdown_folds();
     }
 
     /// Start editing `doc` with a fresh Vim state and viewport.
@@ -243,7 +253,7 @@ impl Buffer {
 
     /// Put `vim` in a fresh viewport with a unique buffer identity.
     pub(super) fn with_vim(vim: Vim) -> Self {
-        Self {
+        let mut buffer = Self {
             id: NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed),
             vim,
             terminal: None,
@@ -256,14 +266,17 @@ impl Buffer {
             restored_wrap_byte: None,
             presentation: None,
             retained_highlights: None,
-            markdown_highlights: MarkdownHighlights::default(),
+            markdown_source: MarkdownSource::default(),
+            markdown_fold_version: None,
             syntax_layers: Default::default(),
             message_spans: Vec::new(),
             diagnostics: Vec::new(),
             diagnostic_buffer: None,
             diagnostic_epoch: 0,
             sql_dialect: None,
-        }
+        };
+        buffer.refresh_markdown_folds();
+        buffer
     }
 
     /// Return the explicit SQL dialect for this buffer, if one was chosen.
@@ -279,7 +292,7 @@ impl Buffer {
         }
     }
 
-    /// Replace the current provider result and synchronize these folds with the document.
+    /// Replace the current provider result, using built-in Markdown folds when it supplies none.
     pub(in crate::grid) fn set_presentation(
         &mut self,
         presentation: Option<(nanobug::plugins::session::Key, Arc<DocumentPresentation>)>,
@@ -300,21 +313,55 @@ impl Buffer {
             == presentation
                 .as_ref()
                 .map(|(key, data)| (key, data.generation));
-        let lines = &self.vim.doc.starts;
-        let folds = presentation.as_ref().map_or_else(Vec::new, |(_, data)| {
-            data.features
-                .folds
+        self.presentation = presentation;
+        let provider_folds = self
+            .presentation
+            .as_ref()
+            .map_or(&[][..], |(_, data)| data.features.folds.as_slice());
+        if provider_folds.is_empty() && self.markdown_document_version().is_some() {
+            self.refresh_markdown_folds();
+        } else {
+            let lines = &self.vim.doc.starts;
+            let folds = provider_folds
                 .iter()
-                .map(|range| {
-                    let first = lines.partition_point(|&start| start <= range.start) - 1;
-                    let end = lines.partition_point(|&start| start < range.end);
-                    first..end
-                })
+                .map(|range| fold_rows(lines, range.start..range.end))
+                .collect();
+            self.vim.doc.set_provider_folds(folds, same_provider);
+            self.markdown_fold_version = None;
+        }
+        true
+    }
+
+    /// Apply folds from the current Markdown revision whenever no language provider owns them.
+    pub(super) fn refresh_markdown_folds(&mut self) {
+        if self
+            .presentation
+            .as_ref()
+            .is_some_and(|(_, data)| !data.features.folds.is_empty())
+        {
+            return;
+        }
+        let version = self.markdown_document_version();
+        if self.markdown_fold_version == version {
+            return;
+        }
+        let doc = &self.vim.doc;
+        let folds = version.map_or_else(Vec::new, |_| {
+            self.markdown_source
+                .folds(doc)
+                .iter()
+                .map(|range| fold_rows(&doc.starts, range.clone()))
                 .collect()
         });
-        self.vim.doc.set_provider_folds(folds, same_provider);
-        self.presentation = presentation;
-        true
+        self.vim.doc.set_builtin_folds(folds);
+        self.markdown_fold_version = version;
+    }
+
+    /// Identify the opening and revision of an editable Markdown file by its path extension.
+    fn markdown_document_version(&self) -> Option<(u64, u64)> {
+        let doc = &self.vim.doc;
+        (!self.vim.is_read_only() && doc.path.as_deref().is_some_and(is_markdown))
+            .then_some((doc.opening, doc.revision))
     }
 
     /// Provider that owns the retained folds while this buffer awaits fresh presentation data.
@@ -410,7 +457,7 @@ impl Buffer {
     pub(super) fn markdown_highlights(&self) -> Option<Ref<'_, [Highlight]>> {
         let doc = &self.vim.doc;
         doc.path.as_deref().filter(|path| is_markdown(path))?;
-        Some(self.markdown_highlights.get(doc))
+        Some(self.markdown_source.highlights(doc))
     }
 
     /// Outline entries in source order for the currently displayed revision.

@@ -219,6 +219,110 @@ fn markdown_gj_gk_use_measured_rows_across_wide_text_and_folds() {
     assert!(editor.vim().doc.folded_end_row(1).is_some());
 }
 
+/// Fold Markdown sections and blocks at their own headers, leaving adjacent sections visible.
+#[test]
+fn markdown_folds_follow_parsed_sections_and_blocks() {
+    use nanobug::vim::Action;
+
+    let source = concat!(
+        "# 项目\n\n导语\n\n## 子章节\n\n",
+        "```md\n# 围栏内是代码\n```\n\n",
+        "> # 引用标题\n> 引用正文\n\n",
+        "1. 第一项\n   - 子项甲\n   - 子项乙\n2. 第二项\n\n",
+        "| 表头 |\n| --- |\n| 单元格 |\n\n",
+        "<div>\n嵌入内容\n</div>\n\n",
+        "下一章\n======\n\n结尾\n",
+    );
+    let mut doc = Document::new(source);
+    doc.path = Some("guide.MD".into());
+    let mut editor = EditorWindow::new(doc);
+    let area = Rect {
+        w: 70,
+        h: 12,
+        ..Rect::default()
+    };
+    let spacing = TextSpacing::new(Arc::new(NoopTextSystem::new()), FontId(0), 16., 9.);
+    let row_of = |text| source.lines().position(|line| line == text).unwrap();
+    assert!(editor.vim().doc.hidden_rows().is_empty());
+
+    for (header, last) in [
+        ("# 项目", "</div>"),
+        ("## 子章节", "</div>"),
+        ("```md", "```"),
+        ("> # 引用标题", "> 引用正文"),
+        ("1. 第一项", "2. 第二项"),
+        ("   - 子项甲", "   - 子项乙"),
+        ("| 表头 |", "| 单元格 |"),
+        ("<div>", "</div>"),
+        ("下一章", "结尾"),
+    ] {
+        let row = row_of(header);
+        let last = row_of(last);
+        let cursor = editor.vim().doc.starts[row];
+        editor.edit(|vim, _| {
+            vim.set_cursor(cursor);
+            Action::None
+        });
+        for key in ["z", "a"] {
+            fold_test_key(&mut editor, key, area, &spacing);
+        }
+        assert_eq!(
+            editor.vim().doc.hidden_rows(),
+            &[row + 1..last + 1],
+            "{header}"
+        );
+        fold_test_key(&mut editor, "enter", area, &spacing);
+        assert_eq!(editor.vim().doc.cursor, cursor);
+        assert!(editor.vim().doc.hidden_rows().is_empty());
+    }
+    assert_eq!(editor.vim().doc.text, source);
+    assert_eq!(editor.vim().doc.revision, 0);
+}
+
+/// Recompute changed Markdown structure in the editing view and in another view of the same text.
+#[test]
+fn markdown_folds_refresh_after_edits_in_shared_views() {
+    use nanobug::vim::Action;
+
+    let mut doc = Document::new("# 第一节\n\n未标记的标题\n\n正文\n\n# 下一节\n内容\n");
+    doc.path = Some("guide.md".into());
+    let mut editor = EditorWindow::new(doc);
+    let mut peer = EditorWindow::with_buffer(editor.buffer().shared_view());
+    peer.edit(|vim, _| {
+        vim.set_cursor(vim.doc.starts[6]);
+        Action::None
+    });
+    assert!(peer.toggle_fold());
+    assert_eq!(peer.vim().doc.folded_end_row(6), Some(7));
+
+    editor.edit(|vim, _| {
+        let start = vim.doc.starts[2];
+        vim.doc.replace(start..start, "## ", true);
+        vim.set_cursor(start);
+        Action::None
+    });
+    assert!(editor.toggle_fold());
+    assert_eq!(editor.vim().doc.folded_end_row(2), Some(4));
+    assert!(!editor.vim().doc.folded_at(6));
+
+    peer.refresh_shared_documents();
+    assert_eq!(peer.vim().doc.folded_end_row(6), Some(7));
+    peer.edit(|vim, _| {
+        vim.set_cursor(vim.doc.starts[2]);
+        Action::None
+    });
+    assert!(peer.toggle_fold());
+    assert_eq!(peer.vim().doc.folded_end_row(2), Some(4));
+
+    editor.edit(|vim, _| {
+        vim.doc.undo(false);
+        Action::None
+    });
+    assert!(!editor.vim().doc.folded_at(2));
+    assert!(editor.toggle_fold());
+    assert_eq!(editor.vim().doc.folded_end_row(0), Some(4));
+}
+
 /// Visual, operators and both replay paths use the same screen-row endpoints as direct input.
 #[test]
 fn markdown_gj_keeps_visual_operators_and_replay_on_wrapped_rows() {
@@ -393,7 +497,7 @@ fn definition_commands_use_normal_mode_and_preserve_the_source() {
 fn gutter_counts_visible_steps_from_the_absolute_caret_line() {
     use crate::{
         grid::{render::Frame, windows::WindowFrame},
-        ui::theme::{MUTED, ThemeComponent},
+        ui::theme::{FOLDED, MUTED, ThemeComponent},
     };
 
     let mut doc = Document::new("a\nb\nc\nd\ne\nf\n");
@@ -416,6 +520,7 @@ fn gutter_counts_visible_steps_from_the_absolute_caret_line() {
     let expected_gutter = |labels: [&str; 4]| {
         let mut frame = Frame::viewport(4, 5, 0);
         frame.set_theme_component(ThemeComponent::Gutter);
+        frame.tint(1, 0, 4, FOLDED);
         for (row, label) in labels.into_iter().enumerate() {
             frame.text(0, row, label, MUTED, 2);
         }
@@ -656,12 +761,12 @@ fn local_display_options_control_source_layout() {
     assert_eq!(editor.vim().doc.location(1), (0, 8));
 }
 
-/// A folded brace block retains its terminator and source syntax colors on the visible header.
+/// Fold headers keep their source styles and tint the gutter and text to the end of the row.
 #[test]
 fn folded_brace_blocks_render_an_inline_placeholder() {
     use crate::{
         grid::{render::Frame, windows::WindowFrame},
-        ui::theme::{GOLD, TEXT, ThemeComponent},
+        ui::theme::{FOLDED, FOLDED_CURRENT, GOLD, TEXT, ThemeComponent},
     };
 
     let source = "\tlet 示例 = { \t\n    value\n};\nplain\n    hidden\n";
@@ -684,7 +789,7 @@ fn folded_brace_blocks_render_an_inline_placeholder() {
         spacing: &spacing,
     };
     let foreground = |byte| (byte == closing).then_some(GOLD);
-    let (_, actual) = editor.content_frames(context, foreground);
+    let (numbers, actual) = editor.content_frames(context, foreground);
     let source_area = editor.text_area(context.area);
     let width = source_area.w + super::TEXT_OVERSCAN;
     let mut expected = Frame::viewport(width, 4, 0);
@@ -692,15 +797,33 @@ fn folded_brace_blocks_render_an_inline_placeholder() {
     expected.keep_whole_graphemes(source_area.x..source_area.x + source_area.w);
     let header = "\tlet 示例 = {";
     let preview = "\tlet 示例 = { ... };";
-    expected.viewport_line(0, spacing.cells(preview), 0..width, 0, |byte| {
-        match byte.checked_sub(header.len()) {
-            Some(0..5) => (0xffffff, 0, true),
-            Some(5) => (GOLD, 0, false),
-            _ => (TEXT, 0, false),
-        }
+    expected.viewport_line(
+        0,
+        spacing.cells(preview),
+        0..width,
+        FOLDED,
+        |byte| match byte.checked_sub(header.len()) {
+            Some(0..5) => (0xffffff, FOLDED, true),
+            Some(5) => (GOLD, FOLDED, false),
+            _ => (TEXT, FOLDED, false),
+        },
+    );
+    expected.viewport_line(1, spacing.cells("plain"), 0..width, FOLDED, |_| {
+        (TEXT, FOLDED, false)
     });
-    expected.viewport_line(1, spacing.cells("plain"), 0..width, 0, |_| (TEXT, 0, false));
     assert!(actual == expected);
+    assert_eq!(numbers.cell_paint_at(0, 0).background, FOLDED);
+    let active = WindowFrame {
+        selected: true,
+        ..context
+    };
+    let (numbers, actual) = editor.content_frames(active, foreground);
+    assert_eq!(numbers.cell_paint_at(0, 0).background, FOLDED_CURRENT);
+    assert_eq!(
+        actual.cell_paint_at(0, width - 1).background,
+        FOLDED_CURRENT
+    );
+    assert_eq!(actual.cell_paint_at(1, width - 1).background, FOLDED);
     assert_eq!(
         editor.buffers[0].display_columns(0, editor.vim().doc.line(0), &spacing),
         spacing.columns(preview)
@@ -709,6 +832,9 @@ fn folded_brace_blocks_render_an_inline_placeholder() {
     editor.edit(|vim, register| vim.key("z", register));
     editor.edit(|vim, register| vim.key("a", register));
     assert!(!editor.vim().doc.folded_at(0));
+    let (numbers, actual) = editor.content_frames(context, foreground);
+    assert_eq!(numbers.cell_paint_at(0, 0).background, 0);
+    assert_eq!(actual.cell_paint_at(0, width - 1).background, 0);
     assert_eq!(
         editor.buffers[0].display_columns(0, header, &spacing),
         spacing.columns(header)

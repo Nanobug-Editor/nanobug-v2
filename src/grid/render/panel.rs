@@ -431,7 +431,7 @@ impl Panel {
         data.paint_theme_background(bounds, |area, color| {
             raster.fill(area.intersect(&clip), color)
         });
-        if let Some((area, color)) = data.trailing_tint(bounds, source_clip.as_ref()) {
+        for (area, color) in data.trailing_tints(bounds, source_clip.as_ref()) {
             raster.fill(area.intersect(&clip), color);
         }
         let clip = text_bounds(clip, source_clip.as_ref());
@@ -895,19 +895,25 @@ impl PanelData {
         Some(snap(columns.start).max(px(0.))..snap(columns.end).min(window.viewport_size().width))
     }
 
-    /// Position the trailing tint against the fixed text clip and follow its row in `bounds`.
-    fn trailing_tint(
+    /// Position each tint at the right edge of `source_clip` and follow its row in `bounds`.
+    fn trailing_tints(
         &self,
         bounds: Bounds<Pixels>,
         source_clip: Option<&Range<Pixels>>,
-    ) -> Option<(Bounds<Pixels>, u32)> {
-        let (row, color) = self.frame.trailing_row_tint?;
-        let start = source_clip?.end;
-        let y = bounds.top() + px(row as f32 * self.metrics.lh);
-        let area =
-            self.frame
-                .tint_bounds(point(start, y), px(self.metrics.cw * 0.5), self.metrics.lh);
-        Some((area, self.style.tint(color)))
+    ) -> impl Iterator<Item = (Bounds<Pixels>, u32)> + '_ {
+        let start = source_clip.map(|clip| clip.end);
+        self.frame
+            .trailing_row_tints
+            .iter()
+            .filter_map(move |&(row, color)| {
+                let y = bounds.top() + px(row as f32 * self.metrics.lh);
+                let area = self.frame.tint_bounds(
+                    point(start?, y),
+                    px(self.metrics.cw * 0.5),
+                    self.metrics.lh,
+                );
+                Some((area, self.style.tint(color)))
+            })
     }
 
     /// Paint rows at `bounds` in `window` using `cx`.
@@ -917,7 +923,7 @@ impl PanelData {
             self.paint_theme_background(bounds, |area, color| {
                 window.paint_quad(fill(area, rgba(color)));
             });
-            if let Some((area, color)) = self.trailing_tint(bounds, source_clip.as_ref()) {
+            for (area, color) in self.trailing_tints(bounds, source_clip.as_ref()) {
                 window.paint_quad(fill(area, rgba(color)));
             }
         });

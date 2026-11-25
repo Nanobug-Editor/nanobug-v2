@@ -1,8 +1,9 @@
 //! Page-local Markdown presentation and the active document's native preview cache.
 
-mod highlight;
+mod folds;
 mod parser;
 mod render;
+mod source;
 mod sync;
 
 use std::{
@@ -21,9 +22,9 @@ use crate::{
     ui::theme::{Style, style},
 };
 use sync::ScrollMap;
-pub(super) use {highlight::MarkdownHighlights, render::PreviewLayout};
+pub(super) use {render::PreviewLayout, source::MarkdownSource};
 
-/// Common extensions enabled for both preview parsing and source coloring.
+/// Common extensions used by the preview parser and Markdown source analysis.
 pub(super) const MARKDOWN_OPTIONS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_FOOTNOTES)
     .union(Options::ENABLE_STRIKETHROUGH)

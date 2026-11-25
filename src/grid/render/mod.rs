@@ -446,8 +446,8 @@ pub struct Frame {
     theme_background: ThemeBackground,
     /// Workspace columns within which text graphemes must fit completely to paint.
     whole_grapheme_columns: Option<Range<usize>>,
-    /// Retained row and tint that continue for half a column past the text viewport.
-    trailing_row_tint: Option<(usize, u32)>,
+    /// Rows whose tint continues for half a column past the text viewport, with their colors.
+    trailing_row_tints: Vec<(usize, u32)>,
 }
 
 impl Frame {
@@ -498,7 +498,7 @@ impl Frame {
             theme_component: None,
             theme_background: ThemeBackground::Full,
             whole_grapheme_columns: None,
-            trailing_row_tint: None,
+            trailing_row_tints: Vec::new(),
         }
     }
 
@@ -507,9 +507,9 @@ impl Frame {
         self.whole_grapheme_columns = Some(columns);
     }
 
-    /// Continue the `row` tint past the fixed right viewport edge by half a column.
+    /// Continue `row`'s `color` past the fixed right viewport edge by half a column.
     pub(in crate::grid) fn extend_row_tint(&mut self, row: usize, color: u32) {
-        self.trailing_row_tint = Some((row, color));
+        self.trailing_row_tints.push((row, color));
     }
 
     /// Apply the colors of `component` to this frame.

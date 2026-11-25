@@ -96,7 +96,7 @@ mod tests {
         },
         ui::{
             text::TextSpacing,
-            theme::{ThemeComponent, WARNING_TEXT},
+            theme::{FOLDED, ThemeComponent, WARNING_TEXT},
         },
     };
     use gpui::{FontId, NoopTextSystem, point, px};
@@ -198,6 +198,7 @@ mod tests {
         };
         let mut expected = Frame::viewport(7, 5, 0);
         expected.set_theme_component(ThemeComponent::Gutter);
+        expected.tint(0, 0, 7, FOLDED);
         expected.text(0, 0, "Hi", 0x123456, 2);
         expected.text(2, 0, " 1", 0x234567, 2);
         expected.text(4, 0, "!", WARNING_TEXT, 1);
